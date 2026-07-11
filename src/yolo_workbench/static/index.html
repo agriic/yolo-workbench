@@ -4,44 +4,97 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>YOLO Workbench</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230c7a63' stroke-width='2.4' stroke-linecap='round'%3E%3Crect x='4' y='4' width='16' height='16' rx='2'/%3E%3Crect x='9' y='9' width='11' height='11' rx='1.4' fill='%230c7a63' stroke='none' opacity='.35'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header>
-    <div><strong>YOLO Workbench</strong><span id="dataset-name"></span></div>
-    <nav aria-label="Workspace"><button class="tab active" data-tab="annotation">Annotation</button><button class="tab" data-tab="exploration">Exploration</button><button class="tab" data-tab="validation">Validation <span id="issue-count"></span></button></nav>
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="11" height="11" rx="1.4" fill="currentColor" stroke="none" opacity=".3"/></svg>
+      <strong>YOLO Workbench</strong>
+      <span id="dataset-name" class="dataset-chip"></span>
+    </div>
+    <nav aria-label="Workspace">
+      <button class="tab active" data-tab="annotation">Annotation</button>
+      <button class="tab" data-tab="exploration">Exploration</button>
+      <button class="tab" data-tab="validation">Validation <span id="issue-count" class="badge"></span></button>
+    </nav>
   </header>
+
   <main>
     <section id="annotation" class="view active">
-      <aside class="filters">
-        <label>Split<select id="image-split"><option value="all">All splits</option></select></label>
-        <label>Class<select id="image-class"><option value="">All classes</option></select></label>
-        <label>Search<input id="image-search" type="search" placeholder="Filename"></label>
-        <div id="image-total" class="muted"></div>
-      </aside>
+      <div class="filters">
+        <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
+        <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
+        <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
+        <label class="toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
+        <div id="image-total" class="total"></div>
+      </div>
       <div id="image-grid" class="grid image-grid"></div>
     </section>
+
     <section id="exploration" class="view">
-      <aside class="filters">
-        <label>Class<select id="object-class"></select></label>
-        <label>Split<select id="object-split"><option value="all">All splits</option></select></label>
-        <label>Crop padding<input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
-        <div id="object-total" class="muted"></div>
-      </aside>
+      <div class="filters">
+        <label class="field">Class<select id="object-class"></select></label>
+        <label class="field">Split<select id="object-split"><option value="all">All splits</option></select></label>
+        <label class="field"><span class="field-label">Crop padding <span id="padding-value" class="muted">15%</span></span><input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
+        <div id="object-total" class="total"></div>
+      </div>
       <div id="object-grid" class="grid object-grid"></div>
     </section>
+
     <section id="validation" class="view">
       <div class="section-title"><h1>Dataset issues</h1><button id="refresh-issues" class="secondary">Refresh</button></div>
-      <div id="issues"></div>
+      <div id="issue-summary" class="issue-summary"></div>
+      <div id="issues" class="issue-list"></div>
     </section>
   </main>
+
   <dialog id="editor">
-    <div class="editor-head"><strong id="editor-title"></strong><div class="toolbar"><button id="undo" title="Undo">↶</button><button id="redo" title="Redo">↷</button><button id="zoom-out" title="Zoom out">−</button><button id="zoom-in" title="Zoom in">+</button><button id="fit" title="Fit image">Fit</button><button id="delete" title="Delete selected">Delete</button><button id="close-editor" title="Close">×</button></div></div>
+    <div class="editor-head">
+      <div class="editor-title-group">
+        <button id="close-editor" class="icon-btn" title="Close (Esc)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+        <div class="editor-title-text"><strong id="editor-title"></strong><span id="editor-subtitle"></span></div>
+      </div>
+      <div class="toolbar">
+        <div class="tool-group">
+          <button id="prev-image" class="icon-btn" title="Previous image (←)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
+          <button id="next-image" class="icon-btn" title="Next image (→)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
+        </div>
+        <div class="tool-group">
+          <button id="undo" class="icon-btn" title="Undo (Ctrl+Z)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg></button>
+          <button id="redo" class="icon-btn" title="Redo (Ctrl+Shift+Z)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0 0 12h3"/></svg></button>
+        </div>
+        <div class="tool-group">
+          <button id="zoom-out" class="icon-btn" title="Zoom out (−)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35M8 11h6"/></svg></button>
+          <button id="zoom-level" class="zoom-label" title="Zoom level — click to reset to 100%">100%</button>
+          <button id="zoom-in" class="icon-btn" title="Zoom in (+)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35M11 8v6M8 11h6"/></svg></button>
+          <button id="fit" class="icon-btn" title="Fit image (F)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
+        </div>
+        <label class="field inline">Draw class<select id="draw-class"></select></label>
+        <button id="delete" class="danger-btn" title="Delete selected (⌫)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6"/></svg>Delete</button>
+      </div>
+    </div>
     <div class="editor-body">
       <div id="canvas-wrap"><canvas id="canvas"></canvas></div>
-      <aside class="inspector"><label>Drawing class<select id="draw-class"></select></label><p id="editor-help" class="muted"></p><div id="annotation-list"></div></aside>
+      <aside class="inspector">
+        <div class="inspector-section grow">
+          <h2>Annotations <span id="annotation-count"></span></h2>
+          <div id="annotation-list"></div>
+        </div>
+        <div class="inspector-section shortcuts">
+          <h2>Shortcuts</h2>
+          <dl id="shortcut-list"></dl>
+        </div>
+      </aside>
+    </div>
+    <div class="editor-status">
+      <span id="status-image"></span>
+      <span id="status-cursor"></span>
+      <span id="status-hint"></span>
     </div>
   </dialog>
+
   <div id="toast" role="status"></div>
   <script type="module" src="/app.js"></script>
 </body>

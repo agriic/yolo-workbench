@@ -10,6 +10,14 @@ from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 from .dataset import Dataset, DatasetError, WriteConflict
+from .models import Annotation, ImageRecord
+
+# Keep in sync with PALETTE in static/app.js so server-rendered overlays match the editor.
+PALETTE = ("#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4", "#84cc16", "#a855f7", "#64748b")
+
+
+def class_color(class_id: int) -> str:
+    return PALETTE[class_id % len(PALETTE)]
 
 
 class AnnotationPayload(BaseModel):
@@ -60,10 +68,10 @@ def create_app(dataset: Dataset) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/images/{image_id}/thumbnail")
-    async def thumbnail(image_id: str, size: int = Query(320, ge=64, le=1024)):
+    async def thumbnail(image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False):
         try:
             record = dataset.require_image(image_id)
-            return jpeg_response(render_thumbnail(record.path, size))
+            return jpeg_response(render_thumbnail(record, size, dataset.category if annotated else None))
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -121,13 +129,29 @@ def json_string(value: str) -> str:
     return json.dumps(value)
 
 
-def render_thumbnail(path: Path, size: int) -> bytes:
-    with Image.open(path) as source:
+def render_thumbnail(record: ImageRecord, size: int, category: str | None = None) -> bytes:
+    with Image.open(record.path) as source:
         image = source.convert("RGB")
         image.thumbnail((size, size))
+        if category:
+            draw = ImageDraw.Draw(image)
+            for annotation in record.annotations:
+                draw_annotation(draw, annotation, category, image.width, image.height)
         output = io.BytesIO()
         image.save(output, "JPEG", quality=82)
         return output.getvalue()
+
+
+def draw_annotation(draw: ImageDraw.ImageDraw, annotation: Annotation, category: str, width: int, height: int) -> None:
+    color = class_color(annotation.class_id)
+    if category == "detection":
+        cx, cy, box_width, box_height = annotation.points
+        xs = sorted(((cx - box_width / 2) * width, (cx + box_width / 2) * width))
+        ys = sorted(((cy - box_height / 2) * height, (cy + box_height / 2) * height))
+        draw.rectangle((xs[0], ys[0], xs[1], ys[1]), outline=color, width=2)
+    else:
+        points = [(x * width, y * height) for x, y in zip(annotation.points[::2], annotation.points[1::2])]
+        draw.line(points + points[:1], fill=color, width=2)
 
 
 def render_crop(record, annotation, category: str, padding: float) -> bytes:
@@ -141,13 +165,19 @@ def render_crop(record, annotation, category: str, padding: float) -> bytes:
             left, top, right, bottom = min(xs), min(ys), max(xs), max(ys)
         pad_x, pad_y = (right - left) * padding, (bottom - top) * padding
         box = (max(0, int((left - pad_x) * image.width)), max(0, int((top - pad_y) * image.height)), min(image.width, int((right + pad_x) * image.width)), min(image.height, int((bottom + pad_y) * image.height)))
+        if box[2] - box[0] < 2 or box[3] - box[1] < 2:
+            # zero-area or out-of-range annotations still need a visible crop so they can be reviewed
+            cx = min(max(int((left + right) / 2 * image.width), 0), image.width)
+            cy = min(max(int((top + bottom) / 2 * image.height), 0), image.height)
+            box = (max(0, cx - 12), max(0, cy - 12), min(image.width, cx + 12), min(image.height, cy + 12))
         crop = image.crop(box)
         draw = ImageDraw.Draw(crop)
+        color = class_color(annotation.class_id)
         if category == "detection":
-            draw.rectangle(((left * image.width - box[0], top * image.height - box[1]), (right * image.width - box[0], bottom * image.height - box[1])), outline="#00c896", width=3)
+            draw.rectangle(((left * image.width - box[0], top * image.height - box[1]), (right * image.width - box[0], bottom * image.height - box[1])), outline=color, width=3)
         else:
             polygon = [(x * image.width - box[0], y * image.height - box[1]) for x, y in zip(annotation.points[::2], annotation.points[1::2])]
-            draw.line(polygon + polygon[:1], fill="#00c896", width=3)
+            draw.line(polygon + polygon[:1], fill=color, width=3)
         crop.thumbnail((420, 320))
         output = io.BytesIO()
         crop.save(output, "JPEG", quality=88)
