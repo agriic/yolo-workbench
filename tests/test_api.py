@@ -1,0 +1,29 @@
+import asyncio
+
+from httpx import ASGITransport, AsyncClient
+
+from test_dataset import make_dataset
+from yolo_workbench.web import create_app
+
+
+def test_metadata_images_and_edit_api(tmp_path):
+    dataset, label = make_dataset(tmp_path)
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=create_app(dataset)), base_url="http://test") as client:
+            metadata = (await client.get("/api/v1/dataset")).json()
+            assert metadata["image_count"] == 1
+            image_id = (await client.get("/api/v1/images")).json()["items"][0]["id"]
+            response = await client.put(f"/api/v1/images/{image_id}/annotations", json={"annotations": [{"class_id": 0, "points": [0.5, 0.5, 0.1, 0.1]}]})
+            assert response.status_code == 200
+            assert label.read_text().startswith("0 ")
+    asyncio.run(run())
+
+
+def test_media_and_validation_endpoints(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=create_app(dataset)), base_url="http://test") as client:
+            image_id = next(iter(dataset.images))
+            assert (await client.get(f"/api/v1/images/{image_id}/thumbnail")).headers["content-type"] == "image/jpeg"
+            assert (await client.get("/api/v1/issues")).status_code == 200
+    asyncio.run(run())

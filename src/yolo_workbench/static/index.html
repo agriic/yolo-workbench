@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>YOLO Workbench</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div><strong>YOLO Workbench</strong><span id="dataset-name"></span></div>
+    <nav aria-label="Workspace"><button class="tab active" data-tab="annotation">Annotation</button><button class="tab" data-tab="exploration">Exploration</button><button class="tab" data-tab="validation">Validation <span id="issue-count"></span></button></nav>
+  </header>
+  <main>
+    <section id="annotation" class="view active">
+      <aside class="filters">
+        <label>Split<select id="image-split"><option value="all">All splits</option></select></label>
+        <label>Class<select id="image-class"><option value="">All classes</option></select></label>
+        <label>Search<input id="image-search" type="search" placeholder="Filename"></label>
+        <div id="image-total" class="muted"></div>
+      </aside>
+      <div id="image-grid" class="grid image-grid"></div>
+    </section>
+    <section id="exploration" class="view">
+      <aside class="filters">
+        <label>Class<select id="object-class"></select></label>
+        <label>Split<select id="object-split"><option value="all">All splits</option></select></label>
+        <label>Crop padding<input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
+        <div id="object-total" class="muted"></div>
+      </aside>
+      <div id="object-grid" class="grid object-grid"></div>
+    </section>
+    <section id="validation" class="view">
+      <div class="section-title"><h1>Dataset issues</h1><button id="refresh-issues" class="secondary">Refresh</button></div>
+      <div id="issues"></div>
+    </section>
+  </main>
+  <dialog id="editor">
+    <div class="editor-head"><strong id="editor-title"></strong><div class="toolbar"><button id="undo" title="Undo">↶</button><button id="redo" title="Redo">↷</button><button id="zoom-out" title="Zoom out">−</button><button id="zoom-in" title="Zoom in">+</button><button id="fit" title="Fit image">Fit</button><button id="delete" title="Delete selected">Delete</button><button id="close-editor" title="Close">×</button></div></div>
+    <div class="editor-body">
+      <div id="canvas-wrap"><canvas id="canvas"></canvas></div>
+      <aside class="inspector"><label>Drawing class<select id="draw-class"></select></label><p id="editor-help" class="muted"></p><div id="annotation-list"></div></aside>
+    </div>
+  </dialog>
+  <div id="toast" role="status"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
