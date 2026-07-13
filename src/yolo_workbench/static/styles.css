@@ -437,7 +437,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   border-radius: 10px;
   overflow: hidden;
 }
-#embed-canvas { position: absolute; inset: 0; cursor: grab; touch-action: none; }
+#embed-canvas { position: absolute; inset: 0; cursor: crosshair; touch-action: none; }
 .embed-view-hint {
   position: absolute;
   left: 12px;

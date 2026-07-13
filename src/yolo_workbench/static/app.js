@@ -896,7 +896,7 @@ function setEmbedMode(mode) {
   $("embed-mode-3d").classList.toggle("active", mode === "3d");
   $("embed-reset-view").hidden = mode !== "3d";
   $("embed-view-hint").hidden = mode !== "3d";
-  $("embed-canvas").style.cursor = mode === "3d" ? "grab" : "crosshair";
+  $("embed-canvas").style.cursor = "crosshair";
   renderEmbedSelection();
   renderEmbeddings();
 }
@@ -1023,7 +1023,7 @@ function embedPointerDown(e) {
   if (state.embed.status !== "ready" || e.button !== 0) return;
   $("embed-canvas").setPointerCapture(e.pointerId);
   const [mx, my] = embedMouse(e);
-  if (state.embed.mode === "3d") {
+  if (state.embed.mode === "3d" && e.ctrlKey) {
     const { yaw, pitch } = state.embed.rotation;
     state.embed.rotate = { x: mx, y: my, lastX: mx, lastY: my, yaw, pitch, moved: false, additive: e.shiftKey };
     $("embed-canvas").style.cursor = "grabbing";
@@ -1072,14 +1072,14 @@ function embedPointerMove(e) {
     tooltip.style.left = `${Math.min(mx + 14, rect.width - 240)}px`;
     tooltip.style.top = `${Math.min(my + 14, rect.height - 200)}px`;
   }
-  $("embed-canvas").style.cursor = state.embed.mode === "3d" ? (best ? "pointer" : "grab") : (best ? "pointer" : "crosshair");
+  $("embed-canvas").style.cursor = state.embed.mode === "3d" && e.ctrlKey ? "grab" : (best ? "pointer" : "crosshair");
 }
 
 function embedPointerUp(e) {
   const rotate = state.embed.rotate;
   if (rotate) {
     state.embed.rotate = null;
-    $("embed-canvas").style.cursor = "grab";
+    $("embed-canvas").style.cursor = "crosshair";
     if (!rotate.moved) selectEmbedPoint(embedNearest(...embedMouse(e)), rotate.additive);
     renderEmbeddings();
     return;
@@ -1090,10 +1090,13 @@ function embedPointerUp(e) {
   const embed = state.embed;
   const previous = band.additive ? embed.selection : [];
   if (band.moved) {
-    const { sx, sy } = embedLayout();
     const [xl, xr] = [Math.min(band.x0, band.x1), Math.max(band.x0, band.x1)];
     const [yt, yb] = [Math.min(band.y0, band.y1), Math.max(band.y0, band.y1)];
-    const inBand = embedFiltered().filter(p => sx(p.x) >= xl && sx(p.x) <= xr && sy(p.y) >= yt && sy(p.y) <= yb);
+    // Screen-space selection makes the 3D box match exactly what the user
+    // sees at the current rotation, depth projection, and zoom level.
+    const inBand = embedScreenPoints()
+      .filter(screen => screen.x >= xl && screen.x <= xr && screen.y >= yt && screen.y <= yb)
+      .map(screen => screen.point);
     const known = new Set(previous.map(p => p.annotation_id));
     embed.selection = [...previous, ...inBand.filter(p => !known.has(p.annotation_id))];
   } else {
@@ -1124,7 +1127,7 @@ function selectEmbedPoint(point, additive) {
 function embedPointerCancel() {
   state.embed.band = null;
   state.embed.rotate = null;
-  $("embed-canvas").style.cursor = state.embed.mode === "3d" ? "grab" : "crosshair";
+  $("embed-canvas").style.cursor = "crosshair";
   renderEmbeddings();
 }
 
@@ -1140,7 +1143,7 @@ function renderEmbedSelection() {
   $("embed-selection-count").textContent = selection.length || "";
   $("embed-clear").hidden = !selection.length;
   const emptyHint = state.embed.mode === "3d"
-    ? "Click a point to select it. Shift-click adds to the selection."
+    ? "Drag a box over visible points to select them. Shift adds to the selection. Ctrl + drag rotates."
     : "Click a point, or drag a box to select multiple objects. Shift adds to the selection.";
   $("embed-selection").innerHTML = selection.map(point => `
     <div class="embed-object">
