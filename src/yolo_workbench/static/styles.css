@@ -437,7 +437,22 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   border-radius: 10px;
   overflow: hidden;
 }
-#embed-canvas { position: absolute; inset: 0; }
+#embed-canvas { position: absolute; inset: 0; cursor: grab; touch-action: none; }
+.embed-view-hint {
+  position: absolute;
+  left: 12px;
+  bottom: 10px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  background: rgb(255 255 255 / 82%);
+  color: var(--muted);
+  font-size: 11px;
+  pointer-events: none;
+}
+.embed-mode { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.embed-mode button { border: 0; border-radius: 0; padding: 4px 10px; background: #fff; color: var(--muted); }
+.embed-mode button + button { border-left: 1px solid var(--line); }
+.embed-mode button.active { background: var(--accent); color: #fff; }
 .embed-tooltip {
   position: absolute;
   z-index: 2;

@@ -32,7 +32,11 @@ const state = {
   view: { scale: 1, x: 0, y: 0 },
   canUndo: false,
   canRedo: false,
-  embed: { status: "idle", error: null, items: [], hovered: null, poll: null, classes: new Set(), selection: [], band: null },
+  embed: {
+    status: "idle", error: null, items: [], hovered: null, poll: null,
+    classes: new Set(), selection: [], band: null, mode: "3d",
+    rotation: { yaw: -0.65, pitch: -0.35 }, zoom: 1, rotate: null, projected: [],
+  },
 };
 
 let dpr = 1, cssW = 0, cssH = 0;
@@ -104,6 +108,9 @@ function bind() {
   $("refresh-issues").onclick = loadIssues;
 
   $("compute-embeddings").onclick = computeEmbeddings;
+  $("embed-mode-2d").onclick = () => setEmbedMode("2d");
+  $("embed-mode-3d").onclick = () => setEmbedMode("3d");
+  $("embed-reset-view").onclick = resetEmbedView;
   $("embed-split").onchange = () => { state.embed.selection = []; renderEmbedSelection(); renderEmbeddings(); };
   $("embed-classes").addEventListener("click", e => {
     const chip = e.target.closest("[data-class]");
@@ -117,6 +124,8 @@ function bind() {
   embedCanvas.onpointerdown = embedPointerDown;
   embedCanvas.onpointermove = embedPointerMove;
   embedCanvas.onpointerup = embedPointerUp;
+  embedCanvas.onpointercancel = embedPointerCancel;
+  embedCanvas.onwheel = embedWheel;
   embedCanvas.onpointerleave = () => { state.embed.hovered = null; $("embed-tooltip").hidden = true; renderEmbeddings(); };
   $("embed-clear").onclick = () => { state.embed.selection = []; renderEmbedSelection(); renderEmbeddings(); };
   $("embed-selection").addEventListener("click", e => {
@@ -876,8 +885,79 @@ function embedLayout() {
   };
 }
 
+function setEmbedMode(mode) {
+  const embed = state.embed;
+  embed.mode = mode;
+  embed.band = null;
+  embed.rotate = null;
+  embed.hovered = null;
+  $("embed-tooltip").hidden = true;
+  $("embed-mode-2d").classList.toggle("active", mode === "2d");
+  $("embed-mode-3d").classList.toggle("active", mode === "3d");
+  $("embed-reset-view").hidden = mode !== "3d";
+  $("embed-view-hint").hidden = mode !== "3d";
+  $("embed-canvas").style.cursor = mode === "3d" ? "grab" : "crosshair";
+  renderEmbedSelection();
+  renderEmbeddings();
+}
+
+function resetEmbedView() {
+  state.embed.rotation = { yaw: -0.65, pitch: -0.35 };
+  state.embed.zoom = 1;
+  renderEmbeddings();
+}
+
+function projectEmbedPoint(point, w, h) {
+  const x = (point.x - 0.5) * 2;
+  const y = (point.y - 0.5) * 2;
+  const z = ((point.z ?? 0.5) - 0.5) * 2;
+  const { yaw, pitch } = state.embed.rotation;
+  const cosY = Math.cos(yaw), sinY = Math.sin(yaw);
+  const cosX = Math.cos(pitch), sinX = Math.sin(pitch);
+  const rx = x * cosY + z * sinY;
+  const rz = -x * sinY + z * cosY;
+  const ry = y * cosX - rz * sinX;
+  const depth = y * sinX + rz * cosX;
+  const perspective = 3.2 / (3.2 - depth);
+  const scale = Math.min(w, h) * 0.34 * state.embed.zoom * perspective;
+  return { x: w / 2 + rx * scale, y: h / 2 - ry * scale, depth, perspective };
+}
+
+function embedScreenPoints() {
+  const wrap = $("embed-wrap"), w = wrap.clientWidth, h = wrap.clientHeight;
+  if (state.embed.mode === "2d") {
+    const { sx, sy } = embedLayout();
+    return embedFiltered().map(point => ({ point, x: sx(point.x), y: sy(point.y), depth: 0, perspective: 1 }));
+  }
+  return embedFiltered().map(point => ({ point, ...projectEmbedPoint(point, w, h) }));
+}
+
+function renderEmbedAxes(ctx, w, h) {
+  const corners = [];
+  for (const x of [0, 1]) for (const y of [0, 1]) for (const z of [0, 1])
+    corners.push({ point: { x, y, z }, ...projectEmbedPoint({ x, y, z }, w, h) });
+  const corner = (x, y, z) => corners[(x * 4) + (y * 2) + z];
+  ctx.save();
+  ctx.strokeStyle = "rgb(28 52 45 / 14%)";
+  ctx.lineWidth = 1;
+  for (const x of [0, 1]) for (const y of [0, 1]) for (const z of [0, 1]) {
+    for (const [dx, dy, dz] of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) {
+      if (x + dx > 1 || y + dy > 1 || z + dz > 1) continue;
+      const a = corner(x, y, z), b = corner(x + dx, y + dy, z + dz);
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+  }
+  const origin = corner(0, 0, 0);
+  for (const [label, target, color] of [["X", corner(1, 0, 0), "#dc6b35"], ["Y", corner(0, 1, 0), "#0c7a63"], ["Z", corner(0, 0, 1), "#526fd3"]]) {
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(origin.x, origin.y); ctx.lineTo(target.x, target.y); ctx.stroke();
+    ctx.font = "600 11px system-ui"; ctx.fillText(label, target.x + 5, target.y - 5);
+  }
+  ctx.restore();
+}
+
 function renderEmbeddings() {
-  const canvas = $("embed-canvas"), { w, h, sx, sy } = embedLayout();
+  const canvas = $("embed-canvas"), { w, h } = embedLayout();
   const ratio = window.devicePixelRatio || 1;
   canvas.width = Math.max(1, Math.round(w * ratio));
   canvas.height = Math.max(1, Math.round(h * ratio));
@@ -887,14 +967,22 @@ function renderEmbeddings() {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, w, h);
   if (state.embed.status !== "ready") return;
+  if (state.embed.mode === "3d") renderEmbedAxes(ctx, w, h);
   const hovered = state.embed.hovered;
   const selected = new Set(state.embed.selection.map(p => p.annotation_id));
-  for (const point of embedFiltered()) {
+  const projected = embedScreenPoints();
+  state.embed.projected = projected;
+  if (state.embed.mode === "3d") projected.sort((a, b) => a.depth - b.depth);
+  for (const screen of projected) {
+    const point = screen.point;
     const isHover = point === hovered, isSelected = selected.has(point.annotation_id);
+    const depthScale = state.embed.mode === "3d" ? clamp((screen.depth + 1.75) / 3.5, 0, 1) : 0.5;
     ctx.beginPath();
-    ctx.arc(sx(point.x), sy(point.y), isHover || isSelected ? 6 : 3.5, 0, Math.PI * 2);
-    ctx.fillStyle = classColor(point.class_id) + (isHover || isSelected ? "" : "cc");
+    ctx.arc(screen.x, screen.y, isHover || isSelected ? 6 : 3 + depthScale * 1.8, 0, Math.PI * 2);
+    ctx.globalAlpha = isHover || isSelected ? 1 : 0.4 + depthScale * 0.55;
+    ctx.fillStyle = classColor(point.class_id);
     ctx.fill();
+    ctx.globalAlpha = 1;
     if (isHover || isSelected) {
       ctx.strokeStyle = isSelected ? "#0c7a63" : "#fff";
       ctx.lineWidth = isSelected ? 2 : 1.5;
@@ -921,11 +1009,12 @@ function embedMouse(e) {
 }
 
 function embedNearest(mx, my) {
-  const { sx, sy } = embedLayout();
   let best = null, bestDistance = 10;
-  for (const point of embedFiltered()) {
-    const distance = Math.hypot(sx(point.x) - mx, sy(point.y) - my);
-    if (distance < bestDistance) { best = point; bestDistance = distance; }
+  const points = embedScreenPoints();
+  if (state.embed.mode === "3d") points.sort((a, b) => b.depth - a.depth);
+  for (const screen of points) {
+    const distance = Math.hypot(screen.x - mx, screen.y - my);
+    if (distance < bestDistance) { best = screen.point; bestDistance = distance; }
   }
   return best;
 }
@@ -934,12 +1023,27 @@ function embedPointerDown(e) {
   if (state.embed.status !== "ready" || e.button !== 0) return;
   $("embed-canvas").setPointerCapture(e.pointerId);
   const [mx, my] = embedMouse(e);
+  if (state.embed.mode === "3d") {
+    const { yaw, pitch } = state.embed.rotation;
+    state.embed.rotate = { x: mx, y: my, lastX: mx, lastY: my, yaw, pitch, moved: false, additive: e.shiftKey };
+    $("embed-canvas").style.cursor = "grabbing";
+    $("embed-tooltip").hidden = true;
+    return;
+  }
   state.embed.band = { x0: mx, y0: my, x1: mx, y1: my, moved: false, additive: e.shiftKey };
 }
 
 function embedPointerMove(e) {
   if (state.embed.status !== "ready") return;
   const [mx, my] = embedMouse(e);
+  const rotate = state.embed.rotate;
+  if (rotate) {
+    if (Math.hypot(mx - rotate.x, my - rotate.y) > 4) rotate.moved = true;
+    state.embed.rotation.yaw = rotate.yaw + (mx - rotate.x) * 0.01;
+    state.embed.rotation.pitch = clamp(rotate.pitch + (my - rotate.y) * 0.01, -Math.PI / 2, Math.PI / 2);
+    rotate.lastX = mx; rotate.lastY = my;
+    return renderEmbeddings();
+  }
   const band = state.embed.band;
   if (band) {
     band.x1 = mx; band.y1 = my;
@@ -968,10 +1072,18 @@ function embedPointerMove(e) {
     tooltip.style.left = `${Math.min(mx + 14, rect.width - 240)}px`;
     tooltip.style.top = `${Math.min(my + 14, rect.height - 200)}px`;
   }
-  $("embed-canvas").style.cursor = best ? "pointer" : "crosshair";
+  $("embed-canvas").style.cursor = state.embed.mode === "3d" ? (best ? "pointer" : "grab") : (best ? "pointer" : "crosshair");
 }
 
 function embedPointerUp(e) {
+  const rotate = state.embed.rotate;
+  if (rotate) {
+    state.embed.rotate = null;
+    $("embed-canvas").style.cursor = "grab";
+    if (!rotate.moved) selectEmbedPoint(embedNearest(...embedMouse(e)), rotate.additive);
+    renderEmbeddings();
+    return;
+  }
   const band = state.embed.band;
   if (!band) return;
   state.embed.band = null;
@@ -998,10 +1110,38 @@ function embedPointerUp(e) {
   renderEmbeddings();
 }
 
+function selectEmbedPoint(point, additive) {
+  const embed = state.embed;
+  const previous = additive ? embed.selection : [];
+  if (point) {
+    const already = previous.some(p => p.annotation_id === point.annotation_id);
+    if (additive) embed.selection = already ? previous.filter(p => p.annotation_id !== point.annotation_id) : [...previous, point];
+    else embed.selection = [point];
+  } else if (!additive) embed.selection = [];
+  renderEmbedSelection();
+}
+
+function embedPointerCancel() {
+  state.embed.band = null;
+  state.embed.rotate = null;
+  $("embed-canvas").style.cursor = state.embed.mode === "3d" ? "grab" : "crosshair";
+  renderEmbeddings();
+}
+
+function embedWheel(e) {
+  if (state.embed.mode !== "3d" || state.embed.status !== "ready") return;
+  e.preventDefault();
+  state.embed.zoom = clamp(state.embed.zoom * Math.exp(-e.deltaY * 0.001), 0.45, 2.5);
+  renderEmbeddings();
+}
+
 function renderEmbedSelection() {
   const selection = state.embed.selection;
   $("embed-selection-count").textContent = selection.length || "";
   $("embed-clear").hidden = !selection.length;
+  const emptyHint = state.embed.mode === "3d"
+    ? "Click a point to select it. Shift-click adds to the selection."
+    : "Click a point, or drag a box to select multiple objects. Shift adds to the selection.";
   $("embed-selection").innerHTML = selection.map(point => `
     <div class="embed-object">
       <img loading="lazy" src="/api/v1/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.version || 0}" alt="">
@@ -1013,7 +1153,7 @@ function renderEmbedSelection() {
           <button data-open-object="${esc(point.annotation_id)}" data-owner="${point.image_id}" title="Open in editor">Open</button>
         </div>
       </div>
-    </div>`).join("") || `<p class="empty-note">Click a point, or drag a box to select multiple objects. Shift adds to the selection.</p>`;
+    </div>`).join("") || `<p class="empty-note">${emptyHint}</p>`;
 }
 
 async function reclassifyEmbedObject(imageId, annotationId, classId) {

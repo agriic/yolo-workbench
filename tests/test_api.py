@@ -35,6 +35,7 @@ def test_embeddings_endpoints_report_state(tmp_path):
         async with AsyncClient(transport=ASGITransport(app=create_app(dataset)), base_url="http://test") as client:
             state = (await client.get("/api/v1/embeddings")).json()
             assert state["brain_key"] == "gt_viz"
+            assert state["dimensions"] == 3
             assert state["status"] in {"idle", "unavailable"}
             started = (await client.post("/api/v1/embeddings/compute")).json()
             assert started["status"] in {"computing", "ready", "unavailable"}

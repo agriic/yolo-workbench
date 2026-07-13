@@ -13,7 +13,7 @@ def fiftyone_available() -> bool:
 
 
 class EmbeddingsManager:
-    """Computes and caches a 2D patch-embedding visualization of the dataset."""
+    """Computes and caches a 3D patch-embedding visualization of the dataset."""
 
     def __init__(self, dataset: Dataset):
         self.dataset = dataset
@@ -24,7 +24,13 @@ class EmbeddingsManager:
         self.items: list[dict] | None = None
 
     def payload(self) -> dict:
-        return {"status": self.status, "error": self.error, "brain_key": "gt_viz", "items": self.items or []}
+        return {
+            "status": self.status,
+            "error": self.error,
+            "brain_key": "gt_viz",
+            "dimensions": 3,
+            "items": self.items or [],
+        }
 
     def start(self) -> dict:
         with self._lock:
@@ -79,29 +85,37 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
             raise RuntimeError("The dataset has no annotations to embed")
         ds.add_samples(samples, progress=False)
 
-        method = "umap" if importlib.util.find_spec("umap") else "pca"
-        results = fob.compute_visualization(ds, patches_field="ground_truth", brain_key="gt_viz", method=method, progress=False)
-
         label_ids = ds.values("ground_truth.detections.id", unwind=True)
         workbench = ds.values("ground_truth.detections.workbench", unwind=True)
         meta = dict(zip(label_ids, workbench))
+        # PCA cannot return more components than there are input samples. UMAP
+        # also becomes unstable for very small datasets, so compute as many
+        # real components as possible and pad the remainder below.
+        num_dims = min(3, len(label_ids))
+        method = "umap" if len(label_ids) > num_dims + 1 and importlib.util.find_spec("umap") else "pca"
+        results = fob.compute_visualization(
+            ds,
+            patches_field="ground_truth",
+            brain_key="gt_viz",
+            method=method,
+            num_dims=num_dims,
+            progress=False,
+        )
+
         result_ids = getattr(results, "label_ids", None)
         result_ids = list(result_ids) if result_ids is not None and len(result_ids) else list(label_ids)
-        points = results.points
+        points = _normalize_3d_points(results.points)
 
-        xs = [float(p[0]) for p in points]
-        ys = [float(p[1]) for p in points]
-        span_x = (max(xs) - min(xs)) or 1.0
-        span_y = (max(ys) - min(ys)) or 1.0
         items = []
-        for label_id, x, y in zip(result_ids, xs, ys):
+        for label_id, (x, y, z) in zip(result_ids, points):
             raw = meta.get(label_id)
             if not raw:
                 continue
             image_id, annotation_id, class_id, split, image_name = raw.split("\x1f")
             items.append({
-                "x": (x - min(xs)) / span_x,
-                "y": (y - min(ys)) / span_y,
+                "x": x,
+                "y": y,
+                "z": z,
                 "image_id": image_id,
                 "annotation_id": annotation_id,
                 "class_id": int(class_id),
@@ -111,3 +125,23 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
         return items
     finally:
         fo.delete_dataset(name)
+
+
+def _normalize_3d_points(points) -> list[tuple[float, float, float]]:
+    """Normalizes each component to [0, 1] and pads points to three axes."""
+    rows = [tuple(float(value) for value in point) for point in points]
+    if not rows:
+        return []
+
+    dimensions = min(3, max(len(row) for row in rows))
+    columns = [[row[index] if index < len(row) else 0.0 for row in rows] for index in range(dimensions)]
+    normalized = []
+    for column in columns:
+        low, high = min(column), max(column)
+        span = high - low
+        normalized.append([(value - low) / span if span else 0.5 for value in column])
+
+    while len(normalized) < 3:
+        normalized.append([0.5] * len(rows))
+
+    return list(zip(*normalized))
