@@ -36,6 +36,7 @@ const state = {
     status: "idle", error: null, items: [], hovered: null, poll: null,
     classes: new Set(), selection: [], band: null, mode: "3d",
     rotation: { yaw: -0.65, pitch: -0.35 }, zoom: 1, rotate: null, projected: [],
+    pan2d: { x: 0, y: 0 }, zoom2d: 1, panDrag: null,
   },
 };
 
@@ -878,10 +879,13 @@ function embedFiltered() {
 
 function embedLayout() {
   const wrap = $("embed-wrap"), pad = 24;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  const { x: panX, y: panY } = state.embed.pan2d;
+  const zoom = state.embed.zoom2d;
   return {
-    w: wrap.clientWidth, h: wrap.clientHeight,
-    sx: x => pad + x * (wrap.clientWidth - 2 * pad),
-    sy: y => pad + (1 - y) * (wrap.clientHeight - 2 * pad),
+    w, h,
+    sx: x => w / 2 + panX + (x - 0.5) * (w - 2 * pad) * zoom,
+    sy: y => h / 2 + panY - (y - 0.5) * (h - 2 * pad) * zoom,
   };
 }
 
@@ -890,20 +894,29 @@ function setEmbedMode(mode) {
   embed.mode = mode;
   embed.band = null;
   embed.rotate = null;
+  embed.panDrag = null;
   embed.hovered = null;
   $("embed-tooltip").hidden = true;
   $("embed-mode-2d").classList.toggle("active", mode === "2d");
   $("embed-mode-3d").classList.toggle("active", mode === "3d");
-  $("embed-reset-view").hidden = mode !== "3d";
-  $("embed-view-hint").hidden = mode !== "3d";
+  $("embed-reset-view").hidden = false;
+  $("embed-view-hint").hidden = false;
+  $("embed-view-hint").textContent = mode === "3d"
+    ? "Drag to select · Ctrl + drag to rotate · Scroll to zoom"
+    : "Drag to select · Ctrl + drag to pan · Scroll to zoom";
   $("embed-canvas").style.cursor = "crosshair";
   renderEmbedSelection();
   renderEmbeddings();
 }
 
 function resetEmbedView() {
-  state.embed.rotation = { yaw: -0.65, pitch: -0.35 };
-  state.embed.zoom = 1;
+  if (state.embed.mode === "3d") {
+    state.embed.rotation = { yaw: -0.65, pitch: -0.35 };
+    state.embed.zoom = 1;
+  } else {
+    state.embed.pan2d = { x: 0, y: 0 };
+    state.embed.zoom2d = 1;
+  }
   renderEmbeddings();
 }
 
@@ -1030,6 +1043,13 @@ function embedPointerDown(e) {
     $("embed-tooltip").hidden = true;
     return;
   }
+  if (state.embed.mode === "2d" && e.ctrlKey) {
+    const { x, y } = state.embed.pan2d;
+    state.embed.panDrag = { x: mx, y: my, panX: x, panY: y, moved: false, additive: e.shiftKey };
+    $("embed-canvas").style.cursor = "grabbing";
+    $("embed-tooltip").hidden = true;
+    return;
+  }
   state.embed.band = { x0: mx, y0: my, x1: mx, y1: my, moved: false, additive: e.shiftKey };
 }
 
@@ -1042,6 +1062,12 @@ function embedPointerMove(e) {
     state.embed.rotation.yaw = rotate.yaw + (mx - rotate.x) * 0.01;
     state.embed.rotation.pitch = clamp(rotate.pitch + (my - rotate.y) * 0.01, -Math.PI / 2, Math.PI / 2);
     rotate.lastX = mx; rotate.lastY = my;
+    return renderEmbeddings();
+  }
+  const panDrag = state.embed.panDrag;
+  if (panDrag) {
+    if (Math.hypot(mx - panDrag.x, my - panDrag.y) > 4) panDrag.moved = true;
+    state.embed.pan2d = { x: panDrag.panX + mx - panDrag.x, y: panDrag.panY + my - panDrag.y };
     return renderEmbeddings();
   }
   const band = state.embed.band;
@@ -1072,7 +1098,7 @@ function embedPointerMove(e) {
     tooltip.style.left = `${Math.min(mx + 14, rect.width - 240)}px`;
     tooltip.style.top = `${Math.min(my + 14, rect.height - 200)}px`;
   }
-  $("embed-canvas").style.cursor = state.embed.mode === "3d" && e.ctrlKey ? "grab" : (best ? "pointer" : "crosshair");
+  $("embed-canvas").style.cursor = e.ctrlKey ? "grab" : (best ? "pointer" : "crosshair");
 }
 
 function embedPointerUp(e) {
@@ -1081,6 +1107,14 @@ function embedPointerUp(e) {
     state.embed.rotate = null;
     $("embed-canvas").style.cursor = "crosshair";
     if (!rotate.moved) selectEmbedPoint(embedNearest(...embedMouse(e)), rotate.additive);
+    renderEmbeddings();
+    return;
+  }
+  const panDrag = state.embed.panDrag;
+  if (panDrag) {
+    state.embed.panDrag = null;
+    $("embed-canvas").style.cursor = "crosshair";
+    if (!panDrag.moved) selectEmbedPoint(embedNearest(...embedMouse(e)), panDrag.additive);
     renderEmbeddings();
     return;
   }
@@ -1127,14 +1161,29 @@ function selectEmbedPoint(point, additive) {
 function embedPointerCancel() {
   state.embed.band = null;
   state.embed.rotate = null;
+  state.embed.panDrag = null;
   $("embed-canvas").style.cursor = "crosshair";
   renderEmbeddings();
 }
 
 function embedWheel(e) {
-  if (state.embed.mode !== "3d" || state.embed.status !== "ready") return;
+  if (state.embed.status !== "ready") return;
   e.preventDefault();
-  state.embed.zoom = clamp(state.embed.zoom * Math.exp(-e.deltaY * 0.001), 0.45, 2.5);
+  if (state.embed.mode === "3d") {
+    state.embed.zoom = clamp(state.embed.zoom * Math.exp(-e.deltaY * 0.001), 0.45, 2.5);
+  } else {
+    const [mx, my] = embedMouse(e);
+    const { w, h } = embedLayout();
+    const oldZoom = state.embed.zoom2d;
+    const zoom = clamp(oldZoom * Math.exp(-e.deltaY * 0.001), 0.5, 8);
+    const ratio = zoom / oldZoom;
+    const pan = state.embed.pan2d;
+    state.embed.pan2d = {
+      x: mx - w / 2 - (mx - w / 2 - pan.x) * ratio,
+      y: my - h / 2 - (my - h / 2 - pan.y) * ratio,
+    };
+    state.embed.zoom2d = zoom;
+  }
   renderEmbeddings();
 }
 
@@ -1144,7 +1193,7 @@ function renderEmbedSelection() {
   $("embed-clear").hidden = !selection.length;
   const emptyHint = state.embed.mode === "3d"
     ? "Drag a box over visible points to select them. Shift adds to the selection. Ctrl + drag rotates."
-    : "Click a point, or drag a box to select multiple objects. Shift adds to the selection.";
+    : "Drag a box to select points. Shift adds to the selection. Ctrl + drag pans and scrolling zooms.";
   $("embed-selection").innerHTML = selection.map(point => `
     <div class="embed-object">
       <img loading="lazy" src="/api/v1/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.version || 0}" alt="">
