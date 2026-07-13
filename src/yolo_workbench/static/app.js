@@ -32,6 +32,7 @@ const state = {
   view: { scale: 1, x: 0, y: 0 },
   canUndo: false,
   canRedo: false,
+  embed: { status: "idle", error: null, items: [], hovered: null, poll: null, classes: new Set(), selection: [], band: null },
 };
 
 let dpr = 1, cssW = 0, cssH = 0;
@@ -58,9 +59,11 @@ async function init() {
   for (const select of [$("image-class"), $("object-class"), $("draw-class")])
     for (const [id, name] of Object.entries(state.meta.names))
       select.insertAdjacentHTML("beforeend", `<option value="${esc(id)}">${esc(id)} · ${esc(name)}</option>`);
-  for (const select of [$("image-split"), $("object-split")])
+  for (const select of [$("image-split"), $("object-split"), $("embed-split")])
     for (const split of Object.keys(state.meta.split_counts))
       select.insertAdjacentHTML("beforeend", `<option>${esc(split)}</option>`);
+  $("embed-classes").innerHTML = Object.entries(state.meta.names).map(([id, name]) =>
+    `<button class="class-chip" data-class="${esc(id)}" style="--c:${classColor(+id)}">${esc(name)}</button>`).join("");
   renderShortcuts();
   bind();
   updateHistoryButtons();
@@ -89,6 +92,7 @@ function bind() {
     document.querySelectorAll(".tab,.view").forEach(el => el.classList.remove("active"));
     button.classList.add("active");
     $(button.dataset.tab).classList.add("active");
+    if (button.dataset.tab === "embeddings") refreshEmbeddings();
   });
   [$("image-split"), $("image-class"), $("show-overlays")].forEach(el => el.onchange = loadImages);
   $("image-search").oninput = debounce(loadImages, 250);
@@ -98,6 +102,32 @@ function bind() {
     reloadObjectsDebounced();
   };
   $("refresh-issues").onclick = loadIssues;
+
+  $("compute-embeddings").onclick = computeEmbeddings;
+  $("embed-split").onchange = () => { state.embed.selection = []; renderEmbedSelection(); renderEmbeddings(); };
+  $("embed-classes").addEventListener("click", e => {
+    const chip = e.target.closest("[data-class]");
+    if (!chip) return;
+    const id = +chip.dataset.class;
+    state.embed.classes.has(id) ? state.embed.classes.delete(id) : state.embed.classes.add(id);
+    chip.classList.toggle("active", state.embed.classes.has(id));
+    renderEmbeddings();
+  });
+  const embedCanvas = $("embed-canvas");
+  embedCanvas.onpointerdown = embedPointerDown;
+  embedCanvas.onpointermove = embedPointerMove;
+  embedCanvas.onpointerup = embedPointerUp;
+  embedCanvas.onpointerleave = () => { state.embed.hovered = null; $("embed-tooltip").hidden = true; renderEmbeddings(); };
+  $("embed-clear").onclick = () => { state.embed.selection = []; renderEmbedSelection(); renderEmbeddings(); };
+  $("embed-selection").addEventListener("click", e => {
+    const open = e.target.closest("[data-open-object]");
+    if (open) openEditor(open.dataset.owner, open.dataset.openObject);
+  });
+  $("embed-selection").addEventListener("change", e => {
+    const select = e.target.closest("[data-object-class]");
+    if (select) reclassifyEmbedObject(select.dataset.owner, select.dataset.objectClass, +select.value);
+  });
+  new ResizeObserver(() => { if ($("embeddings").classList.contains("active")) renderEmbeddings(); }).observe($("embed-wrap"));
 
   $("image-grid").addEventListener("click", e => {
     const card = e.target.closest("[data-image]");
@@ -791,6 +821,210 @@ async function editObject(imageId, id, change) {
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+/* ---------- embeddings (Voxel51 gt_viz) ---------- */
+
+async function refreshEmbeddings() {
+  try {
+    applyEmbedState(await api("/api/v1/embeddings"));
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function computeEmbeddings() {
+  try {
+    applyEmbedState(await api("/api/v1/embeddings/compute", { method: "POST" }));
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function applyEmbedState(data) {
+  const embed = state.embed;
+  const wasReady = embed.status === "ready";
+  embed.status = data.status;
+  embed.error = data.error;
+  embed.items = data.items;
+  if (!wasReady || embed.status !== "ready") { embed.selection = []; renderEmbedSelection(); }
+  clearTimeout(embed.poll);
+  if (embed.status === "computing")
+    embed.poll = setTimeout(refreshEmbeddings, 2000);
+  $("compute-embeddings").disabled = embed.status === "computing";
+  $("compute-embeddings").textContent = embed.status === "ready" ? "Recompute gt_viz" : "Compute gt_viz";
+  const statusText = {
+    idle: "Not computed yet — click “Compute gt_viz”",
+    computing: "Computing embeddings… this can take a while",
+    ready: `${embed.items.length} objects`,
+    error: embed.error || "Failed",
+    unavailable: embed.error || "fiftyone is not installed",
+  }[embed.status] || "";
+  $("embed-status").textContent = statusText;
+  if (embed.status === "error") toast(embed.error, "error");
+  renderEmbeddings();
+}
+
+function embedFiltered() {
+  const classes = state.embed.classes, split = $("embed-split").value;
+  return state.embed.items.filter(p =>
+    (classes.size === 0 || classes.has(p.class_id)) && (split === "all" || p.split === split));
+}
+
+function embedLayout() {
+  const wrap = $("embed-wrap"), pad = 24;
+  return {
+    w: wrap.clientWidth, h: wrap.clientHeight,
+    sx: x => pad + x * (wrap.clientWidth - 2 * pad),
+    sy: y => pad + (1 - y) * (wrap.clientHeight - 2 * pad),
+  };
+}
+
+function renderEmbeddings() {
+  const canvas = $("embed-canvas"), { w, h, sx, sy } = embedLayout();
+  const ratio = window.devicePixelRatio || 1;
+  canvas.width = Math.max(1, Math.round(w * ratio));
+  canvas.height = Math.max(1, Math.round(h * ratio));
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (state.embed.status !== "ready") return;
+  const hovered = state.embed.hovered;
+  const selected = new Set(state.embed.selection.map(p => p.annotation_id));
+  for (const point of embedFiltered()) {
+    const isHover = point === hovered, isSelected = selected.has(point.annotation_id);
+    ctx.beginPath();
+    ctx.arc(sx(point.x), sy(point.y), isHover || isSelected ? 6 : 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = classColor(point.class_id) + (isHover || isSelected ? "" : "cc");
+    ctx.fill();
+    if (isHover || isSelected) {
+      ctx.strokeStyle = isSelected ? "#0c7a63" : "#fff";
+      ctx.lineWidth = isSelected ? 2 : 1.5;
+      ctx.stroke();
+    }
+  }
+  const band = state.embed.band;
+  if (band) {
+    ctx.strokeStyle = "#0c7a63";
+    ctx.lineWidth = 1.2;
+    ctx.setLineDash([5, 4]);
+    ctx.fillStyle = "rgb(12 122 99 / 8%)";
+    const bx = Math.min(band.x0, band.x1), by = Math.min(band.y0, band.y1);
+    const bw = Math.abs(band.x1 - band.x0), bh = Math.abs(band.y1 - band.y0);
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.setLineDash([]);
+  }
+}
+
+function embedMouse(e) {
+  const rect = $("embed-canvas").getBoundingClientRect();
+  return [e.clientX - rect.left, e.clientY - rect.top];
+}
+
+function embedNearest(mx, my) {
+  const { sx, sy } = embedLayout();
+  let best = null, bestDistance = 10;
+  for (const point of embedFiltered()) {
+    const distance = Math.hypot(sx(point.x) - mx, sy(point.y) - my);
+    if (distance < bestDistance) { best = point; bestDistance = distance; }
+  }
+  return best;
+}
+
+function embedPointerDown(e) {
+  if (state.embed.status !== "ready" || e.button !== 0) return;
+  $("embed-canvas").setPointerCapture(e.pointerId);
+  const [mx, my] = embedMouse(e);
+  state.embed.band = { x0: mx, y0: my, x1: mx, y1: my, moved: false, additive: e.shiftKey };
+}
+
+function embedPointerMove(e) {
+  if (state.embed.status !== "ready") return;
+  const [mx, my] = embedMouse(e);
+  const band = state.embed.band;
+  if (band) {
+    band.x1 = mx; band.y1 = my;
+    if (Math.hypot(band.x1 - band.x0, band.y1 - band.y0) > 4) band.moved = true;
+    $("embed-tooltip").hidden = true;
+    return renderEmbeddings();
+  }
+  const best = embedNearest(mx, my);
+  if (best !== state.embed.hovered) {
+    state.embed.hovered = best;
+    renderEmbeddings();
+    const tooltip = $("embed-tooltip");
+    if (best) {
+      tooltip.innerHTML = `
+        <img src="/api/v1/objects/${best.image_id}/${encodeURIComponent(best.annotation_id)}/crop?padding=0.15" alt="">
+        <div><span class="class-tag" style="background:${classColor(best.class_id)}">${esc(state.meta.names[best.class_id] ?? `class ${best.class_id}`)}</span>
+        <strong>${esc(best.image_name)}</strong> · ${esc(best.split)}</div>`;
+      tooltip.hidden = false;
+    } else {
+      tooltip.hidden = true;
+    }
+  }
+  const tooltip = $("embed-tooltip");
+  if (best && !tooltip.hidden) {
+    const rect = $("embed-canvas").getBoundingClientRect();
+    tooltip.style.left = `${Math.min(mx + 14, rect.width - 240)}px`;
+    tooltip.style.top = `${Math.min(my + 14, rect.height - 200)}px`;
+  }
+  $("embed-canvas").style.cursor = best ? "pointer" : "crosshair";
+}
+
+function embedPointerUp(e) {
+  const band = state.embed.band;
+  if (!band) return;
+  state.embed.band = null;
+  const embed = state.embed;
+  const previous = band.additive ? embed.selection : [];
+  if (band.moved) {
+    const { sx, sy } = embedLayout();
+    const [xl, xr] = [Math.min(band.x0, band.x1), Math.max(band.x0, band.x1)];
+    const [yt, yb] = [Math.min(band.y0, band.y1), Math.max(band.y0, band.y1)];
+    const inBand = embedFiltered().filter(p => sx(p.x) >= xl && sx(p.x) <= xr && sy(p.y) >= yt && sy(p.y) <= yb);
+    const known = new Set(previous.map(p => p.annotation_id));
+    embed.selection = [...previous, ...inBand.filter(p => !known.has(p.annotation_id))];
+  } else {
+    const point = embedNearest(...embedMouse(e));
+    if (point) {
+      const already = previous.some(p => p.annotation_id === point.annotation_id);
+      if (band.additive) embed.selection = already ? previous.filter(p => p.annotation_id !== point.annotation_id) : [...previous, point];
+      else embed.selection = [point];
+    } else if (!band.additive) {
+      embed.selection = [];
+    }
+  }
+  renderEmbedSelection();
+  renderEmbeddings();
+}
+
+function renderEmbedSelection() {
+  const selection = state.embed.selection;
+  $("embed-selection-count").textContent = selection.length || "";
+  $("embed-clear").hidden = !selection.length;
+  $("embed-selection").innerHTML = selection.map(point => `
+    <div class="embed-object">
+      <img loading="lazy" src="/api/v1/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.version || 0}" alt="">
+      <div class="embed-object-body">
+        <div class="name" title="${esc(point.image_name)}">${esc(point.image_name)}</div>
+        <div class="meta"><span class="split-badge">${esc(point.split)}</span></div>
+        <div class="object-actions">
+          <select data-object-class="${esc(point.annotation_id)}" data-owner="${point.image_id}" title="Reassign class">${classOptions(point.class_id)}</select>
+          <button data-open-object="${esc(point.annotation_id)}" data-owner="${point.image_id}" title="Open in editor">Open</button>
+        </div>
+      </div>
+    </div>`).join("") || `<p class="empty-note">Click a point, or drag a box to select multiple objects. Shift adds to the selection.</p>`;
+}
+
+async function reclassifyEmbedObject(imageId, annotationId, classId) {
+  await editObject(imageId, annotationId, a => a.class_id = classId);
+  for (const point of state.embed.items)
+    if (point.annotation_id === annotationId && point.image_id === imageId) {
+      point.class_id = classId;
+      point.version = (point.version || 0) + 1;
+    }
+  renderEmbedSelection();
+  renderEmbeddings();
 }
 
 /* ---------- validation ---------- */

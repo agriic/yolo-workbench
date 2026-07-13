@@ -17,6 +17,7 @@
     <nav aria-label="Workspace">
       <button class="tab active" data-tab="annotation">Annotation</button>
       <button class="tab" data-tab="exploration">Exploration</button>
+      <button class="tab" data-tab="embeddings">Embeddings</button>
       <button class="tab" data-tab="validation">Validation <span id="issue-count" class="badge"></span></button>
     </nav>
   </header>
@@ -41,6 +42,25 @@
         <div id="object-total" class="total"></div>
       </div>
       <div id="object-grid" class="grid object-grid"></div>
+    </section>
+
+    <section id="embeddings" class="view">
+      <div class="filters">
+        <div class="field"><span class="field-label">Classes</span><div id="embed-classes" class="chip-row"></div></div>
+        <label class="field">Split<select id="embed-split"><option value="all">All splits</option></select></label>
+        <button id="compute-embeddings" class="secondary">Compute gt_viz</button>
+        <div id="embed-status" class="total"></div>
+      </div>
+      <div class="embed-layout">
+        <div id="embed-wrap" class="embed-wrap">
+          <canvas id="embed-canvas"></canvas>
+          <div id="embed-tooltip" class="embed-tooltip" hidden></div>
+        </div>
+        <aside class="embed-panel">
+          <div class="embed-panel-head"><h2>Selection <span id="embed-selection-count"></span></h2><button id="embed-clear" class="secondary">Clear</button></div>
+          <div id="embed-selection" class="embed-selection"><p class="empty-note">Click a point, or drag a box to select multiple objects.</p></div>
+        </aside>
+      </div>
     </section>
 
     <section id="validation" class="view">

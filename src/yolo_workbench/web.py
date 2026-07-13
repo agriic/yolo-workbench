@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from pydantic import BaseModel
 
 from .dataset import Dataset, DatasetError, WriteConflict
+from .embeddings import EmbeddingsManager
 from .models import Annotation, ImageRecord
 
 # Keep in sync with PALETTE in static/app.js so server-rendered overlays match the editor.
@@ -33,6 +34,8 @@ class AnnotationListPayload(BaseModel):
 def create_app(dataset: Dataset) -> FastAPI:
     app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0")
     app.state.dataset = dataset
+    embeddings = EmbeddingsManager(dataset)
+    app.state.embeddings = embeddings
 
     @app.exception_handler(DatasetError)
     async def dataset_error(_, exc: DatasetError):
@@ -112,11 +115,27 @@ def create_app(dataset: Dataset) -> FastAPI:
     async def fix_issue(issue_id: str):
         return dataset.fix_issue(issue_id)
 
+    @app.get("/api/v1/embeddings")
+    async def embeddings_state():
+        return embeddings.payload()
+
+    @app.post("/api/v1/embeddings/compute")
+    async def embeddings_compute():
+        return embeddings.start()
+
     @app.post("/api/v1/history/{direction}")
     async def history(direction: str):
         if direction not in {"undo", "redo"}:
             raise HTTPException(400, "Direction must be undo or redo")
         return dataset.history(direction)
+
+    @app.middleware("http")
+    async def no_static_cache(request, call_next):
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            # the UI ships with the package; stale cached scripts break new endpoints
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     static = Path(__file__).parent / "static"
     app.mount("/", StaticFiles(directory=static, html=True), name="static")

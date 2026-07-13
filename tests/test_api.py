@@ -27,3 +27,15 @@ def test_media_and_validation_endpoints(tmp_path):
             assert (await client.get(f"/api/v1/images/{image_id}/thumbnail")).headers["content-type"] == "image/jpeg"
             assert (await client.get("/api/v1/issues")).status_code == 200
     asyncio.run(run())
+
+
+def test_embeddings_endpoints_report_state(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=create_app(dataset)), base_url="http://test") as client:
+            state = (await client.get("/api/v1/embeddings")).json()
+            assert state["brain_key"] == "gt_viz"
+            assert state["status"] in {"idle", "unavailable"}
+            started = (await client.post("/api/v1/embeddings/compute")).json()
+            assert started["status"] in {"computing", "ready", "unavailable"}
+    asyncio.run(run())
