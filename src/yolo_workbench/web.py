@@ -198,6 +198,10 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     async def predictor_state():
         return predictor.payload()
 
+    @app.get("/api/v1/predictor/models")
+    async def predictor_models():
+        return predictor.discover_models()
+
     @app.post("/api/v1/predictor/load")
     async def predictor_load(payload: PredictorLoadPayload):
         return predictor.load(payload.path, payload.conf, payload.iou)

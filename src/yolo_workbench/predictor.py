@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import threading
 from pathlib import Path
 
@@ -12,6 +13,11 @@ from .models import ImageRecord
 
 def ultralytics_available() -> bool:
     return importlib.util.find_spec("ultralytics") is not None
+
+
+MODEL_EXTENSIONS = {".pt"}
+SCAN_DEPTH = 4
+SCAN_LIMIT = 50
 
 
 def _clamp(value: float) -> float:
@@ -123,7 +129,80 @@ class PredictorManager:
             self.predictions.clear()
             self.job = {"state": "idle", "done": 0, "total": 0, "error": None}
             self.status = "ready"
+        self._remember_model(str(model_path))
         return self.payload()
+
+    @property
+    def _recents_path(self) -> Path:
+        return self.dataset.root / ".yolo-workbench" / "predictor.json"
+
+    def _recent_models(self) -> list[str]:
+        try:
+            data = json.loads(self._recents_path.read_text(encoding="utf-8"))
+            recents = data.get("recent_models", [])
+            return [str(item) for item in recents] if isinstance(recents, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _remember_model(self, path: str) -> None:
+        recents = [path] + [item for item in self._recent_models() if item != path]
+        try:
+            self._recents_path.parent.mkdir(parents=True, exist_ok=True)
+            self._recents_path.write_text(json.dumps({"recent_models": recents[:10]}), encoding="utf-8")
+        except OSError:
+            pass  # recents are a convenience; failing to persist them must never break loading
+
+    def discover_models(self) -> dict:
+        """Recently used models first, then .pt files found near the dataset, cwd, and recents' directories."""
+        items: list[dict] = []
+        seen: set[Path] = set()
+
+        def add(path: Path, source: str) -> None:
+            resolved = path.resolve()
+            if resolved in seen or resolved.suffix.lower() not in MODEL_EXTENSIONS:
+                return
+            try:
+                stat = resolved.stat()
+            except OSError:
+                return
+            seen.add(resolved)
+            items.append({"path": str(resolved), "name": resolved.name, "size": stat.st_size, "mtime": int(stat.st_mtime), "source": source})
+
+        recents = self._recent_models()
+        for recent in recents:
+            add(Path(recent), "recent")
+        # also scan the directories models were previously loaded from
+        roots = {self.dataset.root, Path.cwd()} | {Path(recent).parent for recent in recents}
+        found: list[Path] = []
+        for root in roots:
+            found.extend(self._scan(root))
+        for path in sorted(found, key=lambda item: item.name.casefold()):
+            if len(items) >= SCAN_LIMIT:
+                break
+            add(path, "found")
+        return {"items": items}
+
+    @staticmethod
+    def _scan(root: Path) -> list[Path]:
+        found: list[Path] = []
+
+        def walk(directory: Path, depth: int) -> None:
+            if depth > SCAN_DEPTH or len(found) >= SCAN_LIMIT:
+                return
+            try:
+                entries = sorted(directory.iterdir())
+            except OSError:
+                return
+            for entry in entries:
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    walk(entry, depth + 1)
+                elif entry.suffix.lower() in MODEL_EXTENSIONS:
+                    found.append(entry)
+
+        walk(root, 0)
+        return found
 
     def _auto_map(self, model_names: dict[int, str]) -> dict[int, int | None]:
         by_name = {name.casefold(): class_id for class_id, name in self.dataset.names.items()}

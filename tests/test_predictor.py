@@ -188,6 +188,61 @@ def test_predict_single_image_endpoint(tmp_path):
     asyncio.run(run())
 
 
+def test_discover_models_scans_and_prioritizes_recents(tmp_path):
+    dataset, _, manager, model = make_predictor(tmp_path)
+    (tmp_path / "weights").mkdir()
+    (tmp_path / "weights" / "best.pt").write_bytes(b"fake")
+    (tmp_path / "weights" / "exported.onnx").write_bytes(b"fake")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "skipped.pt").write_bytes(b"fake")
+    (tmp_path / "notes.txt").write_text("not a model")
+
+    found = manager.discover_models()["items"]
+    names = [item["name"] for item in found if str(tmp_path) in item["path"]]
+    assert "model.pt" in names and "best.pt" in names
+    assert "exported.onnx" not in names  # only .pt models are discovered
+    assert "skipped.pt" not in names and "notes.txt" not in names
+    assert all(item["source"] == "found" for item in found if str(tmp_path) in item["path"])
+
+    manager.load(str(model))
+    assert (tmp_path / ".yolo-workbench" / "predictor.json").exists()
+    found = manager.discover_models()["items"]
+    assert found[0]["path"] == str(model.resolve())
+    assert found[0]["source"] == "recent"
+    assert [item["path"] for item in found].count(str(model.resolve())) == 1  # no duplicate from the scan
+
+
+def test_discover_scans_directories_of_recent_models(tmp_path, tmp_path_factory):
+    dataset, _, manager, _ = make_predictor(tmp_path)
+    outside = tmp_path_factory.mktemp("models-elsewhere")
+    loaded = outside / "loaded.pt"
+    loaded.write_bytes(b"fake")
+    (outside / "sibling.pt").write_bytes(b"fake")
+    manager.load(str(loaded))
+    found = manager.discover_models()["items"]
+    assert found[0]["path"] == str(loaded.resolve())
+    assert any(item["path"] == str((outside / "sibling.pt").resolve()) for item in found)
+
+
+def test_recent_models_skip_deleted_files(tmp_path):
+    dataset, _, manager, model = make_predictor(tmp_path)
+    manager.load(str(model))
+    model.unlink()
+    assert all(item["path"] != str(model.resolve()) for item in manager.discover_models()["items"])
+
+
+def test_models_endpoint(tmp_path):
+    dataset, _, manager, model = make_predictor(tmp_path)
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"), predictor=manager)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            items = (await client.get("/api/v1/predictor/models")).json()["items"]
+            assert any(item["name"] == "model.pt" for item in items)
+
+    asyncio.run(run())
+
+
 def test_predictor_api_endpoints(tmp_path):
     dataset, label, manager, model = make_predictor(tmp_path)
     app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"), predictor=manager)

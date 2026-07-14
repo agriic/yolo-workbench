@@ -592,3 +592,58 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 .pred-row:hover .row-accept { opacity: 1; }
 .pred-row .row-accept:disabled { color: var(--ed-text-2); cursor: not-allowed; }
 #editor .row-accept:hover:not(:disabled) { background: var(--accent-weak, #143028); }
+
+/* ---------- model picker ---------- */
+.model-picker { position: relative; display: flex; align-items: stretch; min-width: 280px; }
+.model-picker input { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.model-browse {
+  width: 30px;
+  border: 1px solid var(--line);
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  font-size: 11px;
+}
+.model-browse:hover { background: var(--accent-weak); color: var(--accent-strong); }
+.model-menu {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 4px); left: 0; right: 0;
+  max-height: 300px;
+  overflow-y: auto;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-option.active { background: var(--accent-weak); outline: 1px solid var(--accent); }
+.model-option {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  text-align: left;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  padding: 7px 9px;
+  cursor: pointer;
+}
+.model-option:hover { background: var(--accent-weak); }
+.model-option-name { font-size: 13px; font-weight: 600; }
+.model-option-meta { font-size: 11px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-recent {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-strong);
+  background: var(--accent-weak);
+  border-radius: 999px;
+  padding: 1px 7px;
+  vertical-align: 1px;
+}

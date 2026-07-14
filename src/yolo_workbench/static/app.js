@@ -37,7 +37,7 @@ const state = {
   canRedo: false,
   pred: {
     status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
-    job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, poll: null,
+    job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, poll: null, models: [],
   },
   embed: {
     status: "idle", error: null, items: [], hovered: null, poll: null,
@@ -137,6 +137,21 @@ function bind() {
   // model-assisted labeling
   $("load-model").onclick = loadModel;
   $("model-path").addEventListener("keydown", e => { if (e.key === "Enter") loadModel(); });
+  $("model-browse").onclick = () => {
+    const menu = $("model-menu");
+    menu.hidden = !menu.hidden;
+    if (!menu.hidden) renderModelMenu();
+  };
+  $("model-menu").addEventListener("click", e => {
+    const option = e.target.closest("[data-path]");
+    if (!option) return;
+    $("model-path").value = option.dataset.path;
+    $("model-menu").hidden = true;
+    loadModel();
+  });
+  document.addEventListener("pointerdown", e => {
+    if (!e.target.closest(".model-picker")) $("model-menu").hidden = true;
+  });
   $("run-predict").onclick = runPredict;
   $("mapping-list").addEventListener("change", async e => {
     const select = e.target.closest("[data-model-class]");
@@ -884,8 +899,37 @@ const UNMAPPED_COLOR = "#8b8f98";
 async function refreshPredictor() {
   try {
     applyPredictorState(await api("/api/v1/predictor"));
+    if (state.pred.status !== "unavailable") await loadModelOptions();
   } catch (error) { toast(error.message, "error"); }
 }
+
+async function loadModelOptions() {
+  try {
+    state.pred.models = (await api("/api/v1/predictor/models")).items;
+  } catch { state.pred.models = []; }
+  // the most recently used model is the best default for a returning session
+  const recent = state.pred.models.find(item => item.source === "recent");
+  if (recent && !$("model-path").value) $("model-path").value = recent.path;
+  $("model-browse").hidden = !state.pred.models.length;
+  renderModelMenu();
+}
+
+function renderModelMenu() {
+  const items = state.pred.models || [];
+  $("model-menu").innerHTML = items.map(item => `
+    <button type="button" class="model-option ${item.path === state.pred.modelPath ? "active" : ""}" data-path="${esc(item.path)}" title="${esc(item.path)}">
+      <span class="model-option-name">${esc(item.name)}${item.source === "recent" ? ' <span class="model-recent">recent</span>' : ""}${item.path === state.pred.modelPath ? ' <span class="model-recent">loaded</span>' : ""}</span>
+      <span class="model-option-meta">${esc(shortDir(item.path))} · ${formatSize(item.size)}</span>
+    </button>`).join("") || `<p class="empty-note">No .pt files found near the dataset — type a path instead.</p>`;
+}
+
+const shortDir = path => {
+  const parts = path.split("/").slice(0, -1);
+  return parts.length > 3 ? `…/${parts.slice(-2).join("/")}` : parts.join("/") || "/";
+};
+
+const formatSize = bytes => bytes >= 1 << 30 ? `${(bytes / (1 << 30)).toFixed(1)} GB`
+  : bytes >= 1 << 20 ? `${(bytes / (1 << 20)).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 
 function applyPredictorState(data) {
   const pred = state.pred;
@@ -893,6 +937,7 @@ function applyPredictorState(data) {
   pred.status = data.status;
   pred.error = data.error;
   pred.names = data.model.names;
+  pred.modelPath = data.model.path;
   pred.mapping = data.mapping;
   pred.pending = data.pending;
   pred.job = data.job;
@@ -918,6 +963,7 @@ function applyPredictorState(data) {
   }[pred.status] || "";
   if (pred.job.state === "error") toast(pred.job.error, "error");
   renderMapping();
+  renderModelMenu();
   clearTimeout(pred.poll);
   if (running) {
     pred.poll = setTimeout(refreshPredictor, 800);
@@ -947,6 +993,7 @@ async function loadModel() {
   try {
     applyPredictorState(await api("/api/v1/predictor/load", { method: "POST", body: JSON.stringify({ path }) }));
     toast("Model loaded");
+    loadModelOptions(); // recents changed
   } catch (error) {
     $("load-model").disabled = false;
     $("predictor-status").textContent = error.message;

@@ -41,7 +41,11 @@
         <div id="image-total" class="total"></div>
       </div>
       <div class="filters assist-bar" id="assist-bar">
-        <label class="field grow">Model<input id="model-path" type="text" placeholder="/path/to/model.pt or .onnx" spellcheck="false"></label>
+        <label class="field grow">Model<div class="model-picker">
+          <input id="model-path" type="text" placeholder="Pick a model or type a path…" spellcheck="false" autocomplete="off">
+          <button id="model-browse" class="model-browse" type="button" title="Show models found near the dataset" aria-label="Show discovered models">▾</button>
+          <div id="model-menu" class="model-menu" hidden></div>
+        </div></label>
         <button id="load-model" class="secondary">Load model</button>
         <details id="mapping-panel" class="mapping-panel" hidden>
           <summary>Class mapping</summary>
