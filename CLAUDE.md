@@ -1,0 +1,32 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+```bash
+uv sync --extra embeddings --extra test   # set up environment (uv is the standard here)
+uv run pytest                             # run all tests
+uv run pytest tests/test_dataset.py -k name_of_test   # run a single test
+uv run yolo-workbench /path/to/dataset.yaml --category detection|segmentation [--no-browser]
+```
+
+The embeddings feature additionally requires a local MongoDB for FiftyOne (see README.md for the docker command and `~/.fiftyone/config.json`).
+
+## Architecture
+
+Local, single-user FastAPI app for annotating and validating YOLO datasets. Python backend in `src/yolo_workbench/`, vanilla-JS frontend served from `src/yolo_workbench/static/` (no Node.js; `app.js` is a single ~1300-line file holding all UI state, canvas editing, and API calls).
+
+- `cli.py` — Typer entrypoint: loads a `Dataset`, starts uvicorn on localhost, opens the browser.
+- `dataset.py` — the core. `Dataset` resolves the YOLO YAML (dirs, `.txt` file lists, colocated or parallel `images/`→`labels/` layouts), indexes every image with a stable sha1-based `record_id`, parses labels, and collects validation issues (malformed lines, unknown classes, out-of-range/zero-area/duplicate annotations, missing/orphan labels — some marked `fixable` and auto-repairable via `fix_issue`). All writes go through `_commit`: mtime-based conflict detection (`WriteConflict` → HTTP 409), one-time per-session backup under `<dataset>/.yolo-workbench/backups/<session-id>/`, atomic write (temp file + fsync + rename), and an undo/redo stack holding full before/after label-file contents.
+- `web.py` — `create_app(dataset)` builds the FastAPI app: JSON endpoints under `/api/v1` (images, annotations PUT, object crops, issues, history, embeddings) plus Pillow-rendered thumbnails/crops. `DatasetError` → 400, `WriteConflict` → 409.
+- `embeddings.py` — optional FiftyOne/UMAP 3D patch-embedding visualization, computed in a background thread with status polled via `/api/v1/embeddings`; degrades to `status: "unavailable"` when fiftyone isn't installed.
+- `models.py` — `Annotation` and `ImageRecord` dataclasses.
+
+The category (`detection` = 4 points cx/cy/w/h, `segmentation` = polygon, ≥6 even-count points) is fixed at launch and branches validation, rendering, and geometry throughout backend and frontend. All coordinates are normalized 0..1.
+
+The class-color `PALETTE` is duplicated in `web.py` and `static/app.js` — keep them in sync.
+
+## Tests
+
+Tests build isolated temporary datasets (`make_dataset` in `tests/test_dataset.py`) and must never modify a real dataset. API tests use httpx `ASGITransport` against `create_app` — no live server.
