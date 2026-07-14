@@ -4,7 +4,7 @@ import io
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from .dataset import Dataset, DatasetError, WriteConflict
 from .embeddings import EmbeddingsManager
+from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 
 # Keep in sync with PALETTE in static/app.js so server-rendered overlays match the editor.
@@ -49,11 +50,25 @@ class BulkObjectPayload(BaseModel):
     operations: list[BulkObjectOperation]
 
 
-def create_app(dataset: Dataset) -> FastAPI:
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None) -> FastAPI:
     app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0")
     app.state.dataset = dataset
     embeddings = EmbeddingsManager(dataset)
     app.state.embeddings = embeddings
+    cache = media_cache or MediaCache()
+    app.state.media_cache = cache
+
+    def label_mtime(record: ImageRecord) -> int:
+        try:
+            return record.label_path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def image_mtime(record: ImageRecord) -> int:
+        try:
+            return record.path.stat().st_mtime_ns
+        except OSError:
+            return 0
 
     @app.exception_handler(DatasetError)
     async def dataset_error(_, exc: DatasetError):
@@ -68,7 +83,7 @@ def create_app(dataset: Dataset) -> FastAPI:
         split_counts: dict[str, int] = {}
         for record in dataset.images.values():
             split_counts[record.split] = split_counts.get(record.split, 0) + 1
-        return {"yaml": str(dataset.yaml_path), "root": str(dataset.root), "category": dataset.category, "names": dataset.names, "image_count": len(dataset.images), "split_counts": split_counts, "issue_count": len(dataset.issues()), "session_id": dataset.session_id}
+        return {"yaml": str(dataset.yaml_path), "root": str(dataset.root), "category": dataset.category, "names": dataset.names, "image_count": len(dataset.images), "split_counts": split_counts, "issue_count": len(dataset.issues()), "session_id": dataset.session_id, "indexing": dict(dataset.indexing)}
 
     @app.get("/api/v1/images")
     async def images(split: str = "all", class_id: int | None = None, search: str = "", offset: int = 0, limit: int = Query(100, ge=1, le=500)):
@@ -89,12 +104,16 @@ def create_app(dataset: Dataset) -> FastAPI:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/images/{image_id}/thumbnail")
-    async def thumbnail(image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False):
+    async def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False):
         try:
             record = dataset.require_image(image_id)
-            return jpeg_response(render_thumbnail(record, size, dataset.category if annotated else None))
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
+        key = cache.key("thumbnail", record.path, image_mtime(record), size, annotated, label_mtime(record) if annotated else 0, PALETTE_VERSION)
+        if request.headers.get("if-none-match") == f'"{key}"':
+            return Response(status_code=304)
+        content = cache.get_or_render(key, lambda: render_thumbnail(record, size, dataset.category if annotated else None))
+        return jpeg_response(content, etag=key)
 
     @app.put("/api/v1/images/{image_id}/annotations")
     async def update_annotations(image_id: str, payload: AnnotationListPayload):
@@ -109,21 +128,27 @@ def create_app(dataset: Dataset) -> FastAPI:
         for record in sorted(dataset.images.values(), key=lambda item: (item.split, item.path.name.casefold())):
             if split != "all" and record.split != split:
                 continue
+            if class_id not in record.class_ids:
+                continue
             for annotation in record.annotations:
                 if annotation.class_id == class_id:
                     items.append({"id": annotation.id, "image_id": record.id, "image_name": record.path.name, "split": record.split, "class_id": annotation.class_id})
         return {"total": len(items), "items": items[offset : offset + limit]}
 
     @app.get("/api/v1/objects/{image_id}/{annotation_id:path}/crop")
-    async def object_crop(image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1)):
+    async def object_crop(request: Request, image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1)):
         try:
             record = dataset.require_image(image_id)
-            annotation = next((item for item in record.annotations if item.id == annotation_id), None)
-            if not annotation:
-                raise HTTPException(404, "Annotation not found")
-            return jpeg_response(render_crop(record, annotation, dataset.category, padding))
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
+        annotation = next((item for item in record.annotations if item.id == annotation_id), None)
+        if not annotation:
+            raise HTTPException(404, "Annotation not found")
+        key = cache.key("crop", record.path, image_mtime(record), annotation.class_id, annotation.points, padding, PALETTE_VERSION)
+        if request.headers.get("if-none-match") == f'"{key}"':
+            return Response(status_code=304)
+        content = cache.get_or_render(key, lambda: render_crop(record, annotation, dataset.category, padding))
+        return jpeg_response(content, etag=key)
 
     @app.get("/api/v1/issues")
     async def issues():
@@ -229,5 +254,8 @@ def render_crop(record, annotation, category: str, padding: float) -> bytes:
         return output.getvalue()
 
 
-def jpeg_response(content: bytes) -> Response:
-    return Response(content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+def jpeg_response(content: bytes, etag: str | None = None) -> Response:
+    if etag is None:
+        return Response(content, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+    # no-cache (not no-store): the browser keeps the bytes but revalidates via ETag, so edits show immediately
+    return Response(content, media_type="image/jpeg", headers={"Cache-Control": "private, no-cache", "ETag": f'"{etag}"'})

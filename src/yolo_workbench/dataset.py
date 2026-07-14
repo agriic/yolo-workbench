@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,7 +34,7 @@ class HistoryEntry:
 
 
 class Dataset:
-    def __init__(self, yaml_path: Path, category: Category):
+    def __init__(self, yaml_path: Path, category: Category, background_probe: bool = False):
         self.yaml_path = yaml_path.resolve()
         self.category = category
         self.root = self.yaml_path.parent
@@ -46,7 +48,16 @@ class Dataset:
         self._redo: list[list[HistoryEntry]] = []
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
         self._backed_up: set[Path] = set()
+        self.indexing: dict[str, int] = {"done": 0, "total": 0}
         self._load()
+        pending = [record for record in self.images.values() if record.width == 0 and record.probe_error is None]
+        self.indexing = {"done": len(self.images) - len(pending), "total": len(self.images)}
+        if not pending:
+            return
+        if background_probe:
+            threading.Thread(target=self._probe_all, args=(pending,), daemon=True).start()
+        else:
+            self._probe_all(pending)
 
     def _load(self) -> None:
         try:
@@ -66,16 +77,77 @@ class Dataset:
         root_value = config.get("path", ".")
         root = Path(root_value)
         self.root = (self.yaml_path.parent / root).resolve() if not root.is_absolute() else root.resolve()
+        size_index = self._load_size_index()
         for split in ("train", "val", "test"):
             for image_path in self._resolve_sources(config.get(split)):
                 record_id = hashlib.sha1(f"{split}:{image_path}".encode()).hexdigest()[:16]
                 label_path = self._label_for(image_path)
                 record = ImageRecord(record_id, split, image_path, label_path)
+                record.name_cf = image_path.name.casefold()
+                self._apply_cached_size(record, size_index)
                 self._read_record(record)
                 self.images[record_id] = record
         if not self.images:
             raise DatasetError("No supported images found in dataset splits")
         self._find_orphans()
+
+    @property
+    def _index_path(self) -> Path:
+        return self.root / ".yolo-workbench" / "index.json"
+
+    def _load_size_index(self) -> dict:
+        try:
+            data = json.loads(self._index_path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _apply_cached_size(self, record: ImageRecord, size_index: dict) -> None:
+        entry = size_index.get(str(record.path))
+        if not entry:
+            return
+        try:
+            stat = record.path.stat()
+        except OSError:
+            return
+        if entry.get("mtime_ns") == stat.st_mtime_ns and entry.get("size") == stat.st_size:
+            record.width, record.height = int(entry.get("width", 0)), int(entry.get("height", 0))
+
+    def _probe_all(self, pending: list[ImageRecord]) -> None:
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            for _ in pool.map(self._probe, pending):
+                pass
+        self._save_size_index()
+
+    def _probe(self, record: ImageRecord) -> None:
+        try:
+            with Image.open(record.path) as image:
+                width, height = image.size
+            error = None
+        except (OSError, UnidentifiedImageError) as exc:
+            width = height = 0
+            error = str(exc)
+        with self._lock:
+            record.width, record.height = width, height
+            record.probe_error = error
+            if error:
+                record.issues.append(self._issue("unreadable_image", "error", error, record))
+            self.indexing["done"] += 1
+
+    def _save_size_index(self) -> None:
+        entries = {str(record.path): {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "width": record.width, "height": record.height} for record in self.images.values() if record.width > 0 and (stat := self._safe_stat(record.path))}
+        try:
+            self._index_path.parent.mkdir(parents=True, exist_ok=True)
+            self._atomic_write(self._index_path, json.dumps(entries))
+        except OSError:
+            pass  # the index is only a cache; failing to persist it must never break the app
+
+    @staticmethod
+    def _safe_stat(path: Path):
+        try:
+            return path.stat()
+        except OSError:
+            return None
 
     def _resolve_sources(self, value) -> list[Path]:
         if not value:
@@ -108,11 +180,8 @@ class Dataset:
 
     def _read_record(self, record: ImageRecord) -> None:
         record.issues.clear()
-        try:
-            with Image.open(record.path) as image:
-                record.width, record.height = image.size
-        except (OSError, UnidentifiedImageError) as exc:
-            record.issues.append(self._issue("unreadable_image", "error", str(exc), record))
+        if record.probe_error:
+            record.issues.append(self._issue("unreadable_image", "error", record.probe_error, record))
         text = ""
         if record.label_path.exists():
             try:
@@ -148,6 +217,7 @@ class Dataset:
                 seen[key] = annotation.id
             except (ValueError, IndexError) as exc:
                 record.issues.append(self._issue("malformed_label", "error", f"Line {line_number}: {exc}", record))
+        record.class_ids = {annotation.class_id for annotation in record.annotations}
         self._mtimes[record.label_path] = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
 
     def _zero_area(self, annotation: Annotation) -> bool:
@@ -173,11 +243,11 @@ class Dataset:
         if split != "all":
             records = [record for record in records if record.split == split]
         if class_id is not None:
-            records = [record for record in records if any(a.class_id == class_id for a in record.annotations)]
+            records = [record for record in records if class_id in record.class_ids]
         if search:
             query = search.casefold()
-            records = [record for record in records if query in record.path.name.casefold()]
-        records.sort(key=lambda record: (record.split, record.path.name.casefold()))
+            records = [record for record in records if query in record.name_cf]
+        records.sort(key=lambda record: (record.split, record.name_cf))
         return {"total": len(records), "items": [record.summary() for record in records[offset : offset + limit]]}
 
     def detail(self, image_id: str) -> dict:

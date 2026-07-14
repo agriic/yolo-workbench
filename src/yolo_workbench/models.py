@@ -28,6 +28,9 @@ class ImageRecord:
     height: int = 0
     annotations: list[Annotation] = field(default_factory=list)
     issues: list[dict] = field(default_factory=list)
+    class_ids: set[int] = field(default_factory=set)
+    name_cf: str = ""
+    probe_error: str | None = None
 
     def summary(self) -> dict:
         return {
@@ -37,6 +40,6 @@ class ImageRecord:
             "width": self.width,
             "height": self.height,
             "annotation_count": len(self.annotations),
-            "classes": sorted({a.class_id for a in self.annotations}),
+            "classes": sorted(self.class_ids),
             "issue_count": len(self.issues),
         }

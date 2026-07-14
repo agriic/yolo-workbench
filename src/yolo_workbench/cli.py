@@ -24,7 +24,7 @@ def main(
 ) -> None:
     """Start the workbench for DATASET_YAML."""
     try:
-        dataset = Dataset(dataset_yaml, category)
+        dataset = Dataset(dataset_yaml, category, background_probe=True)
     except DatasetError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(2) from exc

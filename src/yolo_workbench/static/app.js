@@ -75,7 +75,20 @@ async function init() {
   renderShortcuts();
   bind();
   updateHistoryButtons();
+  watchIndexing();
   await Promise.all([loadImages(), loadObjects(), loadIssues()]);
+}
+
+function watchIndexing() {
+  const el = $("indexing-status");
+  const idx = state.meta.indexing;
+  if (!idx || idx.done >= idx.total) { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = `Indexing ${idx.done}/${idx.total}…`;
+  setTimeout(async () => {
+    try { state.meta = { ...state.meta, ...(await api("/api/v1/dataset")) }; } catch { /* retry on next tick */ }
+    watchIndexing();
+  }, 1000);
 }
 
 function renderShortcuts() {
