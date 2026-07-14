@@ -21,6 +21,7 @@ def main(
     host: str = typer.Option("127.0.0.1", help="Address to bind"),
     port: int = typer.Option(8765, min=1, max=65535),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open a browser automatically"),
+    model: Path | None = typer.Option(None, "--model", help="Ultralytics model (.pt/.onnx) to preload for assisted labeling"),
 ) -> None:
     """Start the workbench for DATASET_YAML."""
     try:
@@ -30,9 +31,16 @@ def main(
         raise typer.Exit(2) from exc
     url = f"http://{host}:{port}"
     typer.echo(f"Indexed {len(dataset.images)} images. Workbench: {url}")
+    app_instance = create_app(dataset)
+    if model is not None:
+        try:
+            app_instance.state.predictor.load(str(model))
+            typer.echo(f"Loaded model {model}")
+        except DatasetError as exc:
+            typer.echo(f"Warning: {exc}", err=True)
     if not no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    uvicorn.run(create_app(dataset), host=host, port=port)
+    uvicorn.run(app_instance, host=host, port=port)
 
 
 if __name__ == "__main__":

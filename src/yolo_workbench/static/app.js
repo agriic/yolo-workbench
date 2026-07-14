@@ -35,6 +35,10 @@ const state = {
   view: { scale: 1, x: 0, y: 0 },
   canUndo: false,
   canRedo: false,
+  pred: {
+    status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
+    job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, poll: null,
+  },
   embed: {
     status: "idle", error: null, items: [], hovered: null, poll: null,
     classes: new Set(), selection: [], band: null, mode: "3d",
@@ -76,7 +80,7 @@ async function init() {
   bind();
   updateHistoryButtons();
   watchIndexing();
-  await Promise.all([loadImages(), loadObjects(), loadIssues()]);
+  await Promise.all([loadImages(), loadObjects(), loadIssues(), refreshPredictor()]);
 }
 
 function watchIndexing() {
@@ -102,6 +106,7 @@ function renderShortcuts() {
     ["⌫", "Delete selection"],
     ["Ctrl+Z / Ctrl+⇧+Z", "Undo / redo"],
     ["← →", "Previous / next image"],
+    ["P", "Predict with the loaded model"],
     ["F", "Fit image"],
     ["Esc", "Cancel drawing / close"],
   ];
@@ -115,7 +120,7 @@ function bind() {
     $(button.dataset.tab).classList.add("active");
     if (button.dataset.tab === "embeddings") refreshEmbeddings();
   });
-  [$("image-split"), $("image-class"), $("show-overlays")].forEach(el => el.onchange = loadImages);
+  [$("image-split"), $("image-class"), $("show-overlays"), $("filter-predictions")].forEach(el => el.onchange = loadImages);
   $("image-search").oninput = debounce(loadImages, 250);
   [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects(); });
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
@@ -128,6 +133,36 @@ function bind() {
     reloadObjectsDebounced();
   };
   $("refresh-issues").onclick = loadIssues;
+
+  // model-assisted labeling
+  $("load-model").onclick = loadModel;
+  $("model-path").addEventListener("keydown", e => { if (e.key === "Enter") loadModel(); });
+  $("run-predict").onclick = runPredict;
+  $("mapping-list").addEventListener("change", async e => {
+    const select = e.target.closest("[data-model-class]");
+    if (!select) return;
+    try {
+      applyPredictorState(await api("/api/v1/predictor/mapping", {
+        method: "PUT",
+        body: JSON.stringify({ mapping: { [select.dataset.modelClass]: select.value === "" ? null : +select.value } }),
+      }));
+      if (state.detail) await loadEditorPredictions(state.detail.id);
+    } catch (error) { toast(error.message, "error"); }
+  });
+  $("pred-conf").oninput = () => {
+    state.pred.minConf = +$("pred-conf").value;
+    $("pred-conf-value").textContent = `${Math.round(state.pred.minConf * 100)}%`;
+    renderPredList();
+    render();
+  };
+  $("accept-all-preds").onclick = () => acceptPredictions(null, state.pred.minConf);
+  $("reject-all-preds").onclick = () => rejectPredictions(null);
+  $("prediction-list").addEventListener("click", e => {
+    const row = e.target.closest("[data-prediction]");
+    if (!row) return;
+    if (e.target.closest(".row-delete")) return rejectPredictions([row.dataset.prediction]);
+    if (e.target.closest(".row-accept")) return acceptPredictions([row.dataset.prediction]);
+  });
 
   $("theme-toggle").onclick = () => {
     const root = document.documentElement;
@@ -216,6 +251,7 @@ function bind() {
   $("undo").onclick = () => applyHistory("undo");
   $("redo").onclick = () => applyHistory("redo");
   $("delete").onclick = deleteSelected;
+  $("predict-image").onclick = predictImage;
   $("fit").onclick = fit;
   $("zoom-in").onclick = () => zoomAt(1.25, cssW / 2, cssH / 2);
   $("zoom-out").onclick = () => zoomAt(0.8, cssW / 2, cssH / 2);
@@ -240,6 +276,8 @@ function bind() {
   });
   $("editor").addEventListener("close", () => {
     state.detail = null; state.img = null; state.drawing = null; state.drag = null; state.selected = null;
+    state.pred.items = [];
+    renderPredList();
   });
 
   $("annotation-list").addEventListener("click", e => {
@@ -283,6 +321,7 @@ function keyDown(e) {
   if (key === "ArrowLeft") return navigate(-1);
   if (key === "ArrowRight") return navigate(1);
   if (key.toLowerCase() === "f") return fit();
+  if (key.toLowerCase() === "p") return predictImage();
   if (key === "+" || key === "=") return zoomAt(1.25, cssW / 2, cssH / 2);
   if (key === "-") return zoomAt(0.8, cssW / 2, cssH / 2);
   if (key === "Enter" && state.drawing?.points?.length >= 3) return finishPolygon();
@@ -304,6 +343,10 @@ async function loadImages() {
   const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value, limit: "500" });
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   const data = await api(`/api/v1/images?${params}`);
+  if ($("filter-predictions").checked) {
+    data.items = data.items.filter(item => state.pred.pending[item.id]);
+    data.total = data.items.length;
+  }
   state.gridImages = data.items;
   $("image-total").textContent = `${data.items.length < data.total ? `${data.items.length} of ` : ""}${data.total} images`;
   const overlay = $("show-overlays").checked ? "&annotated=1" : "";
@@ -313,7 +356,8 @@ async function loadImages() {
     const more = item.classes.length > 3 ? `<span class="chip">+${item.classes.length - 3}</span>` : "";
     return `<article class="card" data-image="${item.id}" tabindex="0">
       <div class="thumb"><img loading="lazy" src="/api/v1/images/${item.id}/thumbnail?size=320${overlay}" alt="">
-        ${item.issue_count ? `<span class="issue-flag">${item.issue_count} ⚠</span>` : ""}</div>
+        ${item.issue_count ? `<span class="issue-flag">${item.issue_count} ⚠</span>` : ""}
+        ${state.pred.pending[item.id] ? `<span class="pred-flag" title="Pending predictions">${state.pred.pending[item.id]} ✨</span>` : ""}</div>
       <div class="card-body">
         <div class="name" title="${esc(item.name)}">${esc(item.name)}</div>
         <div class="meta"><span class="split-badge">${esc(item.split)}</span><span>${item.annotation_count} object${item.annotation_count === 1 ? "" : "s"}</span></div>
@@ -328,6 +372,8 @@ async function loadImages() {
 
 async function openEditor(id, focus = null) {
   state.detail = await api(`/api/v1/images/${id}`);
+  state.pred.items = [];
+  loadEditorPredictions(id);
   state.selected = focus;
   state.drawing = null;
   state.drag = null;
@@ -454,6 +500,7 @@ function render() {
     if (annotation.id !== state.selected) drawShape(ctx, annotation, false);
   const selected = selectedAnnotation();
   if (selected) drawShape(ctx, selected, true);
+  drawPredictions(ctx);
   drawPreview(ctx);
   updateStatus();
 }
@@ -637,6 +684,11 @@ function pointerDown(e) {
     renderList();
     return render();
   }
+  const prediction = hitPrediction(norm);
+  if (prediction) {
+    if (prediction.class_id === null) return toast("Prediction class is unmapped — adjust the class mapping first", "error");
+    return acceptPredictions([prediction.id]);
+  }
   state.selected = null;
   state.drawing = state.meta.category === "detection" ? { start: clamped, end: clamped } : { points: [clamped] };
   renderList();
@@ -671,6 +723,7 @@ function pointerMove(e) {
     } else {
       const found = hitShape(norm);
       if (found) { cursor = "move"; hovered = found.id; }
+      else if (hitPrediction(norm)) cursor = "pointer";
     }
   }
   $("canvas").style.cursor = cursor;
@@ -822,6 +875,228 @@ function sizeLabel(annotation) {
   if (state.meta.category === "detection")
     return `${Math.round(annotation.points[2] * state.detail.width)}×${Math.round(annotation.points[3] * state.detail.height)}`;
   return `${annotation.points.length / 2} pts`;
+}
+
+/* ---------- model-assisted labeling ---------- */
+
+const UNMAPPED_COLOR = "#8b8f98";
+
+async function refreshPredictor() {
+  try {
+    applyPredictorState(await api("/api/v1/predictor"));
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function applyPredictorState(data) {
+  const pred = state.pred;
+  const wasRunning = pred.job.state === "running";
+  pred.status = data.status;
+  pred.error = data.error;
+  pred.names = data.model.names;
+  pred.mapping = data.mapping;
+  pred.pending = data.pending;
+  pred.job = data.job;
+  const ready = pred.status === "ready";
+  const running = pred.job.state === "running";
+  $("load-model").disabled = pred.status === "unavailable" || pred.status === "loading" || running;
+  $("run-predict").hidden = !ready;
+  $("run-predict").disabled = running;
+  $("predict-unlabeled-wrap").hidden = !ready;
+  $("predict-image").hidden = !ready;
+  $("predict-image").disabled = running;
+  $("mapping-panel").hidden = !ready;
+  if (ready && data.model.path && !$("model-path").value) $("model-path").value = data.model.path;
+  const unmapped = Object.values(pred.mapping).filter(value => value === null).length;
+  $("predictor-status").textContent = {
+    unavailable: "Assisted labeling needs the [predict] extra (ultralytics)",
+    idle: "",
+    loading: "Loading model…",
+    error: pred.error || "Failed to load model",
+    ready: running
+      ? `Predicting ${pred.job.done}/${pred.job.total}…`
+      : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}`,
+  }[pred.status] || "";
+  if (pred.job.state === "error") toast(pred.job.error, "error");
+  renderMapping();
+  clearTimeout(pred.poll);
+  if (running) {
+    pred.poll = setTimeout(refreshPredictor, 800);
+  } else if (wasRunning) {
+    const count = Object.values(pred.pending).reduce((sum, n) => sum + n, 0);
+    if (pred.job.state === "done") toast(`Predicted ${pred.job.total} image${pred.job.total === 1 ? "" : "s"} · ${count} pending prediction${count === 1 ? "" : "s"}`);
+    loadImages();
+    if (state.detail) loadEditorPredictions(state.detail.id);
+  }
+}
+
+function renderMapping() {
+  const pred = state.pred;
+  const options = value => `<option value="">— unmapped</option>` + Object.entries(state.meta.names)
+    .map(([id, name]) => `<option value="${id}" ${value !== null && +id === value ? "selected" : ""}>${esc(id)} · ${esc(name)}</option>`).join("");
+  $("mapping-list").innerHTML = Object.entries(pred.names).map(([id, name]) => `
+    <label class="mapping-row"><span title="${esc(name)}">${esc(id)} · ${esc(name)}</span>
+      <select data-model-class="${esc(id)}">${options(pred.mapping[id] ?? null)}</select>
+    </label>`).join("");
+}
+
+async function loadModel() {
+  const path = $("model-path").value.trim();
+  if (!path) return toast("Enter a model path first", "error");
+  $("load-model").disabled = true;
+  $("predictor-status").textContent = "Loading model…";
+  try {
+    applyPredictorState(await api("/api/v1/predictor/load", { method: "POST", body: JSON.stringify({ path }) }));
+    toast("Model loaded");
+  } catch (error) {
+    $("load-model").disabled = false;
+    $("predictor-status").textContent = error.message;
+    toast(error.message, "error");
+  }
+}
+
+async function runPredict() {
+  try {
+    applyPredictorState(await api("/api/v1/predictor/run", {
+      method: "POST",
+      body: JSON.stringify({ split: $("image-split").value, only_unlabeled: $("predict-unlabeled").checked }),
+    }));
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function predictImage() {
+  if (!state.detail) return;
+  if (state.pred.status !== "ready") return toast("Load a model first", "error");
+  const id = state.detail.id;
+  const button = $("predict-image");
+  button.disabled = true;
+  try {
+    const data = await api(`/api/v1/images/${id}/predictions/compute`, { method: "POST" });
+    if (state.detail?.id === id) {
+      state.pred.items = data.items;
+      renderPredList();
+      render();
+    }
+    state.pred.pending[id] = data.items.length;
+    toast(data.items.length ? `${data.items.length} prediction${data.items.length === 1 ? "" : "s"} — click a ghost or use the panel to accept` : "The model found nothing on this image");
+    loadImages();
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.disabled = state.pred.job.state === "running";
+  }
+}
+
+async function loadEditorPredictions(id) {
+  if (state.pred.status === "unavailable") return;
+  try {
+    const data = await api(`/api/v1/images/${id}/predictions`);
+    if (!state.detail || state.detail.id !== id) return;
+    state.pred.items = data.items;
+  } catch { state.pred.items = []; }
+  renderPredList();
+  render();
+}
+
+const visiblePredictions = () => state.pred.items.filter(p => p.confidence >= state.pred.minConf);
+
+function drawPredictions(ctx) {
+  if (!state.detail || !state.img) return;
+  for (const prediction of visiblePredictions()) {
+    const color = prediction.class_id === null ? UNMAPPED_COLOR : classColor(prediction.class_id);
+    const path = shapePath(prediction);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.8;
+    ctx.setLineDash([7, 5]);
+    ctx.stroke(path);
+    ctx.restore();
+    drawPredictionBadge(ctx, prediction, color);
+  }
+}
+
+function drawPredictionBadge(ctx, prediction, color) {
+  const [l, t, r] = bounds(prediction);
+  if ((r - l) * state.img.width * state.view.scale < 26) return;
+  const [sx, sy] = toScreen(l, t);
+  const name = prediction.class_id === null
+    ? `${prediction.model_class_name}?`
+    : state.meta.names[prediction.class_id] ?? `class ${prediction.class_id}`;
+  const text = `${name} ${Math.round(prediction.confidence * 100)}%`;
+  ctx.font = "600 11px Inter, system-ui, sans-serif";
+  const width = ctx.measureText(text).width + 10, height = 17;
+  const y = sy - height - 1 < 2 ? sy + 1 : sy - height - 1;
+  ctx.save();
+  ctx.globalAlpha = 0.85;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(sx, y, width, height, 3);
+  ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#fff";
+  ctx.fillText(text, sx + 5, y + 12);
+  ctx.restore();
+}
+
+function hitPrediction([x, y]) {
+  for (const prediction of [...visiblePredictions()].reverse()) {
+    if (state.meta.category === "detection") {
+      const [l, t, r, b] = bounds(prediction);
+      if (x >= l && x <= r && y >= t && y <= b) return prediction;
+    } else if (pointInPolygon(x, y, prediction.points)) {
+      return prediction;
+    }
+  }
+  return null;
+}
+
+function renderPredList() {
+  const items = state.pred.items;
+  const section = $("prediction-section");
+  section.hidden = !items.length;
+  if (!items.length) return;
+  const visible = visiblePredictions();
+  $("prediction-count").textContent = items.length;
+  $("accept-all-preds").disabled = !visible.some(p => p.class_id !== null);
+  $("prediction-list").innerHTML = items.map(p => {
+    const unmapped = p.class_id === null;
+    const name = unmapped ? `${p.model_class_name} (unmapped)` : state.meta.names[p.class_id] ?? `class ${p.class_id}`;
+    return `<div class="annotation-row pred-row ${p.confidence < state.pred.minConf ? "pred-dim" : ""}" data-prediction="${esc(p.id)}">
+      <span class="swatch" style="background:${unmapped ? UNMAPPED_COLOR : classColor(p.class_id)}"></span>
+      <span class="pred-name" title="${esc(name)}">${esc(name)}</span>
+      <span class="row-meta">${Math.round(p.confidence * 100)}%</span>
+      <button class="row-accept" title="${unmapped ? "Unmapped classes cannot be accepted" : "Accept prediction"}" ${unmapped ? "disabled" : ""}>✓</button>
+      <button class="row-delete" title="Reject prediction">×</button>
+    </div>`;
+  }).join("");
+}
+
+async function acceptPredictions(predictionIds, minConfidence = null) {
+  if (!state.detail) return;
+  const body = { prediction_ids: predictionIds };
+  if (predictionIds === null && minConfidence !== null) body.min_confidence = minConfidence;
+  try {
+    const result = await api(`/api/v1/images/${state.detail.id}/predictions/accept`, { method: "POST", body: JSON.stringify(body) });
+    state.detail = result.detail;
+    state.pred.items = result.predictions;
+    state.pred.pending[state.detail.id] = result.predictions.length;
+    state.canUndo = true;
+    state.canRedo = false;
+    updateHistoryButtons();
+    toast(`Accepted ${result.accepted} prediction${result.accepted === 1 ? "" : "s"} — Ctrl+Z undoes`);
+    renderList(); renderPredList(); render();
+    await Promise.all([loadImages(), loadObjects(), loadIssues()]);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function rejectPredictions(predictionIds) {
+  if (!state.detail) return;
+  try {
+    const result = await api(`/api/v1/images/${state.detail.id}/predictions/reject`, { method: "POST", body: JSON.stringify({ prediction_ids: predictionIds }) });
+    state.pred.items = result.predictions;
+    state.pred.pending[state.detail.id] = result.predictions.length;
+    renderPredList(); render();
+    loadImages();
+  } catch (error) { toast(error.message, "error"); }
 }
 
 /* ---------- exploration ---------- */

@@ -14,6 +14,7 @@ from .dataset import Dataset, DatasetError, WriteConflict
 from .embeddings import EmbeddingsManager
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
+from .predictor import PredictorManager
 
 # Keep in sync with PALETTE in static/app.js so server-rendered overlays match the editor.
 PALETTE = ("#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4", "#84cc16", "#a855f7", "#64748b")
@@ -50,11 +51,38 @@ class BulkObjectPayload(BaseModel):
     operations: list[BulkObjectOperation]
 
 
-def create_app(dataset: Dataset, media_cache: MediaCache | None = None) -> FastAPI:
+class PredictorLoadPayload(BaseModel):
+    path: str
+    conf: float | None = None
+    iou: float | None = None
+
+
+class PredictorMappingPayload(BaseModel):
+    mapping: dict[str, int | None]
+
+
+class PredictorRunPayload(BaseModel):
+    image_ids: list[str] | None = None
+    split: str | None = None
+    only_unlabeled: bool = False
+
+
+class PredictionAcceptPayload(BaseModel):
+    prediction_ids: list[str] | None = None
+    min_confidence: float | None = None
+
+
+class PredictionRejectPayload(BaseModel):
+    prediction_ids: list[str] | None = None
+
+
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None) -> FastAPI:
     app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0")
     app.state.dataset = dataset
     embeddings = EmbeddingsManager(dataset)
     app.state.embeddings = embeddings
+    predictor = predictor or PredictorManager(dataset)
+    app.state.predictor = predictor
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
 
@@ -165,6 +193,50 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None) -> FastA
     @app.post("/api/v1/objects/bulk")
     async def bulk_objects(payload: BulkObjectPayload):
         return dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations])
+
+    @app.get("/api/v1/predictor")
+    async def predictor_state():
+        return predictor.payload()
+
+    @app.post("/api/v1/predictor/load")
+    async def predictor_load(payload: PredictorLoadPayload):
+        return predictor.load(payload.path, payload.conf, payload.iou)
+
+    @app.put("/api/v1/predictor/mapping")
+    async def predictor_mapping(payload: PredictorMappingPayload):
+        return predictor.set_mapping(payload.mapping)
+
+    @app.post("/api/v1/predictor/run")
+    async def predictor_run(payload: PredictorRunPayload):
+        return predictor.run(payload.image_ids, payload.split, payload.only_unlabeled)
+
+    @app.post("/api/v1/images/{image_id}/predictions/compute")
+    async def compute_predictions(image_id: str):
+        try:
+            return predictor.predict_image(image_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.get("/api/v1/images/{image_id}/predictions")
+    async def image_predictions(image_id: str):
+        try:
+            return predictor.predictions_for(image_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/v1/images/{image_id}/predictions/accept")
+    async def accept_predictions(image_id: str, payload: PredictionAcceptPayload):
+        try:
+            return predictor.accept(image_id, payload.prediction_ids, payload.min_confidence)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @app.post("/api/v1/images/{image_id}/predictions/reject")
+    async def reject_predictions(image_id: str, payload: PredictionRejectPayload):
+        try:
+            return predictor.reject(image_id, payload.prediction_ids)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/embeddings")
     async def embeddings_state():

@@ -13,7 +13,7 @@ pip install -e '.[test,embeddings]'
 ```
 OR use UV
 ```bash
-uv sync --extra embeddings --extra test
+uv sync
 ```
 
 If you want to use embedings - 

@@ -537,3 +537,58 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 .bulk-bar strong { font-size: 13px; color: var(--accent-strong); white-space: nowrap; }
 .card-check { position: absolute; top: 8px; left: 8px; width: 17px; height: 17px; margin: 0; accent-color: var(--accent); cursor: pointer; opacity: 0; transition: opacity .12s; }
 .card-check:checked, .object-card:hover .card-check, .card-check:focus-visible { opacity: 1; }
+
+/* ---------- model-assisted labeling ---------- */
+.assist-bar { margin-top: -6px; }
+.assist-bar input[type="text"] { min-width: 260px; font-family: ui-monospace, monospace; font-size: 12px; }
+.pred-flag {
+  position: absolute;
+  bottom: 8px; right: 8px;
+  background: var(--accent-strong, #0c7a63);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 999px;
+}
+.mapping-panel { position: relative; align-self: end; }
+.mapping-panel summary { cursor: pointer; font-size: 13px; color: var(--text-2); height: 34px; display: flex; align-items: center; user-select: none; }
+.mapping-list {
+  position: absolute;
+  z-index: 30;
+  top: 100%; left: 0;
+  min-width: 300px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+}
+.mapping-row { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.mapping-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mapping-row select { width: 150px; height: 28px; font-size: 12px; }
+.pred-threshold { font-size: 12px; color: var(--ed-text-2); margin-top: 2px; }
+#prediction-section input[type="range"] { width: 100%; accent-color: var(--accent); }
+.pred-actions { display: flex; gap: 6px; margin: 6px 0; }
+.pred-actions button { flex: 1; font-size: 12px; }
+.pred-row { border-style: dashed; }
+.pred-row.pred-dim { opacity: 0.45; }
+.pred-row .pred-name { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#editor .row-accept {
+  width: 22px; height: 22px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--accent-strong, #0c7a63);
+  font-size: 14px;
+  cursor: pointer;
+  opacity: 0;
+}
+.pred-row:hover .row-accept { opacity: 1; }
+.pred-row .row-accept:disabled { color: var(--ed-text-2); cursor: not-allowed; }
+#editor .row-accept:hover:not(:disabled) { background: var(--accent-weak, #143028); }

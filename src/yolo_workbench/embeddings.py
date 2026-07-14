@@ -35,7 +35,7 @@ class EmbeddingsManager:
     def start(self) -> dict:
         with self._lock:
             if self.status == "unavailable":
-                self.error = "fiftyone is not installed. Install with: uv pip install 'yolo-workbench[embeddings]'"
+                self.error = "fiftyone is not installed. Run 'uv sync' to install all dependencies"
             elif self.status != "computing":
                 self.status = "computing"
                 self.error = None
