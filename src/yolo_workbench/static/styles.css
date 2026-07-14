@@ -622,6 +622,11 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   flex-direction: column;
   gap: 2px;
 }
+
+.model-menu[hidden] {
+    display: none;
+}
+
 .model-option.active { background: var(--accent-weak); outline: 1px solid var(--accent); }
 .model-option {
   display: flex;
