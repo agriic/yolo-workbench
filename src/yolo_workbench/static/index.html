@@ -46,6 +46,13 @@
         <label class="field">Class<select id="object-class"></select></label>
         <label class="field">Split<select id="object-split"><option value="all">All splits</option></select></label>
         <label class="field"><span class="field-label">Crop padding <span id="padding-value" class="muted">15%</span></span><input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
+        <div id="object-bulk" class="bulk-bar" hidden>
+          <strong id="object-selected-count"></strong>
+          <select id="bulk-class" title="Target class"></select>
+          <button id="bulk-relabel" class="secondary">Relabel</button>
+          <button id="bulk-delete" class="danger-btn">Delete</button>
+          <button id="bulk-clear" class="secondary">Clear</button>
+        </div>
         <div id="object-total" class="total"></div>
       </div>
       <div id="object-grid" class="grid object-grid"></div>

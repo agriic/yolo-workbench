@@ -526,3 +526,12 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   background: var(--surface);
 }
 .class-chip.active { background: var(--c); border-color: var(--c); color: #fff; font-weight: 600; }
+
+/* ---------- bulk operations ---------- */
+.issue-chip-group { display: inline-flex; align-items: center; gap: 4px; }
+.fix-all { border-radius: 999px; font-size: 12px; padding: 5px 10px; color: var(--accent-strong); border-color: var(--accent); }
+.fix-all:hover:not(:disabled) { background: var(--accent-weak); }
+.bulk-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--accent); background: var(--accent-weak); border-radius: var(--radius); }
+.bulk-bar strong { font-size: 13px; color: var(--accent-strong); white-space: nowrap; }
+.card-check { position: absolute; top: 8px; left: 8px; width: 17px; height: 17px; margin: 0; accent-color: var(--accent); cursor: pointer; opacity: 0; transition: opacity .12s; }
+.card-check:checked, .object-card:hover .card-check, .card-check:focus-visible { opacity: 1; }

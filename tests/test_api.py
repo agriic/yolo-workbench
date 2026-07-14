@@ -40,3 +40,23 @@ def test_embeddings_endpoints_report_state(tmp_path):
             started = (await client.post("/api/v1/embeddings/compute")).json()
             assert started["status"] in {"computing", "ready", "unavailable"}
     asyncio.run(run())
+
+
+def test_bulk_endpoints(tmp_path):
+    dataset, label = make_dataset(tmp_path)
+    label.write_text("1 0.5 0.5 0.2 0.4\n1 0.5 0.5 0.2 0.4\n")
+    dataset = type(dataset)(dataset.yaml_path, "detection")
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=create_app(dataset)), base_url="http://test") as client:
+            fixed = await client.post("/api/v1/issues/fix-bulk", json={"kind": "duplicate"})
+            assert fixed.status_code == 200
+            assert fixed.json()["fixed"] == 1
+            image_id = next(iter(dataset.images))
+            annotation_id = dataset.images[image_id].annotations[0].id
+            bulk = await client.post("/api/v1/objects/bulk", json={"operations": [{"image_id": image_id, "annotation_id": annotation_id, "action": "relabel", "class_id": 0}]})
+            assert bulk.status_code == 200
+            assert bulk.json()["applied"] == 1
+            assert label.read_text().startswith("0 ")
+            undo = (await client.post("/api/v1/history/undo")).json()
+            assert undo["image_ids"] == [image_id]
+    asyncio.run(run())

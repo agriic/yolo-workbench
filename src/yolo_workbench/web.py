@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, Response
@@ -29,6 +30,23 @@ class AnnotationPayload(BaseModel):
 
 class AnnotationListPayload(BaseModel):
     annotations: list[AnnotationPayload]
+
+
+class BulkFixPayload(BaseModel):
+    kind: str
+    split: str | None = None
+    issue_ids: list[str] | None = None
+
+
+class BulkObjectOperation(BaseModel):
+    image_id: str
+    annotation_id: str
+    action: Literal["relabel", "delete"]
+    class_id: int | None = None
+
+
+class BulkObjectPayload(BaseModel):
+    operations: list[BulkObjectOperation]
 
 
 def create_app(dataset: Dataset) -> FastAPI:
@@ -111,9 +129,17 @@ def create_app(dataset: Dataset) -> FastAPI:
     async def issues():
         return {"items": dataset.issues()}
 
+    @app.post("/api/v1/issues/fix-bulk")
+    async def fix_issues_bulk(payload: BulkFixPayload):
+        return dataset.fix_issues_bulk(payload.kind, payload.split, payload.issue_ids)
+
     @app.post("/api/v1/issues/{issue_id}/fix")
     async def fix_issue(issue_id: str):
         return dataset.fix_issue(issue_id)
+
+    @app.post("/api/v1/objects/bulk")
+    async def bulk_objects(payload: BulkObjectPayload):
+        return dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations])
 
     @app.get("/api/v1/embeddings")
     async def embeddings_state():

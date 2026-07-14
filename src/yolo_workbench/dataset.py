@@ -41,8 +41,9 @@ class Dataset:
         self.orphan_labels: list[Path] = []
         self._mtimes: dict[Path, int | None] = {}
         self._lock = threading.RLock()
-        self._undo: list[HistoryEntry] = []
-        self._redo: list[HistoryEntry] = []
+        # each history entry is a transaction: one or more label files written together
+        self._undo: list[list[HistoryEntry]] = []
+        self._redo: list[list[HistoryEntry]] = []
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
         self._backed_up: set[Path] = set()
         self._load()
@@ -191,6 +192,11 @@ class Dataset:
 
     def replace_annotations(self, image_id: str, raw_annotations: list[dict]) -> dict:
         record = self.require_image(image_id)
+        self._commit_many([self._prepare(record, raw_annotations)])
+        return self.detail(image_id)
+
+    def _prepare(self, record: ImageRecord, raw_annotations: list[dict]) -> tuple[ImageRecord, str, str]:
+        """Validate raw annotations and return a (record, new content, current content) change."""
         if any(issue["kind"] == "malformed_label" for issue in record.issues):
             raise DatasetError("Resolve or remove malformed label rows before editing this image")
         annotations = []
@@ -204,23 +210,28 @@ class Dataset:
                 raise DatasetError("Invalid annotation geometry")
             annotations.append(Annotation(raw.get("id") or f"{record.id}:new:{index}", class_id, points))
         content = "".join(f"{a.class_id} {' '.join(self._number(v) for v in a.points)}\n" for a in annotations)
-        self._commit(record, content, record.label_path.read_text(encoding="utf-8") if record.label_path.exists() else "")
-        return self.detail(image_id)
+        before = record.label_path.read_text(encoding="utf-8") if record.label_path.exists() else ""
+        return record, content, before
 
     def _number(self, value: float) -> str:
         return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
-    def _commit(self, record: ImageRecord, content: str, before: str, history=True) -> None:
+    def _commit_many(self, changes: list[tuple[ImageRecord, str, str]], history=True) -> None:
+        """Write all changes as one transaction: every mtime is checked before any file is touched."""
         with self._lock:
-            current_mtime = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
-            if current_mtime != self._mtimes.get(record.label_path):
-                raise WriteConflict("Label changed outside this application; reload before saving")
-            self._backup(record.label_path, before)
-            self._atomic_write(record.label_path, content)
-            if history:
-                self._undo.append(HistoryEntry(record.label_path, before, content))
+            for record, _, _ in changes:
+                current_mtime = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
+                if current_mtime != self._mtimes.get(record.label_path):
+                    raise WriteConflict(f"{record.label_path.name} changed outside this application; reload before saving")
+            transaction = []
+            for record, content, before in changes:
+                self._backup(record.label_path, before)
+                self._atomic_write(record.label_path, content)
+                transaction.append(HistoryEntry(record.label_path, before, content))
+                self._read_record(record)
+            if history and transaction:
+                self._undo.append(transaction)
                 self._redo.clear()
-            self._read_record(record)
 
     def _backup(self, label_path: Path, content: str) -> None:
         if label_path in self._backed_up:
@@ -251,13 +262,22 @@ class Dataset:
         source, target = (self._undo, self._redo) if direction == "undo" else (self._redo, self._undo)
         if not source:
             raise DatasetError(f"Nothing to {direction}")
-        entry = source.pop()
-        record = next(record for record in self.images.values() if record.label_path == entry.label_path)
-        content = entry.before if direction == "undo" else entry.after
-        before = entry.after if direction == "undo" else entry.before
-        self._commit(record, content, before, history=False)
-        target.append(entry)
-        return {"image_id": record.id, "can_undo": bool(self._undo), "can_redo": bool(self._redo)}
+        transaction = source.pop()
+        entries = list(reversed(transaction)) if direction == "undo" else transaction
+        changes = []
+        for entry in entries:
+            record = next(record for record in self.images.values() if record.label_path == entry.label_path)
+            content = entry.before if direction == "undo" else entry.after
+            before = entry.after if direction == "undo" else entry.before
+            changes.append((record, content, before))
+        try:
+            self._commit_many(changes, history=False)
+        except WriteConflict:
+            source.append(transaction)
+            raise
+        target.append(transaction)
+        image_ids = [record.id for record, _, _ in changes]
+        return {"image_ids": image_ids, "image_id": image_ids[0], "can_undo": bool(self._undo), "can_redo": bool(self._redo)}
 
     def issues(self) -> list[dict]:
         issues = [issue for record in self.images.values() for issue in record.issues]
@@ -282,3 +302,76 @@ class Dataset:
                 annotations.remove(annotation)
             return self.replace_annotations(record.id, [a.as_dict() for a in annotations])
         raise DatasetError("Issue not found or cannot be fixed automatically")
+
+    def fix_issues_bulk(self, kind: str, split: str | None = None, issue_ids: list[str] | None = None) -> dict:
+        """Fix every matching fixable issue in one transaction; skips images that fail validation."""
+        wanted = set(issue_ids) if issue_ids else None
+        changes, skipped, fixed = [], [], 0
+        for record in self.images.values():
+            if split is not None and record.split != split:
+                continue
+            issues = [issue for issue in record.issues if issue["fixable"] and issue["kind"] == kind and (wanted is None or issue["id"] in wanted)]
+            if not issues:
+                continue
+            try:
+                changes.append(self._prepare(record, self._repair(record, issues)))
+                fixed += len(issues)
+            except DatasetError as exc:
+                skipped.append({"image_id": record.id, "image_name": record.path.name, "reason": str(exc)})
+        if not changes and not skipped:
+            raise DatasetError(f"No fixable {kind} issues match")
+        if changes:
+            self._commit_many(changes)
+        return {"fixed": fixed, "files": len(changes), "skipped": skipped}
+
+    def _repair(self, record: ImageRecord, issues: list[dict]) -> list[dict]:
+        if any(issue["kind"] == "missing_label" for issue in issues):
+            return []
+        annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
+        removed: set[str] = set()
+        for issue in issues:
+            annotation = next((a for a in annotations if a.id == issue["annotation_id"]), None)
+            if not annotation:
+                continue
+            if issue["kind"] == "out_of_range":
+                annotation.points = [min(1, max(0, value)) for value in annotation.points]
+            elif issue["kind"] in {"zero_area", "duplicate"}:
+                removed.add(annotation.id)
+        return [a.as_dict() for a in annotations if a.id not in removed]
+
+    def bulk_edit_objects(self, operations: list[dict]) -> dict:
+        """Relabel or delete many annotations across images in one transaction."""
+        grouped: dict[str, list[dict]] = {}
+        for operation in operations:
+            grouped.setdefault(operation["image_id"], []).append(operation)
+        changes, skipped, applied = [], [], 0
+        for image_id, group in grouped.items():
+            record = self.images.get(image_id)
+            if not record:
+                skipped.append({"image_id": image_id, "annotation_id": None, "reason": "Image not found"})
+                continue
+            annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
+            count = 0
+            for operation in group:
+                annotation = next((a for a in annotations if a.id == operation["annotation_id"]), None)
+                if not annotation:
+                    skipped.append({"image_id": image_id, "annotation_id": operation["annotation_id"], "reason": "Annotation not found"})
+                    continue
+                if operation["action"] == "delete":
+                    annotations.remove(annotation)
+                elif operation.get("class_id") is None:
+                    skipped.append({"image_id": image_id, "annotation_id": operation["annotation_id"], "reason": "Relabel requires class_id"})
+                    continue
+                else:
+                    annotation.class_id = int(operation["class_id"])
+                count += 1
+            if not count:
+                continue
+            try:
+                changes.append(self._prepare(record, [a.as_dict() for a in annotations]))
+                applied += count
+            except DatasetError as exc:
+                skipped.append({"image_id": image_id, "annotation_id": None, "reason": str(exc)})
+        if changes:
+            self._commit_many(changes)
+        return {"applied": applied, "files": len(changes), "skipped": skipped}

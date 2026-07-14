@@ -19,6 +19,9 @@ const HANDLE_CURSORS = ["nwse-resize", "ns-resize", "nesw-resize", "ew-resize", 
 const state = {
   meta: null,
   gridImages: [],
+  gridObjects: [],
+  objectSelection: new Map(),  // "imageId|annotationId" -> object item
+  lastObjectIndex: null,
   issues: [],
   issueFilter: null,
   detail: null,        // image detail currently in the editor
@@ -61,7 +64,7 @@ async function init() {
   const yamlName = state.meta.yaml.split("/").slice(-2).join("/");
   $("dataset-name").textContent = `${yamlName} · ${state.meta.category}`;
   $("dataset-name").title = state.meta.yaml;
-  for (const select of [$("image-class"), $("object-class"), $("draw-class")])
+  for (const select of [$("image-class"), $("object-class"), $("draw-class"), $("bulk-class")])
     for (const [id, name] of Object.entries(state.meta.names))
       select.insertAdjacentHTML("beforeend", `<option value="${esc(id)}">${esc(id)} · ${esc(name)}</option>`);
   for (const select of [$("image-split"), $("object-split"), $("embed-split")])
@@ -101,7 +104,12 @@ function bind() {
   });
   [$("image-split"), $("image-class"), $("show-overlays")].forEach(el => el.onchange = loadImages);
   $("image-search").oninput = debounce(loadImages, 250);
-  [$("object-class"), $("object-split")].forEach(el => el.onchange = loadObjects);
+  [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects(); });
+  $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
+  $("bulk-delete").onclick = () => {
+    if (confirm(`Delete ${state.objectSelection.size} annotation${state.objectSelection.size === 1 ? "" : "s"}?`)) runObjectBulk("delete");
+  };
+  $("bulk-clear").onclick = () => { clearObjectSelection(); loadObjects(); };
   $("crop-padding").oninput = () => {
     $("padding-value").textContent = `${Math.round($("crop-padding").value * 100)}%`;
     reloadObjectsDebounced();
@@ -156,6 +164,8 @@ function bind() {
     if (card && e.key === "Enter") openEditor(card.dataset.image);
   });
   $("object-grid").addEventListener("click", e => {
+    const check = e.target.closest(".card-check");
+    if (check) return handleObjectCheck(check, e.shiftKey);
     const open = e.target.closest("[data-open-object]");
     if (open) return openEditor(open.dataset.owner, open.dataset.openObject);
     const del = e.target.closest("[data-delete-object]");
@@ -166,6 +176,8 @@ function bind() {
     if (select) editObject(select.dataset.owner, select.dataset.objectClass, a => a.class_id = +select.value);
   });
   $("issue-summary").addEventListener("click", e => {
+    const fixAll = e.target.closest("[data-fix-kind]");
+    if (fixAll) return fixAllIssues(fixAll.dataset.fixKind, +fixAll.dataset.count);
     const chip = e.target.closest("[data-kind]");
     if (!chip) return;
     state.issueFilter = state.issueFilter === chip.dataset.kind ? null : chip.dataset.kind;
@@ -244,14 +256,15 @@ function bind() {
 }
 
 function keyDown(e) {
-  if (!$("editor").open) return;
   if (/^(input|select|textarea)$/i.test(e.target.tagName)) return;
   const key = e.key;
+  // undo/redo works everywhere so bulk fixes outside the editor can be reverted
   if ((e.ctrlKey || e.metaKey) && key.toLowerCase() === "z") {
     e.preventDefault();
     return applyHistory(e.shiftKey ? "redo" : "undo");
   }
   if ((e.ctrlKey || e.metaKey) && key.toLowerCase() === "y") { e.preventDefault(); return applyHistory("redo"); }
+  if (!$("editor").open) return;
   if (key === " ") { e.preventDefault(); state.spaceDown = true; $("canvas").style.cursor = "grab"; return; }
   if (key === "Delete" || key === "Backspace") return deleteSelected();
   if (key === "ArrowLeft") return navigate(-1);
@@ -758,12 +771,13 @@ async function save(selectIndex = null) {
 }
 
 async function applyHistory(direction) {
+  if (direction === "undo" ? !state.canUndo : !state.canRedo) return;
   try {
     const result = await api(`/api/v1/history/${direction}`, { method: "POST" });
     state.canUndo = result.can_undo;
     state.canRedo = result.can_redo;
     updateHistoryButtons();
-    if (state.detail && result.image_id === state.detail.id) {
+    if (state.detail && result.image_ids.includes(state.detail.id)) {
       state.detail = await api(`/api/v1/images/${state.detail.id}`);
       if (!state.detail.annotations.some(a => a.id === state.selected)) state.selected = null;
       renderList();
@@ -806,12 +820,17 @@ async function loadObjects() {
   const classId = $("object-class").value || Object.keys(state.meta.names)[0];
   const params = new URLSearchParams({ class_id: classId, split: $("object-split").value, limit: "500" });
   const data = await api(`/api/v1/objects?${params}`);
+  state.gridObjects = data.items;
+  const valid = new Set(data.items.map(objectKey));
+  for (const key of [...state.objectSelection.keys()]) if (!valid.has(key)) state.objectSelection.delete(key);
+  renderObjectBulkBar();
   $("object-total").textContent = `${data.items.length < data.total ? `${data.items.length} of ` : ""}${data.total} objects`;
   const padding = $("crop-padding").value;
-  $("object-grid").innerHTML = data.items.map(item => `
+  $("object-grid").innerHTML = data.items.map((item, index) => `
     <article class="card object-card">
       <div class="thumb">
         <img loading="lazy" src="/api/v1/objects/${item.image_id}/${encodeURIComponent(item.id)}/crop?padding=${padding}" alt="">
+        <input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for range)" ${state.objectSelection.has(objectKey(item)) ? "checked" : ""}>
         <span class="class-tag" style="background:${classColor(item.class_id)}">${esc(state.meta.names[item.class_id] ?? `class ${item.class_id}`)}</span>
       </div>
       <div class="card-body">
@@ -824,6 +843,56 @@ async function loadObjects() {
         </div>
       </div>
     </article>`).join("") || `<p class="empty">No objects of this class in the selected split.</p>`;
+}
+
+const objectKey = item => `${item.image_id}|${item.id}`;
+
+function handleObjectCheck(check, shiftKey) {
+  const index = +check.dataset.index;
+  const on = check.checked;
+  const indices = shiftKey && state.lastObjectIndex != null
+    ? Array.from({ length: Math.abs(index - state.lastObjectIndex) + 1 }, (_, i) => Math.min(index, state.lastObjectIndex) + i)
+    : [index];
+  for (const i of indices) {
+    const item = state.gridObjects[i];
+    if (!item) continue;
+    if (on) state.objectSelection.set(objectKey(item), item);
+    else state.objectSelection.delete(objectKey(item));
+    const box = $("object-grid").querySelector(`.card-check[data-index="${i}"]`);
+    if (box) box.checked = on;
+  }
+  state.lastObjectIndex = index;
+  renderObjectBulkBar();
+}
+
+function renderObjectBulkBar() {
+  const count = state.objectSelection.size;
+  $("object-bulk").hidden = !count;
+  $("object-selected-count").textContent = `${count} selected`;
+}
+
+function clearObjectSelection() {
+  state.objectSelection.clear();
+  state.lastObjectIndex = null;
+  renderObjectBulkBar();
+}
+
+async function runObjectBulk(action, classId = null) {
+  const operations = [...state.objectSelection.values()].map(item =>
+    ({ image_id: item.image_id, annotation_id: item.id, action, class_id: classId }));
+  if (!operations.length) return;
+  try {
+    const result = await api("/api/v1/objects/bulk", { method: "POST", body: JSON.stringify({ operations }) });
+    state.canUndo = true;
+    state.canRedo = false;
+    updateHistoryButtons();
+    const skipped = result.skipped.length ? ` · ${result.skipped.length} skipped` : "";
+    toast(`${action === "delete" ? "Deleted" : "Relabeled"} ${result.applied} annotation${result.applied === 1 ? "" : "s"} in ${result.files} file${result.files === 1 ? "" : "s"}${skipped} — Ctrl+Z undoes`);
+    clearObjectSelection();
+    await Promise.all([loadImages(), loadObjects(), loadIssues()]);
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 async function editObject(imageId, id, change) {
@@ -1239,11 +1308,17 @@ async function loadIssues() {
 
 function renderIssues() {
   const items = state.issues;
-  const counts = {};
-  for (const issue of items) counts[issue.kind] = (counts[issue.kind] || 0) + 1;
+  const counts = {}, fixable = {};
+  for (const issue of items) {
+    counts[issue.kind] = (counts[issue.kind] || 0) + 1;
+    if (issue.fixable) fixable[issue.kind] = (fixable[issue.kind] || 0) + 1;
+  }
   if (state.issueFilter && !counts[state.issueFilter]) state.issueFilter = null;
-  $("issue-summary").innerHTML = Object.entries(counts).map(([kind, count]) =>
-    `<button class="issue-chip ${state.issueFilter === kind ? "active" : ""}" data-kind="${esc(kind)}">${esc(kind.replaceAll("_", " "))} <strong>${count}</strong></button>`).join("");
+  $("issue-summary").innerHTML = Object.entries(counts).map(([kind, count]) => `
+    <span class="issue-chip-group">
+      <button class="issue-chip ${state.issueFilter === kind ? "active" : ""}" data-kind="${esc(kind)}">${esc(kind.replaceAll("_", " "))} <strong>${count}</strong></button>
+      ${fixable[kind] ? `<button class="fix-all" data-fix-kind="${esc(kind)}" data-count="${fixable[kind]}" title="Fix all ${fixable[kind]} automatically">Fix all</button>` : ""}
+    </span>`).join("");
   const visible = state.issueFilter ? items.filter(issue => issue.kind === state.issueFilter) : items;
   $("issues").innerHTML = visible.map(issue => `
     <div class="issue">
@@ -1256,6 +1331,21 @@ function renderIssues() {
         ${issue.fixable ? `<button data-fix="${issue.id}">Fix</button>` : ""}
       </span>
     </div>`).join("") || `<div class="empty">No issues found. The dataset looks clean.</div>`;
+}
+
+async function fixAllIssues(kind, count) {
+  if (!confirm(`Fix all ${count} ${kind.replaceAll("_", " ")} issue${count === 1 ? "" : "s"}? Ctrl+Z undoes the whole batch.`)) return;
+  try {
+    const result = await api("/api/v1/issues/fix-bulk", { method: "POST", body: JSON.stringify({ kind }) });
+    state.canUndo = true;
+    state.canRedo = false;
+    updateHistoryButtons();
+    const skipped = result.skipped.length ? ` · ${result.skipped.length} image${result.skipped.length === 1 ? "" : "s"} skipped (${result.skipped[0].reason})` : "";
+    toast(`Fixed ${result.fixed} issue${result.fixed === 1 ? "" : "s"} in ${result.files} file${result.files === 1 ? "" : "s"}${skipped}`, result.skipped.length ? "error" : "info");
+    await Promise.all([loadImages(), loadObjects(), loadIssues()]);
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 /* ---------- helpers ---------- */
