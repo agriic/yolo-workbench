@@ -108,6 +108,14 @@ function bind() {
   };
   $("refresh-issues").onclick = loadIssues;
 
+  $("theme-toggle").onclick = () => {
+    const root = document.documentElement;
+    const dark = root.dataset.theme !== "dark";
+    if (dark) root.dataset.theme = "dark"; else delete root.dataset.theme;
+    localStorage.setItem("theme", dark ? "dark" : "light");
+    if ($("embeddings").classList.contains("active")) renderEmbeddings();
+  };
+
   $("compute-embeddings").onclick = computeEmbeddings;
   $("embed-mode-2d").onclick = () => setEmbedMode("2d");
   $("embed-mode-3d").onclick = () => setEmbedMode("3d");
@@ -951,7 +959,7 @@ function renderEmbedAxes(ctx, w, h) {
     corners.push({ point: { x, y, z }, ...projectEmbedPoint({ x, y, z }, w, h) });
   const corner = (x, y, z) => corners[(x * 4) + (y * 2) + z];
   ctx.save();
-  ctx.strokeStyle = "rgb(28 52 45 / 14%)";
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--embed-grid").trim();
   ctx.lineWidth = 1;
   for (const x of [0, 1]) for (const y of [0, 1]) for (const z of [0, 1]) {
     for (const [dx, dy, dz] of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) {

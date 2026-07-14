@@ -11,6 +11,11 @@
   --accent-weak: #e3f2ee;
   --danger: #c03221;
   --warn: #d99a12;
+  --surface-hover: #f7faf9;
+  --thumb-bg: #e8edeb;
+  --hint-bg: rgb(255 255 255 / 82%);
+  --embed-grid: rgb(28 52 45 / 14%);
+  --card-hover-shadow: 0 4px 16px rgb(12 28 22 / 12%);
   --radius: 8px;
   --shadow-1: 0 1px 2px rgb(12 28 22 / 6%);
   --shadow-2: 0 18px 50px rgb(8 24 18 / 30%);
@@ -25,6 +30,30 @@
   font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", sans-serif;
   color: var(--text);
   background: var(--bg);
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --bg: #121615;
+  --surface: #1a201e;
+  --line: #2a322f;
+  --line-strong: #3d4844;
+  --text: #e5eae8;
+  --text-2: #9aa6a1;
+  --text-3: #6c7773;
+  --accent: #2eb593;
+  --accent-strong: #4cc7a7;
+  --accent-weak: #1d312b;
+  --danger: #e05a49;
+  --warn: #e0a92e;
+  --surface-hover: #222926;
+  --thumb-bg: #121615;
+  --hint-bg: rgb(26 32 30 / 85%);
+  --embed-grid: rgb(210 235 226 / 12%);
+  --card-hover-shadow: 0 4px 16px rgb(0 0 0 / 35%);
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 25%);
+  --shadow-2: 0 18px 50px rgb(0 0 0 / 55%);
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -42,7 +71,7 @@ button {
   align-items: center;
   gap: 6px;
 }
-button:hover:not(:disabled) { border-color: var(--line-strong); background: #f7faf9; }
+button:hover:not(:disabled) { border-color: var(--line-strong); background: var(--surface-hover); }
 button:disabled { opacity: .4; cursor: default; }
 button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   outline: 2px solid var(--accent);
@@ -108,6 +137,10 @@ header nav { margin-left: auto; display: flex; height: 100%; }
   text-align: center;
 }
 .badge:empty { display: none; }
+#theme-toggle { flex: none; }
+#theme-toggle .icon-sun { display: none; }
+:root[data-theme="dark"] #theme-toggle .icon-sun { display: block; }
+:root[data-theme="dark"] #theme-toggle .icon-moon { display: none; }
 
 /* ---------- layout ---------- */
 main { padding: 18px 22px 48px; }
@@ -149,9 +182,9 @@ main { padding: 18px 22px 48px; }
   transition: box-shadow .12s ease, border-color .12s ease;
   min-width: 0;
 }
-.card:hover { border-color: var(--line-strong); box-shadow: 0 4px 16px rgb(12 28 22 / 12%); }
+.card:hover { border-color: var(--line-strong); box-shadow: var(--card-hover-shadow); }
 .card[data-image] { cursor: pointer; }
-.thumb { position: relative; background: #e8edeb; }
+.thumb { position: relative; background: var(--thumb-bg); }
 .thumb img { display: block; width: 100%; height: 170px; object-fit: contain; }
 .object-card .thumb img { height: 180px; }
 .issue-flag {
@@ -432,7 +465,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 .embed-wrap {
   position: relative;
   flex: 1;
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 10px;
   overflow: hidden;
@@ -444,13 +477,13 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   bottom: 10px;
   padding: 4px 8px;
   border-radius: 5px;
-  background: rgb(255 255 255 / 82%);
+  background: var(--hint-bg);
   color: var(--muted);
   font-size: 11px;
   pointer-events: none;
 }
 .embed-mode { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
-.embed-mode button { border: 0; border-radius: 0; padding: 4px 10px; background: #fff; color: var(--muted); }
+.embed-mode button { border: 0; border-radius: 0; padding: 4px 10px; background: var(--surface); color: var(--muted); }
 .embed-mode button + button { border-left: 1px solid var(--line); }
 .embed-mode button.active { background: var(--accent); color: #fff; }
 .embed-tooltip {
@@ -458,7 +491,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   z-index: 2;
   width: 220px;
   padding: 8px;
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   box-shadow: 0 8px 24px rgb(12 28 22 / 18%);
@@ -471,7 +504,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   width: 280px;
   display: flex;
   flex-direction: column;
-  background: #fff;
+  background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 12px;
@@ -490,6 +523,6 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   border: 1px solid var(--line);
   border-radius: 999px;
   font-size: 12px;
-  background: #fff;
+  background: var(--surface);
 }
 .class-chip.active { background: var(--c); border-color: var(--c); color: #fff; font-weight: 600; }
