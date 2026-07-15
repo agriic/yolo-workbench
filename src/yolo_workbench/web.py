@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import io
+import math
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from .dataset import Dataset, DatasetError, WriteConflict
 from .embeddings import EmbeddingsManager
@@ -24,13 +27,18 @@ def class_color(class_id: int) -> str:
     return PALETTE[class_id % len(PALETTE)]
 
 
-class AnnotationPayload(BaseModel):
+class StrictPayload(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+
+class AnnotationPayload(StrictPayload):
     id: str | None = None
     class_id: int
     points: list[float]
 
 
-class AnnotationListPayload(BaseModel):
+class AnnotationListPayload(StrictPayload):
+    revision: int = Field(ge=1)
     annotations: list[AnnotationPayload]
 
 
@@ -51,10 +59,10 @@ class BulkObjectPayload(BaseModel):
     operations: list[BulkObjectOperation]
 
 
-class PredictorLoadPayload(BaseModel):
+class PredictorLoadPayload(StrictPayload):
     path: str
-    conf: float | None = None
-    iou: float | None = None
+    conf: float | None = Field(default=None, ge=0, le=1)
+    iou: float | None = Field(default=None, ge=0, le=1)
 
 
 class PredictorMappingPayload(BaseModel):
@@ -67,9 +75,9 @@ class PredictorRunPayload(BaseModel):
     only_unlabeled: bool = False
 
 
-class PredictionAcceptPayload(BaseModel):
+class PredictionAcceptPayload(StrictPayload):
     prediction_ids: list[str] | None = None
-    min_confidence: float | None = None
+    min_confidence: float | None = Field(default=None, ge=0, le=1)
 
 
 class PredictionRejectPayload(BaseModel):
@@ -105,6 +113,10 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     @app.exception_handler(WriteConflict)
     async def conflict_error(_, exc: WriteConflict):
         return Response(content=f'{{"detail": {json_string(str(exc))}}}', status_code=409, media_type="application/json")
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_, exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={"detail": json_safe(jsonable_encoder(exc.errors()))})
 
     @app.get("/api/v1/dataset")
     async def metadata():
@@ -146,7 +158,11 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     @app.put("/api/v1/images/{image_id}/annotations")
     async def update_annotations(image_id: str, payload: AnnotationListPayload):
         try:
-            return dataset.replace_annotations(image_id, [annotation.model_dump() for annotation in payload.annotations])
+            return dataset.replace_annotations(
+                image_id,
+                [annotation.model_dump() for annotation in payload.annotations],
+                expected_revision=payload.revision,
+            )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -273,6 +289,17 @@ def json_string(value: str) -> str:
     import json
 
     return json.dumps(value)
+
+
+def json_safe(value):
+    """Replace non-finite floats so validation details remain valid JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
 
 
 def render_thumbnail(record: ImageRecord, size: int, category: str | None = None) -> bytes:

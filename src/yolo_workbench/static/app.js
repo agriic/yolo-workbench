@@ -48,6 +48,11 @@ const state = {
 };
 
 let dpr = 1, cssW = 0, cssH = 0;
+let editorRequest = 0;
+let saveQueue = Promise.resolve();
+let saveSequence = 0;
+const latestSaveByImage = new Map();
+const savedRevisionByImage = new Map();
 
 function toast(message, kind = "info") {
   const el = $("toast");
@@ -292,6 +297,7 @@ function bind() {
     if (state.drawing) { e.preventDefault(); state.drawing = null; render(); }
   });
   $("editor").addEventListener("close", () => {
+    editorRequest += 1;
     state.detail = null; state.img = null; state.drawing = null; state.drag = null; state.selected = null;
     state.pred.items = [];
     renderPredList();
@@ -394,7 +400,25 @@ async function loadImages(append) {
 /* ---------- editor ---------- */
 
 async function openEditor(id, focus = null) {
-  state.detail = await api(`/api/v1/images/${id}`);
+  const request = ++editorRequest;
+  state.detail = null;
+  state.img = null;
+  state.drawing = null;
+  state.drag = null;
+  state.selected = null;
+  render();
+  await saveQueue;
+  if (request !== editorRequest) return;
+  let detail;
+  try {
+    detail = await api(`/api/v1/images/${id}`);
+  } catch (error) {
+    if (request === editorRequest) toast(error.message, "error");
+    return;
+  }
+  if (request !== editorRequest) return;
+  state.detail = detail;
+  savedRevisionByImage.set(id, detail.revision);
   state.pred.items = [];
   loadEditorPredictions(id);
   state.selected = focus;
@@ -835,42 +859,89 @@ async function deleteSelected() {
 /* ---------- persistence ---------- */
 
 async function save(selectIndex = null) {
+  if (!state.detail) return;
   const image = state.detail;
   const index = selectIndex ?? image.annotations.findIndex(a => a.id === state.selected);
-  try {
-    state.detail = await api(`/api/v1/images/${image.id}/annotations`, {
-      method: "PUT",
-      body: JSON.stringify({ annotations: image.annotations }),
-    });
-    state.canUndo = true;
-    state.canRedo = false;
-    // the server re-derives annotation ids from line numbers, so re-select by position
-    state.selected = index >= 0 ? state.detail.annotations[index]?.id ?? null : null;
-  } catch (error) {
-    toast(error.message, "error");
-    state.detail = await api(`/api/v1/images/${image.id}`);
-    state.selected = null;
-  }
-  updateHistoryButtons();
-  renderList();
-  render();
-  loadImages();
-  loadObjects();
-  loadIssues();
+  const request = editorRequest;
+  const sequence = ++saveSequence;
+  const annotations = image.annotations.map(annotation => ({
+    id: annotation.id,
+    class_id: annotation.class_id,
+    points: [...annotation.points],
+  }));
+  latestSaveByImage.set(image.id, sequence);
+
+  const persist = async () => {
+    let detail;
+    try {
+      detail = await api(`/api/v1/images/${image.id}/annotations`, {
+        method: "PUT",
+        body: JSON.stringify({
+          revision: savedRevisionByImage.get(image.id) ?? image.revision,
+          annotations,
+        }),
+      });
+      savedRevisionByImage.set(image.id, detail.revision);
+      state.canUndo = true;
+      state.canRedo = false;
+      updateHistoryButtons();
+    } catch (error) {
+      toast(error.message, "error");
+      if (request === editorRequest && state.detail?.id === image.id && latestSaveByImage.get(image.id) === sequence) {
+        try {
+          detail = await api(`/api/v1/images/${image.id}`);
+          if (request !== editorRequest || state.detail?.id !== image.id || latestSaveByImage.get(image.id) !== sequence) return;
+          savedRevisionByImage.set(image.id, detail.revision);
+          state.detail = detail;
+          state.selected = null;
+          renderList();
+          render();
+        } catch (reloadError) {
+          toast(reloadError.message, "error");
+        }
+      }
+      return;
+    }
+
+    const isLatest = latestSaveByImage.get(image.id) === sequence;
+    if (request === editorRequest && state.detail?.id === image.id && isLatest) {
+      state.detail = detail;
+      // the server re-derives annotation ids from line numbers, so re-select by position
+      state.selected = index >= 0 ? detail.annotations[index]?.id ?? null : null;
+      renderList();
+      render();
+    }
+    if (isLatest) {
+      loadImages();
+      loadObjects();
+      loadIssues();
+    }
+  };
+
+  const queued = saveQueue.then(persist, persist);
+  saveQueue = queued.catch(() => {});
+  return queued;
 }
 
 async function applyHistory(direction) {
   if (direction === "undo" ? !state.canUndo : !state.canRedo) return;
+  await saveQueue;
   try {
     const result = await api(`/api/v1/history/${direction}`, { method: "POST" });
     state.canUndo = result.can_undo;
     state.canRedo = result.can_redo;
     updateHistoryButtons();
-    if (state.detail && result.image_ids.includes(state.detail.id)) {
-      state.detail = await api(`/api/v1/images/${state.detail.id}`);
-      if (!state.detail.annotations.some(a => a.id === state.selected)) state.selected = null;
-      renderList();
-      render();
+    const request = editorRequest;
+    const imageId = state.detail?.id;
+    if (imageId && result.image_ids.includes(imageId)) {
+      const detail = await api(`/api/v1/images/${imageId}`);
+      if (request === editorRequest && state.detail?.id === imageId) {
+        state.detail = detail;
+        savedRevisionByImage.set(imageId, detail.revision);
+        if (!detail.annotations.some(a => a.id === state.selected)) state.selected = null;
+        renderList();
+        render();
+      }
     }
     await Promise.all([loadImages(), loadObjects(), loadIssues()]);
   } catch (error) {
@@ -1127,29 +1198,39 @@ function renderPredList() {
 
 async function acceptPredictions(predictionIds, minConfidence = null) {
   if (!state.detail) return;
+  const imageId = state.detail.id;
+  const request = editorRequest;
   const body = { prediction_ids: predictionIds };
   if (predictionIds === null && minConfidence !== null) body.min_confidence = minConfidence;
   try {
-    const result = await api(`/api/v1/images/${state.detail.id}/predictions/accept`, { method: "POST", body: JSON.stringify(body) });
-    state.detail = result.detail;
-    state.pred.items = result.predictions;
-    state.pred.pending[state.detail.id] = result.predictions.length;
+    await saveQueue;
+    const result = await api(`/api/v1/images/${imageId}/predictions/accept`, { method: "POST", body: JSON.stringify(body) });
+    state.pred.pending[imageId] = result.predictions.length;
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
     toast(`Accepted ${result.accepted} prediction${result.accepted === 1 ? "" : "s"} — Ctrl+Z undoes`);
-    renderList(); renderPredList(); render();
+    if (request === editorRequest && state.detail?.id === imageId) {
+      state.detail = result.detail;
+      savedRevisionByImage.set(imageId, result.detail.revision);
+      state.pred.items = result.predictions;
+      renderList(); renderPredList(); render();
+    }
     await Promise.all([loadImages(), loadObjects(), loadIssues()]);
   } catch (error) { toast(error.message, "error"); }
 }
 
 async function rejectPredictions(predictionIds) {
   if (!state.detail) return;
+  const imageId = state.detail.id;
+  const request = editorRequest;
   try {
-    const result = await api(`/api/v1/images/${state.detail.id}/predictions/reject`, { method: "POST", body: JSON.stringify({ prediction_ids: predictionIds }) });
-    state.pred.items = result.predictions;
-    state.pred.pending[state.detail.id] = result.predictions.length;
-    renderPredList(); render();
+    const result = await api(`/api/v1/images/${imageId}/predictions/reject`, { method: "POST", body: JSON.stringify({ prediction_ids: predictionIds }) });
+    state.pred.pending[imageId] = result.predictions.length;
+    if (request === editorRequest && state.detail?.id === imageId) {
+      state.pred.items = result.predictions;
+      renderPredList(); render();
+    }
     loadImages();
   } catch (error) { toast(error.message, "error"); }
 }
@@ -1249,7 +1330,10 @@ async function editObject(imageId, id, change) {
     const detail = await api(`/api/v1/images/${imageId}`);
     if (change) change(detail.annotations.find(a => a.id === id));
     else detail.annotations = detail.annotations.filter(a => a.id !== id);
-    await api(`/api/v1/images/${imageId}/annotations`, { method: "PUT", body: JSON.stringify({ annotations: detail.annotations }) });
+    await api(`/api/v1/images/${imageId}/annotations`, {
+      method: "PUT",
+      body: JSON.stringify({ revision: detail.revision, annotations: detail.annotations }),
+    });
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();

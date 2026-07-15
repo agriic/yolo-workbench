@@ -18,9 +18,41 @@ def test_metadata_images_and_edit_api(tmp_path):
             metadata = (await client.get("/api/v1/dataset")).json()
             assert metadata["image_count"] == 1
             image_id = (await client.get("/api/v1/images")).json()["items"][0]["id"]
-            response = await client.put(f"/api/v1/images/{image_id}/annotations", json={"annotations": [{"class_id": 0, "points": [0.5, 0.5, 0.1, 0.1]}]})
+            revision = (await client.get(f"/api/v1/images/{image_id}")).json()["revision"]
+            response = await client.put(f"/api/v1/images/{image_id}/annotations", json={"revision": revision, "annotations": [{"class_id": 0, "points": [0.5, 0.5, 0.1, 0.1]}]})
             assert response.status_code == 200
+            assert response.json()["revision"] > revision
             assert label.read_text().startswith("0 ")
+    asyncio.run(run())
+
+
+def test_annotation_api_rejects_stale_revision_and_non_finite_values(tmp_path):
+    dataset, label = make_dataset(tmp_path)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=make_app(dataset, tmp_path)), base_url="http://test") as client:
+            image_id = next(iter(dataset.images))
+            revision = (await client.get(f"/api/v1/images/{image_id}")).json()["revision"]
+            first = await client.put(
+                f"/api/v1/images/{image_id}/annotations",
+                json={"revision": revision, "annotations": [{"class_id": 0, "points": [0.5, 0.5, 0.1, 0.1]}]},
+            )
+            assert first.status_code == 200
+
+            stale = await client.put(
+                f"/api/v1/images/{image_id}/annotations",
+                json={"revision": revision, "annotations": [{"class_id": 1, "points": [0.2, 0.2, 0.1, 0.1]}]},
+            )
+            assert stale.status_code == 409
+            assert label.read_text().startswith("0 ")
+
+            non_finite = await client.put(
+                f"/api/v1/images/{image_id}/annotations",
+                content=f'{{"revision":{first.json()["revision"]},"annotations":[{{"class_id":0,"points":[0.5,0.5,NaN,0.1]}}]}}',
+                headers={"Content-Type": "application/json"},
+            )
+            assert non_finite.status_code == 422
+
     asyncio.run(run())
 
 

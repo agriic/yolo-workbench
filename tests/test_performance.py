@@ -65,7 +65,8 @@ def test_thumbnail_cache_and_invalidation_after_edit(tmp_path):
             assert revalidated.status_code == 304
             # editing annotations bumps the label mtime, so the annotated thumbnail key changes
             time.sleep(0.01)
-            await client.put(f"/api/v1/images/{image_id}/annotations", json={"annotations": [{"class_id": 0, "points": [0.5, 0.5, 0.1, 0.1]}]})
+            detail = (await client.get(f"/api/v1/images/{image_id}")).json()
+            await client.put(f"/api/v1/images/{image_id}/annotations", json={"revision": detail["revision"], "annotations": [{"class_id": 0, "points": [0.5, 0.5, 0.1, 0.1]}]})
             after = await client.get(f"/api/v1/images/{image_id}/thumbnail", params={"annotated": "true"}, headers={"If-None-Match": etag})
             assert after.status_code == 200
             assert after.headers["etag"] != etag

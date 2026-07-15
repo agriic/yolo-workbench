@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,36 @@ def test_writes_backup_and_supports_history(tmp_path):
     assert label.read_text().startswith("0 ")
 
 
+def test_history_restores_missing_label_file_state(tmp_path):
+    dataset, label = make_dataset(tmp_path)
+    label.unlink()
+    dataset = Dataset(dataset.yaml_path, "detection")
+    record = next(iter(dataset.images.values()))
+
+    dataset.replace_annotations(record.id, [])
+    assert label.exists()
+
+    dataset.history("undo")
+    assert not label.exists()
+    assert any(issue["kind"] == "missing_label" for issue in record.issues)
+
+    dataset.history("redo")
+    assert label.exists()
+    assert label.read_text() == ""
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_rejects_non_finite_annotation_geometry(tmp_path, value):
+    dataset, label = make_dataset(tmp_path)
+    record = next(iter(dataset.images.values()))
+    original = label.read_text()
+
+    with pytest.raises(DatasetError, match="Invalid annotation geometry"):
+        dataset.replace_annotations(record.id, [{"class_id": 1, "points": [0.5, 0.5, value, 0.2]}])
+
+    assert label.read_text() == original
+
+
 def test_detects_external_write_conflict(tmp_path):
     dataset, label = make_dataset(tmp_path)
     record = next(iter(dataset.images.values()))
@@ -77,3 +108,22 @@ def test_parallel_images_and_labels_layout(tmp_path):
     yaml_path.write_text(yaml.safe_dump({"path": ".", "train": "images/train", "names": ["object"]}))
     dataset = Dataset(yaml_path, "detection")
     assert next(iter(dataset.images.values())).label_path == labels / "a.txt"
+
+
+def test_reports_nested_orphan_labels_recursively(tmp_path):
+    images = tmp_path / "images" / "train"
+    labels = tmp_path / "labels" / "train"
+    images.mkdir(parents=True)
+    labels.mkdir(parents=True)
+    Image.new("RGB", (20, 20)).save(images / "a.png")
+    (labels / "a.txt").write_text("0 0.5 0.5 0.5 0.5\n")
+    orphan = labels / "nested" / "orphan.txt"
+    orphan.parent.mkdir()
+    orphan.write_text("0 0.5 0.5 0.5 0.5\n")
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text(yaml.safe_dump({"path": ".", "train": "images/train", "names": ["object"]}))
+
+    dataset = Dataset(yaml_path, "detection")
+
+    assert dataset.orphan_labels == [orphan.resolve()]
+    assert any(issue["kind"] == "orphan_label" and issue["image_name"] == "orphan.txt" for issue in dataset.issues())

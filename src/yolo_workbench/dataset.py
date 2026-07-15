@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -31,6 +32,20 @@ class HistoryEntry:
     label_path: Path
     before: str
     after: str
+    before_exists: bool
+    after_exists: bool
+
+
+@dataclass
+class PreparedChange:
+    record: ImageRecord
+    before: str
+    after: str
+    before_exists: bool
+    after_exists: bool
+    base_mtime: int | None
+    base_revision: int
+    expected_revision: int | None = None
 
 
 class Dataset:
@@ -41,7 +56,9 @@ class Dataset:
         self.names: dict[int, str] = {}
         self.images: dict[str, ImageRecord] = {}
         self.orphan_labels: list[Path] = []
+        self._label_scan_roots: set[Path] = set()
         self._mtimes: dict[Path, int | None] = {}
+        self._revisions: dict[Path, int] = {}
         self._lock = threading.RLock()
         # each history entry is a transaction: one or more label files written together
         self._undo: list[list[HistoryEntry]] = []
@@ -158,6 +175,7 @@ class Dataset:
             source = Path(str(item))
             source = (self.root / source).resolve() if not source.is_absolute() else source.resolve()
             if source.is_dir():
+                self._label_scan_roots.add(self._label_root_for(source))
                 found.extend(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS)
             elif source.suffix.lower() == ".txt" and source.exists():
                 for line in source.read_text(encoding="utf-8").splitlines():
@@ -167,6 +185,15 @@ class Dataset:
             elif source.suffix.lower() in IMAGE_EXTENSIONS and source.exists():
                 found.append(source)
         return sorted(set(found))
+
+    def _label_root_for(self, image_root: Path) -> Path:
+        parts = list(image_root.parts)
+        if "images" in parts:
+            index = len(parts) - 1 - parts[::-1].index("images")
+            candidate = Path(*parts[:index], "labels", *parts[index + 1 :])
+            if candidate.exists() or (self.root / "labels").exists():
+                return candidate
+        return image_root
 
     def _label_for(self, image_path: Path) -> Path:
         parts = list(image_path.parts)
@@ -201,7 +228,7 @@ class Dataset:
                 class_id = int(values[0])
                 points = [float(value) for value in values[1:]]
                 expected = len(points) == 4 if self.category == "detection" else len(points) >= 6 and len(points) % 2 == 0
-                if not expected or not all(value == value and abs(value) != float("inf") for value in points):
+                if not expected or not all(math.isfinite(value) for value in points):
                     raise ValueError("invalid coordinate count or value")
                 annotation = Annotation(f"{record.id}:{line_number}", class_id, points)
                 record.annotations.append(annotation)
@@ -219,6 +246,7 @@ class Dataset:
                 record.issues.append(self._issue("malformed_label", "error", f"Line {line_number}: {exc}", record))
         record.class_ids = {annotation.class_id for annotation in record.annotations}
         self._mtimes[record.label_path] = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
+        self._revisions[record.label_path] = self._revisions.get(record.label_path, 0) + 1
 
     def _zero_area(self, annotation: Annotation) -> bool:
         if self.category == "detection":
@@ -233,9 +261,10 @@ class Dataset:
     def _find_orphans(self) -> None:
         expected = {record.label_path.resolve() for record in self.images.values()}
         candidates = set()
-        for parent in {record.label_path.parent for record in self.images.values()}:
-            if parent.exists():
-                candidates.update(path.resolve() for path in parent.glob("*.txt"))
+        roots = self._label_scan_roots | {record.label_path.parent for record in self.images.values()}
+        for root in roots:
+            if root.exists():
+                candidates.update(path.resolve() for path in root.rglob("*.txt") if ".yolo-workbench" not in path.parts)
         self.orphan_labels = sorted(candidates - expected)
 
     def list_images(self, split="all", class_id=None, search="", offset=0, limit=100) -> dict:
@@ -252,7 +281,13 @@ class Dataset:
 
     def detail(self, image_id: str) -> dict:
         record = self.require_image(image_id)
-        return {**record.summary(), "path": str(record.path), "annotations": [a.as_dict() for a in record.annotations], "issues": record.issues}
+        return {
+            **record.summary(),
+            "path": str(record.path),
+            "revision": self._revisions[record.label_path],
+            "annotations": [a.as_dict() for a in record.annotations],
+            "issues": record.issues,
+        }
 
     def require_image(self, image_id: str) -> ImageRecord:
         try:
@@ -260,13 +295,13 @@ class Dataset:
         except KeyError as exc:
             raise KeyError("Image not found") from exc
 
-    def replace_annotations(self, image_id: str, raw_annotations: list[dict]) -> dict:
+    def replace_annotations(self, image_id: str, raw_annotations: list[dict], expected_revision: int | None = None) -> dict:
         record = self.require_image(image_id)
-        self._commit_many([self._prepare(record, raw_annotations)])
+        self._commit_many([self._prepare(record, raw_annotations, expected_revision)])
         return self.detail(image_id)
 
-    def _prepare(self, record: ImageRecord, raw_annotations: list[dict]) -> tuple[ImageRecord, str, str]:
-        """Validate raw annotations and return a (record, new content, current content) change."""
+    def _prepare(self, record: ImageRecord, raw_annotations: list[dict], expected_revision: int | None = None) -> PreparedChange:
+        """Validate raw annotations and capture the label state this change is based on."""
         if any(issue["kind"] == "malformed_label" for issue in record.issues):
             raise DatasetError("Resolve or remove malformed label rows before editing this image")
         annotations = []
@@ -276,28 +311,52 @@ class Dataset:
             if class_id not in self.names:
                 raise DatasetError(f"Unknown class {class_id}")
             valid_count = len(points) == 4 if self.category == "detection" else len(points) >= 6 and len(points) % 2 == 0
-            if not valid_count or any(value < 0 or value > 1 for value in points):
+            if not valid_count or not all(math.isfinite(value) and 0 <= value <= 1 for value in points):
                 raise DatasetError("Invalid annotation geometry")
             annotations.append(Annotation(raw.get("id") or f"{record.id}:new:{index}", class_id, points))
         content = "".join(f"{a.class_id} {' '.join(self._number(v) for v in a.points)}\n" for a in annotations)
-        before = record.label_path.read_text(encoding="utf-8") if record.label_path.exists() else ""
-        return record, content, before
+        before_exists = record.label_path.exists()
+        before = record.label_path.read_text(encoding="utf-8") if before_exists else ""
+        base_mtime = record.label_path.stat().st_mtime_ns if before_exists else None
+        return PreparedChange(
+            record=record,
+            before=before,
+            after=content,
+            before_exists=before_exists,
+            after_exists=True,
+            base_mtime=base_mtime,
+            base_revision=self._revisions[record.label_path],
+            expected_revision=expected_revision,
+        )
 
     def _number(self, value: float) -> str:
         return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
-    def _commit_many(self, changes: list[tuple[ImageRecord, str, str]], history=True) -> None:
+    def _commit_many(self, changes: list[PreparedChange], history=True) -> None:
         """Write all changes as one transaction: every mtime is checked before any file is touched."""
         with self._lock:
-            for record, _, _ in changes:
+            for change in changes:
+                record = change.record
                 current_mtime = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
                 if current_mtime != self._mtimes.get(record.label_path):
+                    self._read_record(record)
                     raise WriteConflict(f"{record.label_path.name} changed outside this application; reload before saving")
+                if current_mtime != change.base_mtime or self._revisions[record.label_path] != change.base_revision:
+                    raise WriteConflict(f"{record.label_path.name} changed while this edit was pending; reload before saving")
+                if change.expected_revision is not None and change.expected_revision != change.base_revision:
+                    raise WriteConflict(f"{record.label_path.name} has a newer revision; reload before saving")
             transaction = []
-            for record, content, before in changes:
-                self._backup(record.label_path, before)
-                self._atomic_write(record.label_path, content)
-                transaction.append(HistoryEntry(record.label_path, before, content))
+            for change in changes:
+                record = change.record
+                self._backup(record.label_path, change.before)
+                self._write_state(record.label_path, change.after, change.after_exists)
+                transaction.append(HistoryEntry(
+                    record.label_path,
+                    change.before,
+                    change.after,
+                    change.before_exists,
+                    change.after_exists,
+                ))
                 self._read_record(record)
             if history and transaction:
                 self._undo.append(transaction)
@@ -328,6 +387,12 @@ class Dataset:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    def _write_state(self, path: Path, content: str, exists: bool) -> None:
+        if exists:
+            self._atomic_write(path, content)
+        else:
+            path.unlink(missing_ok=True)
+
     def history(self, direction: str) -> dict:
         source, target = (self._undo, self._redo) if direction == "undo" else (self._redo, self._undo)
         if not source:
@@ -337,16 +402,28 @@ class Dataset:
         changes = []
         for entry in entries:
             record = next(record for record in self.images.values() if record.label_path == entry.label_path)
-            content = entry.before if direction == "undo" else entry.after
-            before = entry.after if direction == "undo" else entry.before
-            changes.append((record, content, before))
+            if direction == "undo":
+                before, after = entry.after, entry.before
+                before_exists, after_exists = entry.after_exists, entry.before_exists
+            else:
+                before, after = entry.before, entry.after
+                before_exists, after_exists = entry.before_exists, entry.after_exists
+            changes.append(PreparedChange(
+                record=record,
+                before=before,
+                after=after,
+                before_exists=before_exists,
+                after_exists=after_exists,
+                base_mtime=self._mtimes[record.label_path],
+                base_revision=self._revisions[record.label_path],
+            ))
         try:
             self._commit_many(changes, history=False)
         except WriteConflict:
             source.append(transaction)
             raise
         target.append(transaction)
-        image_ids = [record.id for record, _, _ in changes]
+        image_ids = [change.record.id for change in changes]
         return {"image_ids": image_ids, "image_id": image_ids[0], "can_undo": bool(self._undo), "can_redo": bool(self._redo)}
 
     def issues(self) -> list[dict]:
