@@ -58,8 +58,13 @@
         <button id="retry-predict" class="secondary" hidden>Retry failed</button>
         <div id="predictor-status" class="total"></div>
       </div>
-      <div id="image-grid" class="grid image-grid"></div>
-      <button id="load-more-images" class="secondary load-more" hidden>Load more</button>
+      <div id="image-gallery" class="virtual-gallery">
+        <div id="image-scroll" class="virtual-scroll" tabindex="0" role="region" aria-label="Images">
+          <div id="image-grid" class="grid image-grid virtual-grid"></div>
+        </div>
+        <div id="image-scroll-labels" class="virtual-scroll-labels" aria-hidden="true"></div>
+        <div id="image-load-error" class="virtual-load-error" hidden><span></span><button type="button">Retry</button></div>
+      </div>
     </section>
 
     <section id="exploration" class="view">
@@ -76,8 +81,13 @@
         </div>
         <div id="object-total" class="total"></div>
       </div>
-      <div id="object-grid" class="grid object-grid"></div>
-      <button id="load-more-objects" class="secondary load-more" hidden>Load more</button>
+      <div id="object-gallery" class="virtual-gallery">
+        <div id="object-scroll" class="virtual-scroll" tabindex="0" role="region" aria-label="Objects">
+          <div id="object-grid" class="grid object-grid virtual-grid"></div>
+        </div>
+        <div id="object-scroll-labels" class="virtual-scroll-labels" aria-hidden="true"></div>
+        <div id="object-load-error" class="virtual-load-error" hidden><span></span><button type="button">Retry</button></div>
+      </div>
     </section>
 
     <section id="statistics" class="view">

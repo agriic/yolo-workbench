@@ -1,8 +1,10 @@
 import asyncio
 
 from httpx import ASGITransport, AsyncClient
+from PIL import Image
 
 from test_dataset import make_dataset
+from yolo_workbench.dataset import Dataset
 from yolo_workbench.media_cache import MediaCache
 from yolo_workbench.web import create_app
 
@@ -39,6 +41,41 @@ def test_server_side_prediction_filter_has_correct_total(tmp_path):
             filtered = (await client.get("/api/v1/images", params={"has_predictions": "true"})).json()
             assert filtered["total"] == 1
             assert len(filtered["items"]) == 1
+
+    asyncio.run(run())
+
+
+def test_image_and_object_endpoints_support_random_access_slices(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    split = tmp_path / "train"
+    for index in range(12):
+        Image.new("RGB", (24, 24), "white").save(split / f"image-{index:02}.jpg")
+        (split / f"image-{index:02}.txt").write_text(f"{index % 2} 0.5 0.5 0.25 0.25\n")
+    dataset = Dataset(dataset.yaml_path, "detection")
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=make_app(dataset, tmp_path)), base_url="http://test") as client:
+            middle = (await client.get("/api/v1/images", params={"offset": 4, "limit": 3})).json()
+            assert middle["total"] == 13
+            assert [item["name"] for item in middle["items"]] == ["image-04.jpg", "image-05.jpg", "image-06.jpg"]
+
+            filtered_end = (await client.get("/api/v1/images", params={"search": "image-", "offset": 10, "limit": 5})).json()
+            assert filtered_end["total"] == 12
+            assert [item["name"] for item in filtered_end["items"]] == ["image-10.jpg", "image-11.jpg"]
+
+            beyond_end = (await client.get("/api/v1/images", params={"offset": 100, "limit": 5})).json()
+            assert beyond_end == {"total": 13, "items": []}
+
+            class_slice = (await client.get("/api/v1/images", params={"class_id": 0, "split": "train", "offset": 4, "limit": 2})).json()
+            assert class_slice["total"] == 6
+            assert [item["name"] for item in class_slice["items"]] == ["image-08.jpg", "image-10.jpg"]
+
+            objects = (await client.get("/api/v1/objects", params={"class_id": 0, "offset": 4, "limit": 2})).json()
+            assert objects["total"] == 6
+            assert [item["image_name"] for item in objects["items"]] == ["image-08.jpg", "image-10.jpg"]
+
+            objects_end = (await client.get("/api/v1/objects", params={"class_id": 0, "offset": 6, "limit": 2})).json()
+            assert objects_end == {"total": 6, "items": []}
 
     asyncio.run(run())
 

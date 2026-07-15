@@ -148,6 +148,12 @@ header nav { margin-left: auto; display: flex; height: 100%; }
 main { padding: 18px 22px 48px; }
 .view { display: none; }
 .view.active { display: block; }
+#annotation.view.active, #exploration.view.active {
+  display: flex;
+  flex-direction: column;
+  height: calc(100dvh - 122px);
+  min-height: 360px;
+}
 .muted { color: var(--text-2); font-size: 13px; }
 .section-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
 .section-title h1 { font-size: 19px; margin: 8px 0; }
@@ -174,9 +180,114 @@ main { padding: 18px 22px 48px; }
 
 /* ---------- cards ---------- */
 .grid { display: grid; gap: 14px; }
-.load-more { display: block; margin: 16px auto 4px; }
 .image-grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
 .object-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.virtual-gallery {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 58px;
+  flex: 1;
+  min-height: 260px;
+}
+.virtual-scroll {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: scroll;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+  padding-right: 2px;
+}
+.virtual-scroll:focus-visible { outline-offset: 3px; }
+.virtual-grid { position: relative; }
+.virtual-grid.image-grid { --virtual-card-height: 276px; }
+.virtual-grid.object-grid { --virtual-card-height: 286px; }
+.virtual-grid > .card, .virtual-placeholder { height: var(--virtual-card-height); }
+.virtual-grid > .card { display: flex; flex-direction: column; }
+.virtual-grid > .card .card-body { flex: 1; min-height: 0; }
+.virtual-grid.image-grid .chips { max-height: 43px; overflow: hidden; }
+.virtual-spacer { grid-column: 1 / -1; min-height: 0; pointer-events: none; }
+.virtual-placeholder {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--surface);
+}
+.virtual-placeholder::before {
+  content: "";
+  display: block;
+  height: 170px;
+  background: linear-gradient(100deg, var(--thumb-bg) 25%, var(--surface-hover) 40%, var(--thumb-bg) 55%);
+  background-size: 220% 100%;
+  animation: virtual-shimmer 1.4s ease-in-out infinite;
+}
+.virtual-placeholder::after {
+  content: "";
+  display: block;
+  width: 68%;
+  height: 46px;
+  margin: 15px 12px;
+  border-radius: 5px;
+  background: linear-gradient(var(--line) 0 10px, transparent 10px 20px, var(--line) 20px 29px, transparent 29px 37px, var(--line) 37px 46px);
+  opacity: .7;
+}
+@keyframes virtual-shimmer { to { background-position-x: -220%; } }
+.virtual-scroll-labels {
+  position: relative;
+  min-height: 0;
+  margin: 7px 0;
+  color: var(--text-3);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  user-select: none;
+}
+.virtual-marker {
+  position: absolute;
+  left: 7px;
+  transform: translateY(-50%);
+  max-width: 50px;
+  white-space: nowrap;
+}
+.virtual-marker.start { transform: none; }
+.virtual-marker.end { transform: translateY(-100%); }
+.virtual-position {
+  position: absolute;
+  right: 4px;
+  transform: translateY(-50%);
+  z-index: 2;
+  width: max-content;
+  max-width: min(240px, 70vw);
+  padding: 4px 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity .12s ease;
+}
+.virtual-position.show { opacity: 1; }
+.virtual-load-error {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100% - 90px);
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--line));
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: var(--shadow-2);
+  color: var(--danger);
+  font-size: 12px;
+}
+.virtual-load-error[hidden] { display: none; }
+.virtual-load-error span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card {
   background: var(--surface);
   border: 1px solid var(--line);
@@ -489,10 +600,15 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   .dataset-chip { display: none; }
   .tab { padding: 0 10px; }
   main { padding: 12px 12px 32px; }
+  #annotation.view.active, #exploration.view.active { height: calc(100dvh - 100px); }
   .filters .field { flex: 1; min-width: 130px; }
   .total { margin-left: 0; }
   .image-grid, .object-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .virtual-gallery { grid-template-columns: minmax(0, 1fr) 46px; }
+  .virtual-grid.image-grid { --virtual-card-height: 252px; }
+  .virtual-grid.object-grid { --virtual-card-height: 250px; }
   .thumb img, .object-card .thumb img { height: 130px; }
+  .virtual-placeholder::before { height: 130px; }
   .editor-body { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) 210px; }
   .inspector { border-left: 0; border-top: 1px solid var(--ed-line); }
   .shortcuts { display: none; }
