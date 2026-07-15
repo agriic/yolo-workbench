@@ -1385,6 +1385,7 @@ function applyPredictorState(data) {
       ? `Predicting ${pred.job.done}/${pred.job.total} · ${pred.job.completed || 0} completed · ${pred.job.failed || 0} failed${pred.job.cancel_requested ? " · cancelling…" : ""}`
       : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""}`,
   }[pred.status] || "";
+  $("predictor-status").title = $("predictor-status").textContent;
   renderMapping();
   renderModelMenu();
   clearTimeout(pred.poll);
@@ -1414,6 +1415,7 @@ async function loadModel() {
   if (!path) return toast("Enter a model path first", "error");
   $("load-model").disabled = true;
   $("predictor-status").textContent = "Loading model…";
+  $("predictor-status").title = "Loading model…";
   try {
     applyPredictorState(await api("/api/v1/predictor/load", { method: "POST", body: JSON.stringify({ path }) }));
     toast("Model loaded");
@@ -1421,6 +1423,7 @@ async function loadModel() {
   } catch (error) {
     $("load-model").disabled = false;
     $("predictor-status").textContent = error.message;
+    $("predictor-status").title = error.message;
     toast(error.message, "error");
   }
 }

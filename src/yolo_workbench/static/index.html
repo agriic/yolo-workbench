@@ -33,30 +33,35 @@
 
   <main>
     <section id="annotation" class="view active">
-      <div class="filters">
-        <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
-        <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
-        <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
-        <label class="toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
-        <label class="toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
-        <div id="image-total" class="total"></div>
-      </div>
-      <div class="filters assist-bar" id="assist-bar">
-        <label class="field grow">Model<div class="model-picker">
-          <input id="model-path" type="text" placeholder="Pick a model or type a path…" spellcheck="false" autocomplete="off">
-          <button id="model-browse" class="model-browse" type="button" title="Show models found near the dataset" aria-label="Show discovered models">▾</button>
-          <div id="model-menu" class="model-menu" hidden></div>
-        </div></label>
-        <button id="load-model" class="secondary">Load model</button>
-        <details id="mapping-panel" class="mapping-panel" hidden>
-          <summary>Class mapping</summary>
-          <div id="mapping-list" class="mapping-list"></div>
-        </details>
-        <label class="toggle" id="predict-unlabeled-wrap" hidden title="Skip images that already have annotations"><input type="checkbox" id="predict-unlabeled" checked><span>Only unlabeled</span></label>
-        <button id="run-predict" class="secondary" hidden>Predict</button>
-        <button id="cancel-predict" class="secondary" hidden>Cancel</button>
-        <button id="retry-predict" class="secondary" hidden>Retry failed</button>
-        <div id="predictor-status" class="total"></div>
+      <div class="filters annotation-toolbar">
+        <div class="toolbar-group filter-controls">
+          <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
+          <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
+          <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
+          <label class="toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
+          <label class="toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
+        </div>
+        <div class="toolbar-group prediction-controls" id="assist-bar">
+          <label class="field model-field grow">Model<div class="model-picker">
+            <input id="model-path" type="text" placeholder="Model path…" spellcheck="false" autocomplete="off">
+            <button id="model-browse" class="model-browse" type="button" title="Show models found near the dataset" aria-label="Show discovered models">▾</button>
+            <div id="model-menu" class="model-menu" hidden></div>
+          </div></label>
+          <button id="load-model" class="secondary" title="Load prediction model">Load</button>
+          <details id="mapping-panel" class="mapping-panel" hidden>
+            <summary title="Prediction settings">Options</summary>
+            <div class="prediction-options">
+              <label class="toggle" id="predict-unlabeled-wrap" hidden title="Skip images that already have annotations"><input type="checkbox" id="predict-unlabeled" checked><span>Only unlabeled</span></label>
+              <div class="prediction-options-title">Class mapping</div>
+              <div id="mapping-list" class="mapping-list"></div>
+            </div>
+          </details>
+          <button id="run-predict" class="secondary" hidden>Predict</button>
+          <button id="cancel-predict" class="secondary" hidden>Cancel</button>
+          <button id="retry-predict" class="secondary" hidden>Retry failed</button>
+          <div id="predictor-status" class="toolbar-status" role="status" aria-live="polite"></div>
+        </div>
+        <div id="image-total" class="total toolbar-total"></div>
       </div>
       <div id="image-gallery" class="virtual-gallery">
         <div id="image-scroll" class="virtual-scroll" tabindex="0" role="region" aria-label="Images">

@@ -177,6 +177,38 @@ main { padding: 18px 22px 48px; }
 .toggle { display: flex; align-items: center; gap: 7px; height: 34px; font-size: 13px; color: var(--text-2); cursor: pointer; user-select: none; }
 .toggle input { accent-color: var(--accent); width: 15px; height: 15px; margin: 0; }
 .total { margin-left: auto; align-self: center; padding-top: 16px; font-size: 13px; color: var(--text-2); white-space: nowrap; }
+.annotation-toolbar {
+  align-items: flex-end;
+  flex-wrap: nowrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.toolbar-group { display: flex; align-items: flex-end; gap: 8px; min-width: 0; }
+.filter-controls { flex: 1 1 560px; }
+.prediction-controls {
+  flex: 1 1 auto;
+  padding-left: 9px;
+  border-left: 1px solid var(--line);
+}
+.annotation-toolbar .field { gap: 3px; }
+.annotation-toolbar .field input, .annotation-toolbar .field select { height: 32px; }
+.annotation-toolbar #image-split { width: 104px; min-width: 104px; }
+.annotation-toolbar #image-class { width: 118px; min-width: 118px; }
+.annotation-toolbar #image-search { min-width: 145px; }
+.annotation-toolbar .toggle { height: 32px; font-size: 12px; white-space: nowrap; }
+.annotation-toolbar button { min-height: 32px; padding: 6px 10px; }
+.toolbar-status {
+  align-self: center;
+  min-width: 0;
+  max-width: 170px;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.toolbar-status:empty { display: none; }
+.toolbar-total { flex: none; margin-left: 0; padding-top: 0; }
 
 /* ---------- cards ---------- */
 .grid { display: grid; gap: 14px; }
@@ -595,6 +627,12 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 #toast.error { border-left-color: #ff6b57; }
 
 /* ---------- small screens ---------- */
+@media (max-width: 1180px) {
+  .annotation-toolbar { flex-wrap: wrap; }
+  .filter-controls { flex: 1 1 100%; }
+  .prediction-controls { flex: 1 1 auto; }
+}
+
 @media (max-width: 760px) {
   header { padding: 0 10px; gap: 10px; }
   .dataset-chip { display: none; }
@@ -602,6 +640,14 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   main { padding: 12px 12px 32px; }
   #annotation.view.active, #exploration.view.active { height: calc(100dvh - 100px); }
   .filters .field { flex: 1; min-width: 130px; }
+  .annotation-toolbar { align-items: stretch; }
+  .toolbar-group { flex-wrap: wrap; }
+  .filter-controls, .prediction-controls { width: 100%; }
+  .prediction-controls { padding: 8px 0 0; border-top: 1px solid var(--line); border-left: 0; }
+  .annotation-toolbar #image-split, .annotation-toolbar #image-class { width: 100%; }
+  .annotation-toolbar .model-field { flex: 1 1 190px; }
+  .toolbar-status { max-width: 100%; flex: 1 1 140px; }
+  .total.toolbar-total { margin-left: auto; }
   .total { margin-left: 0; }
   .image-grid, .object-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .virtual-gallery { grid-template-columns: minmax(0, 1fr) 46px; }
@@ -699,8 +745,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 .card-check:checked, .object-card:hover .card-check, .card-check:focus-visible { opacity: 1; }
 
 /* ---------- model-assisted labeling ---------- */
-.assist-bar { margin-top: -6px; }
-.assist-bar input[type="text"] { min-width: 260px; font-family: ui-monospace, monospace; font-size: 12px; }
+.prediction-controls input[type="text"] { font-family: ui-monospace, monospace; font-size: 12px; }
 .pred-flag {
   position: absolute;
   bottom: 8px; right: 8px;
@@ -713,21 +758,26 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 }
 .mapping-panel { position: relative; align-self: end; }
 .mapping-panel summary { cursor: pointer; font-size: 13px; color: var(--text-2); height: 34px; display: flex; align-items: center; user-select: none; }
-.mapping-list {
+.prediction-options {
   position: absolute;
   z-index: 30;
-  top: 100%; left: 0;
-  min-width: 300px;
-  max-height: 320px;
+  top: calc(100% + 4px);
+  right: 0;
+  width: min(360px, 80vw);
+  max-height: min(440px, 70vh);
   overflow-y: auto;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 10px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+}
+.prediction-options-title { margin: 4px 0 7px; color: var(--text-2); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+.prediction-options > .toggle { height: 28px; }
+.mapping-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
 }
 .mapping-row { display: flex; align-items: center; gap: 10px; font-size: 12px; }
 .mapping-row span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -754,7 +804,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 #editor .row-accept:hover:not(:disabled) { background: var(--accent-weak, #143028); }
 
 /* ---------- model picker ---------- */
-.model-picker { position: relative; display: flex; align-items: stretch; min-width: 280px; }
+.model-picker { position: relative; display: flex; align-items: stretch; min-width: 0; }
 .model-picker input { flex: 1; min-width: 0; border-top-right-radius: 0; border-bottom-right-radius: 0; }
 .model-browse {
   width: 30px;
