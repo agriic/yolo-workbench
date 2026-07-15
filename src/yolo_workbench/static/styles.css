@@ -57,6 +57,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; }
 button, input, select { font: inherit; color: inherit; }
 

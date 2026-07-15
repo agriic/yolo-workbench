@@ -1364,12 +1364,14 @@ function applyPredictorState(data) {
   pred.job = data.job;
   const ready = pred.status === "ready";
   const running = pred.job.state === "running";
+  const canCancel = running && pred.job.done < pred.job.total && !pred.job.cancel_requested;
+  const canRetry = !running && Number(pred.job.failed) > 0;
   $("load-model").disabled = pred.status === "unavailable" || pred.status === "loading" || running;
   $("run-predict").hidden = !ready;
   $("run-predict").disabled = running;
-  $("cancel-predict").hidden = !running;
-  $("cancel-predict").disabled = !!pred.job.cancel_requested;
-  $("retry-predict").hidden = running || !pred.job.failed;
+  $("cancel-predict").hidden = !canCancel;
+  $("cancel-predict").disabled = !canCancel;
+  $("retry-predict").hidden = !canRetry;
   $("predict-unlabeled-wrap").hidden = !ready;
   $("predict-image").hidden = !ready;
   $("predict-image").disabled = running;
