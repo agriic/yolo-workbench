@@ -28,6 +28,21 @@ def test_loads_colocated_detection_dataset(tmp_path):
     assert dataset.list_images(class_id=1)["total"] == 1
 
 
+def test_annotation_indexes_and_cached_aggregates_refresh_after_write(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    record = next(iter(dataset.images.values()))
+
+    assert dataset.metadata()["issue_count"] == 0
+    assert dataset.list_objects(1)["total"] == 1
+    dataset.replace_annotations(record.id, [{"class_id": 0, "points": [0.4, 0.4, 0.1, 0.1]}])
+
+    assert dataset.list_images(class_id=1)["total"] == 0
+    assert dataset.list_images(class_id=0)["total"] == 1
+    assert dataset.list_objects(1)["total"] == 0
+    assert dataset.list_objects(0)["items"][0]["image_id"] == record.id
+    assert dataset.metadata()["issue_count"] == 0
+
+
 def test_writes_backup_and_supports_history(tmp_path):
     dataset, label = make_dataset(tmp_path)
     record = next(iter(dataset.images.values()))

@@ -26,6 +26,23 @@ def test_metadata_images_and_edit_api(tmp_path):
     asyncio.run(run())
 
 
+def test_server_side_prediction_filter_has_correct_total(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+
+    class PendingPredictor:
+        def pending_image_ids(self):
+            return set(dataset.images)
+
+    async def run():
+        app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"), predictor=PendingPredictor())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            filtered = (await client.get("/api/v1/images", params={"has_predictions": "true"})).json()
+            assert filtered["total"] == 1
+            assert len(filtered["items"]) == 1
+
+    asyncio.run(run())
+
+
 def test_annotation_api_rejects_stale_revision_and_non_finite_values(tmp_path):
     dataset, label = make_dataset(tmp_path)
 

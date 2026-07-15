@@ -22,15 +22,27 @@ class EmbeddingsManager:
         self.status = "idle" if fiftyone_available() else "unavailable"
         self.error: str | None = None
         self.items: list[dict] | None = None
+        self.source_generation: int | None = None
+        dataset.add_change_listener(self._annotations_changed)
 
     def payload(self) -> dict:
-        return {
-            "status": self.status,
-            "error": self.error,
-            "brain_key": "gt_viz",
-            "dimensions": 3,
-            "items": self.items or [],
-        }
+        with self._lock:
+            return {
+                "status": self.status,
+                "error": self.error,
+                "brain_key": "gt_viz",
+                "dimensions": 3,
+                "source_generation": self.source_generation,
+                "items": self.items or [],
+            }
+
+    def _annotations_changed(self, _image_ids: list[str], generation: int) -> None:
+        with self._lock:
+            self.items = None
+            self.source_generation = None
+            self.error = None
+            if self.status not in {"unavailable", "computing"}:
+                self.status = "idle"
 
     def start(self) -> dict:
         with self._lock:
@@ -39,20 +51,31 @@ class EmbeddingsManager:
             elif self.status != "computing":
                 self.status = "computing"
                 self.error = None
-                self._thread = threading.Thread(target=self._run, daemon=True)
+                generation = self.dataset.annotation_generation
+                self._thread = threading.Thread(target=self._run, args=(generation,), daemon=True)
                 self._thread.start()
         return self.payload()
 
-    def _run(self) -> None:
+    def _run(self, generation: int) -> None:
         try:
             items = compute_gt_viz(self.dataset)
             with self._lock:
-                self.items = items
-                self.status = "ready"
+                if generation == self.dataset.annotation_generation:
+                    self.items = items
+                    self.source_generation = generation
+                    self.status = "ready"
+                else:
+                    self.items = None
+                    self.source_generation = None
+                    self.status = "idle"
         except Exception as exc:  # surfaced to the UI, never crashes the server
             with self._lock:
-                self.status = "error"
-                self.error = str(exc)
+                if generation == self.dataset.annotation_generation:
+                    self.status = "error"
+                    self.error = str(exc)
+                else:
+                    self.status = "idle"
+                    self.error = None
 
 
 def compute_gt_viz(dataset: Dataset) -> list[dict]:

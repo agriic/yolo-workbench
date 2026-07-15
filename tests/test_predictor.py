@@ -1,10 +1,13 @@
 import asyncio
+import threading
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from PIL import Image
 
 from test_dataset import make_dataset
-from yolo_workbench.dataset import DatasetError
+from yolo_workbench.dataset import Dataset, DatasetError
+from yolo_workbench.embeddings import EmbeddingsManager
 from yolo_workbench.media_cache import MediaCache
 from yolo_workbench.predictor import PredictorManager
 from yolo_workbench.web import create_app
@@ -40,12 +43,24 @@ def make_predictor(tmp_path, category="detection"):
 
 def wait_job(manager):
     for _ in range(200):
-        if manager.job["state"] in {"done", "error"}:
+        if manager.job["state"] in {"done", "error", "cancelled"}:
             return
         import time
 
         time.sleep(0.01)
     raise AssertionError("prediction job did not finish")
+
+
+class FailOnceBackend(FakeBackend):
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.failed = set()
+
+    def predict(self, image_path):
+        if image_path not in self.failed:
+            self.failed.add(image_path)
+            raise RuntimeError("synthetic failure")
+        return super().predict(image_path)
 
 
 def test_load_auto_maps_classes_case_insensitively(tmp_path):
@@ -74,6 +89,72 @@ def test_run_stores_predictions_in_memory_only(tmp_path):
     assert items[0]["class_id"] == 1  # mapped via ONE -> one
     assert items[1]["class_id"] is None  # "extra" unmapped
     assert label.read_text() == before  # nothing written
+
+
+def test_batch_reports_failures_and_retries_only_failed_images(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    manager = PredictorManager(dataset, backend_factory=FailOnceBackend)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+
+    manager.run()
+    wait_job(manager)
+    assert manager.job["state"] == "done"
+    assert manager.job["completed"] == 0
+    assert manager.job["failed"] == 1
+    assert manager.job["done"] == manager.job["total"] == 1
+    assert manager.job["failures"][0]["error"] == "synthetic failure"
+
+    manager.retry_failed()
+    wait_job(manager)
+    assert manager.job["completed"] == 1
+    assert manager.job["failed"] == 0
+
+
+def test_batch_cancellation_is_cooperative(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    split = tmp_path / "train"
+    Image.new("RGB", (100, 80), "white").save(split / "second.jpg")
+    (split / "second.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    dataset = Dataset(dataset.yaml_path, "detection")
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingBackend(FakeBackend):
+        def predict(self, image_path):
+            started.set()
+            release.wait(2)
+            return super().predict(image_path)
+
+    manager = PredictorManager(dataset, backend_factory=BlockingBackend)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    manager.run()
+    assert started.wait(1)
+    state = manager.cancel()
+    assert state["job"]["cancel_requested"] is True
+    release.set()
+    wait_job(manager)
+    assert manager.job["state"] == "cancelled"
+    assert manager.job["completed"] == 1
+    assert manager.job["cancelled"] == 1
+
+
+def test_annotation_write_invalidates_ready_embeddings(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    embeddings = EmbeddingsManager(dataset)
+    embeddings.status = "ready"
+    embeddings.items = [{"annotation_id": "old"}]
+    embeddings.source_generation = dataset.annotation_generation
+    record = next(iter(dataset.images.values()))
+
+    dataset.replace_annotations(record.id, [{"class_id": 0, "points": [0.4, 0.4, 0.1, 0.1]}])
+
+    state = embeddings.payload()
+    assert state["status"] == "idle"
+    assert state["items"] == []
+    assert state["source_generation"] is None
 
 
 def test_only_unlabeled_skips_annotated_images(tmp_path):
@@ -257,6 +338,38 @@ def test_predict_single_image_endpoint(tmp_path):
             assert (await client.post("/api/v1/images/unknown/predictions/compute")).status_code == 404
 
     asyncio.run(run())
+
+
+def test_slow_prediction_endpoint_does_not_block_other_api_requests(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingBackend(FakeBackend):
+        def predict(self, image_path):
+            started.set()
+            release.wait(2)
+            return super().predict(image_path)
+
+    manager = PredictorManager(dataset, backend_factory=BlockingBackend)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"), predictor=manager)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            image_id = next(iter(dataset.images))
+            prediction = asyncio.create_task(client.post(f"/api/v1/images/{image_id}/predictions/compute"))
+            assert await asyncio.to_thread(started.wait, 1)
+            metadata = await asyncio.wait_for(client.get("/api/v1/dataset"), 0.5)
+            assert metadata.status_code == 200
+            release.set()
+            assert (await prediction).status_code == 200
+
+    try:
+        asyncio.run(run())
+    finally:
+        release.set()
 
 
 def test_discover_models_scans_and_prioritizes_recents(tmp_path):

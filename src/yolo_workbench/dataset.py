@@ -60,6 +60,17 @@ class Dataset:
         self._mtimes: dict[Path, int | None] = {}
         self._revisions: dict[Path, int] = {}
         self._lock = threading.RLock()
+        self._change_listeners: list = []
+        self.annotation_generation = 0
+        self._sorted_image_ids: list[str] = []
+        self._split_image_ids: dict[str, set[str]] = {}
+        self._class_image_ids: dict[int, set[str]] = {}
+        self._object_index: dict[int, dict[str, dict]] = {}
+        self._object_keys_by_image: dict[str, list[tuple[int, str]]] = {}
+        self._issues_by_image: dict[str, list[dict]] = {}
+        self._issue_index: dict[str, tuple[ImageRecord, dict]] = {}
+        self._issue_count = 0
+        self._orphan_issues: list[dict] = []
         # each history entry is a transaction: one or more label files written together
         self._undo: list[list[HistoryEntry]] = []
         self._redo: list[list[HistoryEntry]] = []
@@ -107,6 +118,7 @@ class Dataset:
         if not self.images:
             raise DatasetError("No supported images found in dataset splits")
         self._find_orphans()
+        self._rebuild_indexes()
 
     @property
     def _index_path(self) -> Path:
@@ -149,6 +161,7 @@ class Dataset:
             record.probe_error = error
             if error:
                 record.issues.append(self._issue("unreadable_image", "error", error, record))
+            self._refresh_record_indexes(record)
             self.indexing["done"] += 1
 
     def _save_size_index(self) -> None:
@@ -247,6 +260,7 @@ class Dataset:
         record.class_ids = {annotation.class_id for annotation in record.annotations}
         self._mtimes[record.label_path] = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
         self._revisions[record.label_path] = self._revisions.get(record.label_path, 0) + 1
+        self._refresh_record_indexes(record)
 
     def _zero_area(self, annotation: Annotation) -> bool:
         if self.category == "detection":
@@ -267,27 +281,133 @@ class Dataset:
                 candidates.update(path.resolve() for path in root.rglob("*.txt") if ".yolo-workbench" not in path.parts)
         self.orphan_labels = sorted(candidates - expected)
 
-    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100) -> dict:
-        records = list(self.images.values())
-        if split != "all":
-            records = [record for record in records if record.split == split]
-        if class_id is not None:
-            records = [record for record in records if class_id in record.class_ids]
-        if search:
-            query = search.casefold()
-            records = [record for record in records if query in record.name_cf]
-        records.sort(key=lambda record: (record.split, record.name_cf))
-        return {"total": len(records), "items": [record.summary() for record in records[offset : offset + limit]]}
+    def _rebuild_indexes(self) -> None:
+        """Build immutable ordering/split indexes and mutable annotation indexes once."""
+        self._sorted_image_ids = [
+            record.id for record in sorted(self.images.values(), key=lambda item: (item.split, item.name_cf))
+        ]
+        self._split_image_ids = {}
+        self._class_image_ids = {}
+        self._object_index = {}
+        self._object_keys_by_image = {}
+        self._issues_by_image = {}
+        self._issue_index = {}
+        self._issue_count = 0
+        for record in self.images.values():
+            self._split_image_ids.setdefault(record.split, set()).add(record.id)
+            self._refresh_record_indexes(record)
+        self._orphan_issues = [
+            {
+                "id": hashlib.sha1(str(path).encode()).hexdigest()[:16],
+                "kind": "orphan_label",
+                "severity": "warning",
+                "message": "Label has no matching dataset image",
+                "image_id": None,
+                "image_name": path.name,
+                "split": None,
+                "annotation_id": None,
+                "fixable": False,
+            }
+            for path in self.orphan_labels
+        ]
+
+    def _refresh_record_indexes(self, record: ImageRecord) -> None:
+        """Refresh only the indexes affected by one record mutation."""
+        if record.id not in self.images:
+            return
+        old_keys = self._object_keys_by_image.pop(record.id, [])
+        for class_id in {class_id for class_id, _ in old_keys}:
+            image_ids = self._class_image_ids[class_id]
+            image_ids.discard(record.id)
+            if not image_ids:
+                del self._class_image_ids[class_id]
+        for class_id, annotation_id in old_keys:
+            objects = self._object_index.get(class_id)
+            if objects is not None:
+                objects.pop(annotation_id, None)
+                if not objects:
+                    del self._object_index[class_id]
+
+        keys = []
+        for annotation in record.annotations:
+            self._class_image_ids.setdefault(annotation.class_id, set()).add(record.id)
+            item = {
+                "id": annotation.id,
+                "image_id": record.id,
+                "image_name": record.path.name,
+                "split": record.split,
+                "class_id": annotation.class_id,
+            }
+            self._object_index.setdefault(annotation.class_id, {})[annotation.id] = item
+            keys.append((annotation.class_id, annotation.id))
+        self._object_keys_by_image[record.id] = keys
+        old_issues = self._issues_by_image.get(record.id, [])
+        self._issue_count -= len(old_issues)
+        for issue in old_issues:
+            self._issue_index.pop(issue["id"], None)
+        self._issues_by_image[record.id] = list(record.issues)
+        for issue in record.issues:
+            self._issue_index[issue["id"]] = (record, issue)
+        self._issue_count += len(record.issues)
+
+    def add_change_listener(self, listener) -> None:
+        self._change_listeners.append(listener)
+
+    def _notify_changes(self, image_ids: list[str]) -> None:
+        for listener in tuple(self._change_listeners):
+            try:
+                listener(image_ids, self.annotation_generation)
+            except Exception:
+                pass  # cache invalidation must never make a committed label write fail
+
+    def metadata(self) -> dict:
+        with self._lock:
+            return {
+                "yaml": str(self.yaml_path),
+                "root": str(self.root),
+                "category": self.category,
+                "names": self.names,
+                "image_count": len(self.images),
+                "split_counts": {split: len(image_ids) for split, image_ids in self._split_image_ids.items()},
+                "issue_count": self._issue_count + len(self._orphan_issues),
+                "session_id": self.session_id,
+                "indexing": dict(self.indexing),
+            }
+
+    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None) -> dict:
+        with self._lock:
+            allowed: set[str] | None = None
+            if split != "all":
+                allowed = set(self._split_image_ids.get(split, set()))
+            if class_id is not None:
+                class_images = self._class_image_ids.get(class_id, set())
+                allowed = set(class_images) if allowed is None else allowed & class_images
+            if prediction_ids is not None:
+                allowed = set(prediction_ids) if allowed is None else allowed & prediction_ids
+            records = [self.images[image_id] for image_id in self._sorted_image_ids if allowed is None or image_id in allowed]
+            if search:
+                query = search.casefold()
+                records = [record for record in records if query in record.name_cf]
+            return {"total": len(records), "items": [record.summary() for record in records[offset : offset + limit]]}
+
+    def list_objects(self, class_id: int, split="all", offset=0, limit=100) -> dict:
+        with self._lock:
+            items = list(self._object_index.get(class_id, {}).values())
+            if split != "all":
+                items = [item for item in items if item["split"] == split]
+            items.sort(key=lambda item: (item["split"], item["image_name"].casefold(), item["id"]))
+            return {"total": len(items), "items": items[offset : offset + limit]}
 
     def detail(self, image_id: str) -> dict:
-        record = self.require_image(image_id)
-        return {
-            **record.summary(),
-            "path": str(record.path),
-            "revision": self._revisions[record.label_path],
-            "annotations": [a.as_dict() for a in record.annotations],
-            "issues": record.issues,
-        }
+        with self._lock:
+            record = self.require_image(image_id)
+            return {
+                **record.summary(),
+                "path": str(record.path),
+                "revision": self._revisions[record.label_path],
+                "annotations": [a.as_dict() for a in record.annotations],
+                "issues": list(record.issues),
+            }
 
     def require_image(self, image_id: str) -> ImageRecord:
         try:
@@ -361,6 +481,11 @@ class Dataset:
             if history and transaction:
                 self._undo.append(transaction)
                 self._redo.clear()
+            changed_ids = [change.record.id for change in changes]
+            if changed_ids:
+                self.annotation_generation += 1
+        if changed_ids:
+            self._notify_changes(changed_ids)
 
     def _backup(self, label_path: Path, content: str) -> None:
         if label_path in self._backed_up:
@@ -427,39 +552,36 @@ class Dataset:
         return {"image_ids": image_ids, "image_id": image_ids[0], "can_undo": bool(self._undo), "can_redo": bool(self._redo)}
 
     def issues(self) -> list[dict]:
-        issues = [issue for record in self.images.values() for issue in record.issues]
-        issues.extend({"id": hashlib.sha1(str(path).encode()).hexdigest()[:16], "kind": "orphan_label", "severity": "warning", "message": "Label has no matching dataset image", "image_id": None, "image_name": path.name, "split": None, "annotation_id": None, "fixable": False} for path in self.orphan_labels)
-        return issues
+        with self._lock:
+            return [issue for _, issue in self._issue_index.values()] + list(self._orphan_issues)
 
     def fix_issue(self, issue_id: str) -> dict:
-        for record in self.images.values():
-            issue = next((item for item in record.issues if item["id"] == issue_id), None)
-            if not issue or not issue["fixable"]:
-                continue
-            if issue["kind"] == "missing_label":
-                return self.replace_annotations(record.id, [])
-            annotation = next((a for a in record.annotations if a.id == issue["annotation_id"]), None)
-            if not annotation:
-                raise DatasetError("Annotation no longer exists")
-            annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
-            annotation = next(a for a in annotations if a.id == annotation.id)
-            if issue["kind"] == "out_of_range":
-                annotation.points = [min(1, max(0, value)) for value in annotation.points]
-            elif issue["kind"] in {"zero_area", "duplicate"}:
-                annotations.remove(annotation)
-            return self.replace_annotations(record.id, [a.as_dict() for a in annotations])
-        raise DatasetError("Issue not found or cannot be fixed automatically")
+        indexed = self._issue_index.get(issue_id)
+        if not indexed or not indexed[1]["fixable"]:
+            raise DatasetError("Issue not found or cannot be fixed automatically")
+        record, issue = indexed
+        if issue["kind"] == "missing_label":
+            return self.replace_annotations(record.id, [])
+        annotation = next((a for a in record.annotations if a.id == issue["annotation_id"]), None)
+        if not annotation:
+            raise DatasetError("Annotation no longer exists")
+        annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
+        annotation = next(a for a in annotations if a.id == annotation.id)
+        if issue["kind"] == "out_of_range":
+            annotation.points = [min(1, max(0, value)) for value in annotation.points]
+        elif issue["kind"] in {"zero_area", "duplicate"}:
+            annotations.remove(annotation)
+        return self.replace_annotations(record.id, [a.as_dict() for a in annotations])
 
     def fix_issues_bulk(self, kind: str, split: str | None = None, issue_ids: list[str] | None = None) -> dict:
         """Fix every matching fixable issue in one transaction; skips images that fail validation."""
         wanted = set(issue_ids) if issue_ids else None
         changes, skipped, fixed = [], [], 0
-        for record in self.images.values():
-            if split is not None and record.split != split:
-                continue
-            issues = [issue for issue in record.issues if issue["fixable"] and issue["kind"] == kind and (wanted is None or issue["id"] in wanted)]
-            if not issues:
-                continue
+        grouped: dict[str, tuple[ImageRecord, list[dict]]] = {}
+        for record, issue in self._issue_index.values():
+            if issue["fixable"] and issue["kind"] == kind and (split is None or record.split == split) and (wanted is None or issue["id"] in wanted):
+                grouped.setdefault(record.id, (record, []))[1].append(issue)
+        for record, issues in grouped.values():
             try:
                 changes.append(self._prepare(record, self._repair(record, issues)))
                 fixed += len(issues)

@@ -102,6 +102,8 @@ class PredictorManager:
         self._available = backend_factory is not None or ultralytics_available()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._cancel_event = threading.Event()
+        self._failed_image_ids: list[str] = []
         self.status = "idle" if self._available else "unavailable"
         self.error: str | None = None
         self.backend = None
@@ -110,8 +112,22 @@ class PredictorManager:
         self.iou = 0.45
         self.mapping: dict[int, int | None] = {}  # model class id -> dataset class id (None = unmapped)
         self.predictions: dict[str, list[dict]] = {}  # image_id -> pending predictions
-        self.job: dict = {"state": "idle", "done": 0, "total": 0, "error": None}
+        self.job: dict = self._new_job()
         self._counter = 0
+
+    @staticmethod
+    def _new_job(state: str = "idle", total: int = 0) -> dict:
+        return {
+            "state": state,
+            "done": 0,
+            "completed": 0,
+            "failed": 0,
+            "cancelled": 0,
+            "total": total,
+            "failures": [],
+            "cancel_requested": False,
+            "error": None,
+        }
 
     @staticmethod
     def _default_factory(path: Path, category: str, conf: float, iou: float):
@@ -119,6 +135,7 @@ class PredictorManager:
 
     def payload(self) -> dict:
         with self._lock:
+            job = {**self.job, "failures": [dict(item) for item in self.job["failures"]]}
             return {
                 "status": self.status,
                 "error": self.error,
@@ -126,9 +143,13 @@ class PredictorManager:
                 "conf": self.conf,
                 "iou": self.iou,
                 "mapping": {str(key): value for key, value in self.mapping.items()},
-                "job": dict(self.job),
+                "job": job,
                 "pending": {image_id: len(items) for image_id, items in self.predictions.items() if items},
             }
+
+    def pending_image_ids(self) -> set[str]:
+        with self._lock:
+            return {image_id for image_id, items in self.predictions.items() if items}
 
     def load(self, path: str, conf: float | None = None, iou: float | None = None) -> dict:
         if not self._available:
@@ -157,7 +178,9 @@ class PredictorManager:
                 self.iou = iou
             self.mapping = self._auto_map(backend.names)
             self.predictions.clear()
-            self.job = {"state": "idle", "done": 0, "total": 0, "error": None}
+            self.job = self._new_job()
+            self._failed_image_ids = []
+            self._cancel_event.clear()
             self.status = "ready"
         self._remember_model(str(model_path))
         return self.payload()
@@ -263,10 +286,29 @@ class PredictorManager:
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is already in progress")
             records = self._select(image_ids, split, only_unlabeled)
-            self.job = {"state": "running", "done": 0, "total": len(records), "error": None}
+            self.job = self._new_job("running", len(records))
+            self._failed_image_ids = []
+            self._cancel_event.clear()
             self._thread = threading.Thread(target=self._run_batch, args=(records,), daemon=True)
             self._thread.start()
         return self.payload()
+
+    def cancel(self) -> dict:
+        with self._lock:
+            if self.job["state"] != "running":
+                raise DatasetError("No prediction run is in progress")
+            self._cancel_event.set()
+            self.job["cancel_requested"] = True
+        return self.payload()
+
+    def retry_failed(self) -> dict:
+        with self._lock:
+            if self.job["state"] == "running":
+                raise DatasetError("A prediction run is already in progress")
+            image_ids = list(self._failed_image_ids)
+        if not image_ids:
+            raise DatasetError("There are no failed predictions to retry")
+        return self.run(image_ids=image_ids)
 
     def _select(self, image_ids: list[str] | None, split: str | None, only_unlabeled: bool) -> list[ImageRecord]:
         if image_ids is not None:
@@ -283,19 +325,30 @@ class PredictorManager:
         return records
 
     def _run_batch(self, records: list[ImageRecord]) -> None:
-        for record in records:
+        for index, record in enumerate(records):
+            if self._cancel_event.is_set():
+                with self._lock:
+                    self.job["cancelled"] = len(records) - index
+                break
             try:
                 raw = self.backend.predict(record.path)
+                with self._lock:
+                    items = [self._prediction(record, item) for item in raw]
+                    self.predictions[record.id] = self._filter_new(record, items)
             except Exception as exc:  # surfaced to the UI, never crashes the server
                 with self._lock:
-                    self.job["state"] = "error"
-                    self.job["error"] = f"{record.path.name}: {exc}"
-                return
+                    failure = {"image_id": record.id, "image_name": record.path.name, "error": str(exc)}
+                    self.job["failures"].append(failure)
+                    self.job["failed"] += 1
+                    self.job["done"] += 1
+                    self._failed_image_ids.append(record.id)
+                continue
             with self._lock:
-                self.predictions[record.id] = self._filter_new(record, [self._prediction(record, item) for item in raw])
+                self.job["completed"] += 1
                 self.job["done"] += 1
         with self._lock:
-            self.job["state"] = "done"
+            self.job["state"] = "cancelled" if self._cancel_event.is_set() else "done"
+            self.job["cancel_requested"] = False
 
     def _prediction(self, record: ImageRecord, item: dict) -> dict:
         self._counter += 1

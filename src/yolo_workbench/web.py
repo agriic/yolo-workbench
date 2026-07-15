@@ -119,32 +119,30 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
         return JSONResponse(status_code=422, content={"detail": json_safe(jsonable_encoder(exc.errors()))})
 
     @app.get("/api/v1/dataset")
-    async def metadata():
-        split_counts: dict[str, int] = {}
-        for record in dataset.images.values():
-            split_counts[record.split] = split_counts.get(record.split, 0) + 1
-        return {"yaml": str(dataset.yaml_path), "root": str(dataset.root), "category": dataset.category, "names": dataset.names, "image_count": len(dataset.images), "split_counts": split_counts, "issue_count": len(dataset.issues()), "session_id": dataset.session_id, "indexing": dict(dataset.indexing)}
+    def metadata():
+        return dataset.metadata()
 
     @app.get("/api/v1/images")
-    async def images(split: str = "all", class_id: int | None = None, search: str = "", offset: int = 0, limit: int = Query(100, ge=1, le=500)):
-        return dataset.list_images(split, class_id, search, max(0, offset), limit)
+    def images(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, offset: int = 0, limit: int = Query(100, ge=1, le=500)):
+        prediction_ids = predictor.pending_image_ids() if has_predictions else None
+        return dataset.list_images(split, class_id, search, max(0, offset), limit, prediction_ids)
 
     @app.get("/api/v1/images/{image_id}")
-    async def image_detail(image_id: str):
+    def image_detail(image_id: str):
         try:
             return dataset.detail(image_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/images/{image_id}/file")
-    async def image_file(image_id: str):
+    def image_file(image_id: str):
         try:
             return FileResponse(dataset.require_image(image_id).path)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/images/{image_id}/thumbnail")
-    async def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False):
+    def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False):
         try:
             record = dataset.require_image(image_id)
         except KeyError as exc:
@@ -156,7 +154,7 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
         return jpeg_response(content, etag=key)
 
     @app.put("/api/v1/images/{image_id}/annotations")
-    async def update_annotations(image_id: str, payload: AnnotationListPayload):
+    def update_annotations(image_id: str, payload: AnnotationListPayload):
         try:
             return dataset.replace_annotations(
                 image_id,
@@ -167,20 +165,11 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/objects")
-    async def objects(class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500)):
-        items = []
-        for record in sorted(dataset.images.values(), key=lambda item: (item.split, item.path.name.casefold())):
-            if split != "all" and record.split != split:
-                continue
-            if class_id not in record.class_ids:
-                continue
-            for annotation in record.annotations:
-                if annotation.class_id == class_id:
-                    items.append({"id": annotation.id, "image_id": record.id, "image_name": record.path.name, "split": record.split, "class_id": annotation.class_id})
-        return {"total": len(items), "items": items[offset : offset + limit]}
+    def objects(class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500)):
+        return dataset.list_objects(class_id, split, max(0, offset), limit)
 
     @app.get("/api/v1/objects/{image_id}/{annotation_id:path}/crop")
-    async def object_crop(request: Request, image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1)):
+    def object_crop(request: Request, image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1)):
         try:
             record = dataset.require_image(image_id)
         except KeyError as exc:
@@ -195,79 +184,87 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
         return jpeg_response(content, etag=key)
 
     @app.get("/api/v1/issues")
-    async def issues():
+    def issues():
         return {"items": dataset.issues()}
 
     @app.post("/api/v1/issues/fix-bulk")
-    async def fix_issues_bulk(payload: BulkFixPayload):
+    def fix_issues_bulk(payload: BulkFixPayload):
         return dataset.fix_issues_bulk(payload.kind, payload.split, payload.issue_ids)
 
     @app.post("/api/v1/issues/{issue_id}/fix")
-    async def fix_issue(issue_id: str):
+    def fix_issue(issue_id: str):
         return dataset.fix_issue(issue_id)
 
     @app.post("/api/v1/objects/bulk")
-    async def bulk_objects(payload: BulkObjectPayload):
+    def bulk_objects(payload: BulkObjectPayload):
         return dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations])
 
     @app.get("/api/v1/predictor")
-    async def predictor_state():
+    def predictor_state():
         return predictor.payload()
 
     @app.get("/api/v1/predictor/models")
-    async def predictor_models():
+    def predictor_models():
         return predictor.discover_models()
 
     @app.post("/api/v1/predictor/load")
-    async def predictor_load(payload: PredictorLoadPayload):
+    def predictor_load(payload: PredictorLoadPayload):
         return predictor.load(payload.path, payload.conf, payload.iou)
 
     @app.put("/api/v1/predictor/mapping")
-    async def predictor_mapping(payload: PredictorMappingPayload):
+    def predictor_mapping(payload: PredictorMappingPayload):
         return predictor.set_mapping(payload.mapping)
 
     @app.post("/api/v1/predictor/run")
-    async def predictor_run(payload: PredictorRunPayload):
+    def predictor_run(payload: PredictorRunPayload):
         return predictor.run(payload.image_ids, payload.split, payload.only_unlabeled)
 
+    @app.post("/api/v1/predictor/cancel")
+    def predictor_cancel():
+        return predictor.cancel()
+
+    @app.post("/api/v1/predictor/retry")
+    def predictor_retry():
+        return predictor.retry_failed()
+
     @app.post("/api/v1/images/{image_id}/predictions/compute")
-    async def compute_predictions(image_id: str):
+    def compute_predictions(image_id: str):
         try:
             return predictor.predict_image(image_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/images/{image_id}/predictions")
-    async def image_predictions(image_id: str):
+    def image_predictions(image_id: str):
         try:
             return predictor.predictions_for(image_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.post("/api/v1/images/{image_id}/predictions/accept")
-    async def accept_predictions(image_id: str, payload: PredictionAcceptPayload):
+    def accept_predictions(image_id: str, payload: PredictionAcceptPayload):
         try:
             return predictor.accept(image_id, payload.prediction_ids, payload.min_confidence)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.post("/api/v1/images/{image_id}/predictions/reject")
-    async def reject_predictions(image_id: str, payload: PredictionRejectPayload):
+    def reject_predictions(image_id: str, payload: PredictionRejectPayload):
         try:
             return predictor.reject(image_id, payload.prediction_ids)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
     @app.get("/api/v1/embeddings")
-    async def embeddings_state():
+    def embeddings_state():
         return embeddings.payload()
 
     @app.post("/api/v1/embeddings/compute")
-    async def embeddings_compute():
+    def embeddings_compute():
         return embeddings.start()
 
     @app.post("/api/v1/history/{direction}")
-    async def history(direction: str):
+    def history(direction: str):
         if direction not in {"undo", "redo"}:
             raise HTTPException(400, "Direction must be undo or redo")
         return dataset.history(direction)

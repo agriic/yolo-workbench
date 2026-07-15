@@ -160,6 +160,8 @@ function bind() {
     if (!e.target.closest(".model-picker")) $("model-menu").hidden = true;
   });
   $("run-predict").onclick = runPredict;
+  $("cancel-predict").onclick = cancelPredict;
+  $("retry-predict").onclick = retryPredict;
   $("mapping-list").addEventListener("change", async e => {
     const select = e.target.closest("[data-model-class]");
     if (!select) return;
@@ -366,14 +368,14 @@ async function loadImages(append) {
   const offset = append === true ? state.gridOffset : 0;
   const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value, limit: "500", offset: String(offset) });
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
+  if ($("filter-predictions").checked) params.set("has_predictions", "true");
   const data = await api(`/api/v1/images?${params}`);
   state.gridOffset = offset + data.items.length;
   state.gridTotal = data.total;
-  let items = data.items;
-  if ($("filter-predictions").checked) items = items.filter(item => state.pred.pending[item.id]);
+  const items = data.items;
   state.gridImages = append === true ? state.gridImages.concat(items) : items;
   const remaining = state.gridTotal - state.gridOffset;
-  $("image-total").textContent = `${remaining > 0 ? `${state.gridImages.length} of ` : ""}${$("filter-predictions").checked && remaining <= 0 ? state.gridImages.length : state.gridTotal} images`;
+  $("image-total").textContent = `${remaining > 0 ? `${state.gridImages.length} of ` : ""}${state.gridTotal} images`;
   $("load-more-images").hidden = remaining <= 0;
   $("load-more-images").textContent = `Load ${Math.min(remaining, 500)} more`;
   const overlay = $("show-overlays").checked ? "&annotated=1" : "";
@@ -1025,6 +1027,9 @@ function applyPredictorState(data) {
   $("load-model").disabled = pred.status === "unavailable" || pred.status === "loading" || running;
   $("run-predict").hidden = !ready;
   $("run-predict").disabled = running;
+  $("cancel-predict").hidden = !running;
+  $("cancel-predict").disabled = !!pred.job.cancel_requested;
+  $("retry-predict").hidden = running || !pred.job.failed;
   $("predict-unlabeled-wrap").hidden = !ready;
   $("predict-image").hidden = !ready;
   $("predict-image").disabled = running;
@@ -1037,10 +1042,9 @@ function applyPredictorState(data) {
     loading: "Loading model…",
     error: pred.error || "Failed to load model",
     ready: running
-      ? `Predicting ${pred.job.done}/${pred.job.total}…`
-      : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}`,
+      ? `Predicting ${pred.job.done}/${pred.job.total} · ${pred.job.completed || 0} completed · ${pred.job.failed || 0} failed${pred.job.cancel_requested ? " · cancelling…" : ""}`
+      : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""}`,
   }[pred.status] || "";
-  if (pred.job.state === "error") toast(pred.job.error, "error");
   renderMapping();
   renderModelMenu();
   clearTimeout(pred.poll);
@@ -1048,7 +1052,8 @@ function applyPredictorState(data) {
     pred.poll = setTimeout(refreshPredictor, 800);
   } else if (wasRunning) {
     const count = Object.values(pred.pending).reduce((sum, n) => sum + n, 0);
-    if (pred.job.state === "done") toast(`Predicted ${pred.job.total} image${pred.job.total === 1 ? "" : "s"} · ${count} pending prediction${count === 1 ? "" : "s"}`);
+    if (pred.job.state === "done") toast(`Predicted ${pred.job.completed} image${pred.job.completed === 1 ? "" : "s"}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""} · ${count} pending prediction${count === 1 ? "" : "s"}`, pred.job.failed ? "error" : undefined);
+    if (pred.job.state === "cancelled") toast(`Prediction cancelled · ${pred.job.completed} completed · ${pred.job.cancelled} skipped`);
     loadImages();
     if (state.detail) loadEditorPredictions(state.detail.id);
   }
@@ -1086,6 +1091,18 @@ async function runPredict() {
       method: "POST",
       body: JSON.stringify({ split: $("image-split").value, only_unlabeled: $("predict-unlabeled").checked }),
     }));
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function cancelPredict() {
+  try {
+    applyPredictorState(await api("/api/v1/predictor/cancel", { method: "POST" }));
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function retryPredict() {
+  try {
+    applyPredictorState(await api("/api/v1/predictor/retry", { method: "POST" }));
   } catch (error) { toast(error.message, "error"); }
 }
 
