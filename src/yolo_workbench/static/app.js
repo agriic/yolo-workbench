@@ -24,6 +24,7 @@ const state = {
   lastObjectIndex: null,
   issues: [],
   issueFilter: null,
+  statistics: null,
   detail: null,        // image detail currently in the editor
   img: null,           // loaded HTMLImageElement
   selected: null,      // annotation id
@@ -51,6 +52,7 @@ let dpr = 1, cssW = 0, cssH = 0;
 let editorRequest = 0;
 let saveQueue = Promise.resolve();
 let saveSequence = 0;
+let statisticsRequest = 0;
 const latestSaveByImage = new Map();
 const savedRevisionByImage = new Map();
 
@@ -124,6 +126,7 @@ function bind() {
     button.classList.add("active");
     $(button.dataset.tab).classList.add("active");
     if (button.dataset.tab === "embeddings") refreshEmbeddings();
+    if (button.dataset.tab === "statistics") loadStatistics();
   });
   [$("image-split"), $("image-class"), $("show-overlays"), $("filter-predictions")].forEach(el => el.onchange = loadImages);
   $("image-search").oninput = debounce(loadImages, 250);
@@ -140,6 +143,11 @@ function bind() {
     reloadObjectsDebounced();
   };
   $("refresh-issues").onclick = loadIssues;
+  $("refresh-statistics").onclick = loadStatistics;
+  $("stats-outliers").addEventListener("click", e => {
+    const open = e.target.closest("[data-stat-open]");
+    if (open) openEditor(open.dataset.statOpen, open.dataset.object || null);
+  });
 
   // model-assisted labeling
   $("load-model").onclick = loadModel;
@@ -263,6 +271,7 @@ function bind() {
     try {
       await api(`/api/v1/issues/${fix.dataset.fix}/fix`, { method: "POST" });
       state.canUndo = true; state.canRedo = false; updateHistoryButtons();
+      statisticsChanged();
       toast("Issue fixed");
       await Promise.all([loadImages(), loadObjects(), loadIssues()]);
     } catch (error) { toast(error.message, "error"); }
@@ -887,6 +896,7 @@ async function save(selectIndex = null) {
       state.canUndo = true;
       state.canRedo = false;
       updateHistoryButtons();
+      statisticsChanged();
     } catch (error) {
       toast(error.message, "error");
       if (request === editorRequest && state.detail?.id === image.id && latestSaveByImage.get(image.id) === sequence) {
@@ -933,6 +943,7 @@ async function applyHistory(direction) {
     state.canUndo = result.can_undo;
     state.canRedo = result.can_redo;
     updateHistoryButtons();
+    statisticsChanged();
     const request = editorRequest;
     const imageId = state.detail?.id;
     if (imageId && result.image_ids.includes(imageId)) {
@@ -1226,6 +1237,7 @@ async function acceptPredictions(predictionIds, minConfidence = null) {
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
+    statisticsChanged();
     toast(`Accepted ${result.accepted} prediction${result.accepted === 1 ? "" : "s"} — Ctrl+Z undoes`);
     if (request === editorRequest && state.detail?.id === imageId) {
       state.detail = result.detail;
@@ -1333,6 +1345,7 @@ async function runObjectBulk(action, classId = null) {
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
+    statisticsChanged();
     const skipped = result.skipped.length ? ` · ${result.skipped.length} skipped` : "";
     toast(`${action === "delete" ? "Deleted" : "Relabeled"} ${result.applied} annotation${result.applied === 1 ? "" : "s"} in ${result.files} file${result.files === 1 ? "" : "s"}${skipped} — Ctrl+Z undoes`);
     clearObjectSelection();
@@ -1354,10 +1367,111 @@ async function editObject(imageId, id, change) {
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
+    statisticsChanged();
     await Promise.all([loadImages(), loadObjects(), loadIssues()]);
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+/* ---------- statistics ---------- */
+
+async function loadStatistics() {
+  const request = ++statisticsRequest;
+  $("statistics-loading").textContent = "Loading statistics…";
+  $("statistics-loading").hidden = false;
+  $("statistics-content").hidden = true;
+  try {
+    const data = await api("/api/v1/statistics");
+    if (request !== statisticsRequest) return;
+    state.statistics = data;
+    renderStatistics();
+    $("statistics-loading").hidden = true;
+    $("statistics-content").hidden = false;
+  } catch (error) {
+    if (request !== statisticsRequest) return;
+    $("statistics-loading").textContent = `Could not load statistics: ${error.message}`;
+    toast(error.message, "error");
+  }
+}
+
+function renderStatistics() {
+  const stats = state.statistics;
+  if (!stats) return;
+  const summary = stats.summary;
+  const kpis = [
+    [summary.images, "Images"],
+    [summary.annotations, "Annotations"],
+    [summary.annotated_images, "Annotated images"],
+    [summary.unlabeled_images, "Unlabeled images"],
+    [formatNumber(summary.average_annotations, 2), "Average per image"],
+  ];
+  $("stats-kpis").innerHTML = kpis.map(([value, label]) =>
+    `<div class="stats-kpi"><strong>${esc(value)}</strong><span>${esc(label)}</span></div>`).join("");
+
+  const classes = [...stats.class_balance].sort((a, b) => b.annotations - a.annotations || a.class_id - b.class_id);
+  const classMax = Math.max(1, ...classes.map(item => item.annotations));
+  $("stats-class-balance").innerHTML = `<div class="stats-bars">${classes.map(item => `
+    <div class="stats-bar-row" title="${esc(item.images)} image${item.images === 1 ? "" : "s"} · ${esc(item.percent)}% of annotations">
+      <span class="stats-bar-label"><span class="chip" style="--c:${classColor(item.class_id)}">${esc(item.name)}</span></span>
+      <span class="stats-bar-track"><span class="stats-bar-fill" style="--c:${classColor(item.class_id)};width:${item.annotations / classMax * 100}%"></span></span>
+      <span class="stats-bar-value">${item.annotations} · ${item.images} img</span>
+    </div>`).join("")}</div>`;
+
+  renderDistribution("stats-density", stats.annotations_per_image, value => formatNumber(value, 1));
+  renderDistribution("stats-box-size", stats.box_size, value => `${formatNumber(value * 100, 2)}%`);
+  renderDistribution("stats-aspect", stats.aspect_ratio, value => formatNumber(value, 2));
+
+  const classHeaders = classes.map(item => item.class_id);
+  $("stats-splits").innerHTML = `<table class="stats-table"><thead><tr>
+    <th>Split</th><th>Images</th><th>Annotated</th><th>Annotations</th><th>Avg/image</th>
+    ${classHeaders.map(id => `<th title="${esc(state.meta.names[id] ?? `class ${id}`)}">${esc(state.meta.names[id] ?? id)}</th>`).join("")}
+  </tr></thead><tbody>${stats.split_comparison.map(row => `<tr>
+    <td><span class="split-badge">${esc(row.split)}</span></td><td>${row.images}</td><td>${row.annotated_images}</td><td>${row.annotations}</td><td>${formatNumber(row.average_annotations, 2)}</td>
+    ${classHeaders.map(id => `<td>${row.class_annotations[id] || 0}</td>`).join("")}
+  </tr>`).join("")}</tbody></table>`;
+
+  renderCooccurrence(stats.cooccurrence);
+  $("stats-outlier-count").textContent = stats.outliers.length ? `(${stats.outliers.length})` : "";
+  $("stats-outliers").innerHTML = stats.outliers.map(item => `
+    <div class="stats-outlier">
+      <div><div class="name" title="${esc(item.image_name)}">${esc(item.image_name)}</div><span class="split-badge">${esc(item.split)}</span></div>
+      <span class="pill">${esc(item.kind.replaceAll("_", " "))}</span>
+      <span class="stats-outlier-reason">${esc(item.reason)}</span>
+      <button data-stat-open="${item.image_id}" data-object="${esc(item.annotation_id || "")}">Open</button>
+    </div>`).join("") || `<div class="empty">No strong statistical outliers detected.</div>`;
+}
+
+function renderDistribution(id, distribution, formatter) {
+  const maximum = Math.max(1, ...distribution.bins.map(bin => bin.count));
+  $(id).innerHTML = `<div class="stats-bars">${distribution.bins.map(bin => `
+    <div class="stats-bar-row">
+      <span class="stats-bar-label">${esc(bin.label)}</span>
+      <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${bin.count / maximum * 100}%"></span></span>
+      <span class="stats-bar-value">${bin.count}</span>
+    </div>`).join("")}</div>
+    <div class="stats-summary"><span>Median <strong>${formatter(distribution.median)}</strong></span><span>Q1 <strong>${formatter(distribution.q1)}</strong></span><span>Q3 <strong>${formatter(distribution.q3)}</strong></span><span>P95 <strong>${formatter(distribution.p95)}</strong></span><span>Max <strong>${formatter(distribution.max)}</strong></span></div>`;
+}
+
+function renderCooccurrence(data) {
+  const present = data.class_ids.map((id, index) => ({ id, index, count: data.matrix[index][index] }))
+    .filter(item => item.count > 0).sort((a, b) => b.count - a.count || a.id - b.id);
+  const ranked = present.slice(0, 12);
+  const maximum = Math.max(1, ...ranked.flatMap(row => ranked.map(column => data.matrix[row.index][column.index])));
+  $("stats-cooccurrence").innerHTML = ranked.length ? `<table class="cooccurrence"><thead><tr><th></th>${ranked.map(item => `<th title="${esc(data.names[item.index])}">${esc(data.names[item.index])}</th>`).join("")}</tr></thead><tbody>
+    ${ranked.map(row => `<tr><th title="${esc(data.names[row.index])}">${esc(data.names[row.index])}</th>${ranked.map(column => {
+      const count = data.matrix[row.index][column.index];
+      return `<td style="--heat:${count / maximum}" title="${esc(data.names[row.index])} + ${esc(data.names[column.index])}: ${count} image${count === 1 ? "" : "s"}">${count || ""}</td>`;
+    }).join("")}</tr>`).join("")}</tbody></table>${present.length > ranked.length ? `<p class="panel-note">Showing the 12 classes present in the most images.</p>` : ""}` : `<p class="empty-note">No annotated classes to compare.</p>`;
+}
+
+function formatNumber(value, digits = 0) {
+  return Number(value).toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+
+function statisticsChanged() {
+  state.statistics = null;
+  if ($("statistics").classList.contains("active")) loadStatistics();
 }
 
 /* ---------- embeddings (Voxel51 gt_viz) ---------- */
@@ -1790,6 +1904,7 @@ async function fixAllIssues(kind, count) {
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
+    statisticsChanged();
     const skipped = result.skipped.length ? ` · ${result.skipped.length} image${result.skipped.length === 1 ? "" : "s"} skipped (${result.skipped[0].reason})` : "";
     toast(`Fixed ${result.fixed} issue${result.fixed === 1 ? "" : "s"} in ${result.files} file${result.files === 1 ? "" : "s"}${skipped}`, result.skipped.length ? "error" : "info");
     await Promise.all([loadImages(), loadObjects(), loadIssues()]);

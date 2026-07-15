@@ -1,6 +1,6 @@
 # YOLO Dataset Workbench
 
-Local browser-based tooling for YOLO detection and segmentation annotation, object exploration, relabeling, and dataset validation.
+Local browser-based tooling for YOLO detection and segmentation annotation, object exploration, relabeling, dataset statistics, and validation.
 
 ## Run
 
@@ -43,4 +43,3 @@ pytest
 ```
 
 Tests create isolated temporary datasets and never modify the dataset passed to the application.
-

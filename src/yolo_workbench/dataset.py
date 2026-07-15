@@ -71,6 +71,7 @@ class Dataset:
         self._issue_index: dict[str, tuple[ImageRecord, dict]] = {}
         self._issue_count = 0
         self._orphan_issues: list[dict] = []
+        self._statistics_cache: dict | None = None
         # each history entry is a transaction: one or more label files written together
         self._undo: list[list[HistoryEntry]] = []
         self._redo: list[list[HistoryEntry]] = []
@@ -313,6 +314,7 @@ class Dataset:
 
     def _refresh_record_indexes(self, record: ImageRecord) -> None:
         """Refresh only the indexes affected by one record mutation."""
+        self._statistics_cache = None
         if record.id not in self.images:
             return
         old_keys = self._object_keys_by_image.pop(record.id, [])
@@ -373,6 +375,223 @@ class Dataset:
                 "session_id": self.session_id,
                 "indexing": dict(self.indexing),
             }
+
+    def statistics(self) -> dict:
+        """Return cached dataset-wide annotation statistics.
+
+        Geometry is normalized to the image and segmentation objects use their
+        enclosing box, so the same distributions work for both dataset types.
+        """
+        with self._lock:
+            if self._statistics_cache is None:
+                self._statistics_cache = self._build_statistics()
+            return self._statistics_cache
+
+    def _build_statistics(self) -> dict:
+        records = list(self.images.values())
+        annotation_counts = [len(record.annotations) for record in records]
+        annotation_total = sum(annotation_counts)
+        annotated_images = sum(count > 0 for count in annotation_counts)
+        class_ids = sorted(set(self.names) | {annotation.class_id for record in records for annotation in record.annotations})
+        class_annotations = {class_id: 0 for class_id in class_ids}
+        class_images = {class_id: 0 for class_id in class_ids}
+        split_rows = {
+            split: {
+                "split": split,
+                "images": len(image_ids),
+                "annotated_images": 0,
+                "annotations": 0,
+                "class_annotations": {str(class_id): 0 for class_id in class_ids},
+            }
+            for split, image_ids in sorted(self._split_image_ids.items())
+        }
+        cooccurrence = [[0 for _ in class_ids] for _ in class_ids]
+        class_positions = {class_id: index for index, class_id in enumerate(class_ids)}
+        geometry = []
+
+        for record in records:
+            split = split_rows[record.split]
+            split["annotations"] += len(record.annotations)
+            split["annotated_images"] += bool(record.annotations)
+            present = sorted({annotation.class_id for annotation in record.annotations})
+            for class_id in present:
+                class_images[class_id] += 1
+                position = class_positions[class_id]
+                cooccurrence[position][position] += 1
+            for left, class_id in enumerate(present):
+                for other_id in present[left + 1 :]:
+                    a, b = class_positions[class_id], class_positions[other_id]
+                    cooccurrence[a][b] += 1
+                    cooccurrence[b][a] += 1
+            for annotation in record.annotations:
+                class_annotations[annotation.class_id] += 1
+                split["class_annotations"][str(annotation.class_id)] += 1
+                width, height = self._annotation_size(annotation)
+                area = width * height if width > 0 and height > 0 else 0
+                aspect = width / height if width > 0 and height > 0 else None
+                geometry.append({
+                    "record": record,
+                    "annotation": annotation,
+                    "area": area,
+                    "aspect": aspect,
+                })
+
+        for row in split_rows.values():
+            row["average_annotations"] = round(row["annotations"] / row["images"], 3) if row["images"] else 0
+
+        area_values = [item["area"] for item in geometry]
+        aspect_values = [item["aspect"] for item in geometry if item["aspect"] is not None]
+        density_bins = [
+            {"label": "0", "count": sum(value == 0 for value in annotation_counts)},
+            {"label": "1", "count": sum(value == 1 for value in annotation_counts)},
+            {"label": "2", "count": sum(value == 2 for value in annotation_counts)},
+            {"label": "3–4", "count": sum(3 <= value <= 4 for value in annotation_counts)},
+            {"label": "5–9", "count": sum(5 <= value <= 9 for value in annotation_counts)},
+            {"label": "10–19", "count": sum(10 <= value <= 19 for value in annotation_counts)},
+            {"label": "20+", "count": sum(value >= 20 for value in annotation_counts)},
+        ]
+        size_bins = [
+            {"label": "≤0", "count": sum(value <= 0 for value in area_values)},
+            {"label": "<1%", "count": sum(0 < value < 0.01 for value in area_values)},
+            {"label": "1–5%", "count": sum(0.01 <= value < 0.05 for value in area_values)},
+            {"label": "5–20%", "count": sum(0.05 <= value < 0.2 for value in area_values)},
+            {"label": "≥20%", "count": sum(value >= 0.2 for value in area_values)},
+        ]
+        aspect_bins = [
+            {"label": "<0.5", "count": sum(value < 0.5 for value in aspect_values)},
+            {"label": "0.5–0.8", "count": sum(0.5 <= value < 0.8 for value in aspect_values)},
+            {"label": "0.8–1.25", "count": sum(0.8 <= value < 1.25 for value in aspect_values)},
+            {"label": "1.25–2", "count": sum(1.25 <= value < 2 for value in aspect_values)},
+            {"label": "≥2", "count": sum(value >= 2 for value in aspect_values)},
+        ]
+
+        return {
+            "source_generation": self.annotation_generation,
+            "summary": {
+                "images": len(records),
+                "annotated_images": annotated_images,
+                "unlabeled_images": len(records) - annotated_images,
+                "annotations": annotation_total,
+                "average_annotations": round(annotation_total / len(records), 3) if records else 0,
+            },
+            "class_balance": [
+                {
+                    "class_id": class_id,
+                    "name": self.names.get(class_id, f"Unknown class {class_id}"),
+                    "annotations": class_annotations[class_id],
+                    "images": class_images[class_id],
+                    "percent": round(class_annotations[class_id] * 100 / annotation_total, 2) if annotation_total else 0,
+                }
+                for class_id in class_ids
+            ],
+            "annotations_per_image": {
+                "bins": density_bins,
+                **self._distribution_summary(annotation_counts),
+            },
+            "box_size": {"bins": size_bins, **self._distribution_summary(area_values)},
+            "aspect_ratio": {"bins": aspect_bins, **self._distribution_summary(aspect_values)},
+            "split_comparison": list(split_rows.values()),
+            "cooccurrence": {
+                "class_ids": class_ids,
+                "names": [self.names.get(class_id, f"Unknown {class_id}") for class_id in class_ids],
+                "matrix": cooccurrence,
+            },
+            "outliers": self._statistics_outliers(records, annotation_counts, geometry),
+        }
+
+    def _annotation_size(self, annotation: Annotation) -> tuple[float, float]:
+        if self.category == "detection":
+            return annotation.points[2], annotation.points[3]
+        xs, ys = annotation.points[::2], annotation.points[1::2]
+        return max(xs) - min(xs), max(ys) - min(ys)
+
+    @staticmethod
+    def _percentile(values: list[float] | list[int], percentile: float) -> float:
+        if not values:
+            return 0
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * percentile
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        fraction = position - lower
+        return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+    @classmethod
+    def _distribution_summary(cls, values: list[float] | list[int]) -> dict:
+        return {
+            "count": len(values),
+            "min": min(values) if values else 0,
+            "q1": cls._percentile(values, 0.25),
+            "median": cls._percentile(values, 0.5),
+            "q3": cls._percentile(values, 0.75),
+            "p95": cls._percentile(values, 0.95),
+            "max": max(values) if values else 0,
+        }
+
+    @classmethod
+    def _iqr_fences(cls, values: list[float], multiplier: float = 3) -> tuple[float, float] | None:
+        if len(values) < 8:
+            return None
+        q1, q3 = cls._percentile(values, 0.25), cls._percentile(values, 0.75)
+        spread = q3 - q1
+        if spread <= 1e-12:
+            return (q1, q3) if min(values) < q1 or max(values) > q3 else None
+        return q1 - multiplier * spread, q3 + multiplier * spread
+
+    def _statistics_outliers(self, records: list[ImageRecord], counts: list[int], geometry: list[dict]) -> list[dict]:
+        outliers = []
+        count_fence = self._iqr_fences(counts)
+        if count_fence:
+            for record, count in zip(records, counts):
+                if count > count_fence[1]:
+                    outliers.append({
+                        "image_id": record.id,
+                        "image_name": record.path.name,
+                        "split": record.split,
+                        "annotation_id": None,
+                        "kind": "annotation_count",
+                        "reason": f"Unusually many annotations ({count})",
+                        "score": count / max(count_fence[1], 1),
+                    })
+
+        by_class: dict[int, list[dict]] = {}
+        for item in geometry:
+            by_class.setdefault(item["annotation"].class_id, []).append(item)
+        for class_items in by_class.values():
+            positive_areas = [math.log(item["area"]) for item in class_items if item["area"] > 0]
+            positive_aspects = [math.log(item["aspect"]) for item in class_items if item["aspect"] is not None]
+            area_fence = self._iqr_fences(positive_areas)
+            aspect_fence = self._iqr_fences(positive_aspects)
+            for item in class_items:
+                record, annotation = item["record"], item["annotation"]
+                candidates = []
+                if item["area"] <= 0:
+                    candidates.append(("box_size", "Non-positive box size", 1000))
+                elif area_fence:
+                    value = math.log(item["area"])
+                    if value < area_fence[0]:
+                        candidates.append(("box_size", f"Unusually small box ({item['area'] * 100:.3g}% of image)", area_fence[0] - value))
+                    elif value > area_fence[1]:
+                        candidates.append(("box_size", f"Unusually large box ({item['area'] * 100:.3g}% of image)", value - area_fence[1]))
+                if item["aspect"] is not None and aspect_fence:
+                    value = math.log(item["aspect"])
+                    if value < aspect_fence[0] or value > aspect_fence[1]:
+                        candidates.append(("aspect_ratio", f"Unusual aspect ratio ({item['aspect']:.3g}:1)", min(abs(value - aspect_fence[0]), abs(value - aspect_fence[1]))))
+                for kind, reason, score in candidates:
+                    outliers.append({
+                        "image_id": record.id,
+                        "image_name": record.path.name,
+                        "split": record.split,
+                        "annotation_id": annotation.id,
+                        "class_id": annotation.class_id,
+                        "kind": kind,
+                        "reason": reason,
+                        "score": score,
+                    })
+        outliers.sort(key=lambda item: item["score"], reverse=True)
+        for item in outliers:
+            item.pop("score", None)
+        return outliers[:100]
 
     def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None) -> dict:
         with self._lock:

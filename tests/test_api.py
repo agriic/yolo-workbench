@@ -80,6 +80,9 @@ def test_media_and_validation_endpoints(tmp_path):
             image_id = next(iter(dataset.images))
             assert (await client.get(f"/api/v1/images/{image_id}/thumbnail")).headers["content-type"] == "image/jpeg"
             assert (await client.get("/api/v1/issues")).status_code == 200
+            statistics = (await client.get("/api/v1/statistics")).json()
+            assert statistics["summary"]["annotations"] == 1
+            assert statistics["class_balance"][1]["name"] == "one"
     asyncio.run(run())
 
 

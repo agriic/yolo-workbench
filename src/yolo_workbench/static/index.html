@@ -21,6 +21,7 @@
     <nav aria-label="Workspace">
       <button class="tab active" data-tab="annotation">Annotation</button>
       <button class="tab" data-tab="exploration">Exploration</button>
+      <button class="tab" data-tab="statistics">Statistics</button>
       <button class="tab" data-tab="embeddings">Embeddings</button>
       <button class="tab" data-tab="validation">Validation <span id="issue-count" class="badge"></span></button>
     </nav>
@@ -77,6 +78,26 @@
       </div>
       <div id="object-grid" class="grid object-grid"></div>
       <button id="load-more-objects" class="secondary load-more" hidden>Load more</button>
+    </section>
+
+    <section id="statistics" class="view">
+      <div class="section-title">
+        <div><h1>Dataset statistics</h1><p class="section-subtitle">Label balance, geometry, split consistency, and review candidates.</p></div>
+        <button id="refresh-statistics" class="secondary">Refresh</button>
+      </div>
+      <div id="statistics-loading" class="stats-loading">Loading statistics…</div>
+      <div id="statistics-content" hidden>
+        <div id="stats-kpis" class="stats-kpis"></div>
+        <div class="stats-grid">
+          <article class="stats-panel stats-wide"><h2>Class balance</h2><p class="panel-note">Annotations and images containing each class</p><div id="stats-class-balance"></div></article>
+          <article class="stats-panel"><h2>Annotations per image</h2><div id="stats-density"></div></article>
+          <article class="stats-panel"><h2>Box size</h2><p class="panel-note">Normalized bounding area</p><div id="stats-box-size"></div></article>
+          <article class="stats-panel"><h2>Aspect ratio</h2><p class="panel-note">Width ÷ height</p><div id="stats-aspect"></div></article>
+          <article class="stats-panel stats-wide"><h2>Split comparison</h2><div id="stats-splits" class="table-scroll"></div></article>
+          <article class="stats-panel stats-wide"><h2>Class co-occurrence</h2><p class="panel-note">Images containing both classes; the diagonal is images containing that class</p><div id="stats-cooccurrence" class="cooccurrence-wrap"></div></article>
+          <article class="stats-panel stats-wide"><h2>Likely outliers <span id="stats-outlier-count" class="muted"></span></h2><p class="panel-note">Conservative IQR-based candidates for review, not validation failures</p><div id="stats-outliers" class="stats-outliers"></div></article>
+        </div>
+      </div>
     </section>
 
     <section id="embeddings" class="view">

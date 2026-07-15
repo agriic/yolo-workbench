@@ -43,6 +43,54 @@ def test_annotation_indexes_and_cached_aggregates_refresh_after_write(tmp_path):
     assert dataset.metadata()["issue_count"] == 0
 
 
+def test_statistics_cover_balance_geometry_splits_cooccurrence_and_refresh(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    record = next(iter(dataset.images.values()))
+
+    stats = dataset.statistics()
+
+    assert stats["summary"] == {
+        "images": 1,
+        "annotated_images": 1,
+        "unlabeled_images": 0,
+        "annotations": 1,
+        "average_annotations": 1.0,
+    }
+    assert next(item for item in stats["class_balance"] if item["class_id"] == 1)["annotations"] == 1
+    assert stats["annotations_per_image"]["median"] == 1
+    assert stats["box_size"]["median"] == pytest.approx(0.08)
+    assert stats["aspect_ratio"]["median"] == pytest.approx(0.5)
+    assert stats["split_comparison"][0]["class_annotations"]["1"] == 1
+    assert stats["cooccurrence"]["matrix"] == [[0, 0], [0, 1]]
+    assert dataset.statistics() is stats
+
+    dataset.replace_annotations(record.id, [
+        {"class_id": 0, "points": [0.4, 0.4, 0.1, 0.1]},
+        {"class_id": 1, "points": [0.6, 0.6, 0.2, 0.2]},
+    ])
+    refreshed = dataset.statistics()
+
+    assert refreshed is not stats
+    assert refreshed["summary"]["annotations"] == 2
+    assert refreshed["cooccurrence"]["matrix"] == [[1, 1], [1, 1]]
+    assert refreshed["source_generation"] == 1
+
+
+def test_statistics_flag_clear_geometry_outlier(tmp_path):
+    split = tmp_path / "train"
+    split.mkdir()
+    for index in range(9):
+        Image.new("RGB", (40, 40), "white").save(split / f"{index}.jpg")
+        size = 0.9 if index == 8 else 0.1
+        (split / f"{index}.txt").write_text(f"0 0.5 0.5 {size} {size}\n")
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text(yaml.safe_dump({"path": ".", "train": "train", "names": ["object"]}))
+
+    outliers = Dataset(yaml_path, "detection").statistics()["outliers"]
+
+    assert any(item["image_name"] == "8.jpg" and item["kind"] == "box_size" for item in outliers)
+
+
 def test_writes_backup_and_supports_history(tmp_path):
     dataset, label = make_dataset(tmp_path)
     record = next(iter(dataset.images.values()))

@@ -122,6 +122,10 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     def metadata():
         return dataset.metadata()
 
+    @app.get("/api/v1/statistics")
+    def statistics():
+        return dataset.statistics()
+
     @app.get("/api/v1/images")
     def images(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, offset: int = 0, limit: int = Query(100, ge=1, le=500)):
         prediction_ids = predictor.pending_image_ids() if has_predictions else None
