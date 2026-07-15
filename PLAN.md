@@ -1,45 +1,26 @@
-# YOLO Dataset Workbench
+Easy wins (hours, not days)
 
-## Goal
+1. Fix --model ONNX discovery mismatch — cli.py:24 documents .pt/.onnx, but MODEL_EXTENSIONS = {".pt"} in predictor.py:18, so ONNX models never show in the discovery dropdown. One-line fix.
+2. Stop recomputing metadata on every poll — GET /api/v1/dataset recomputes split_counts and runs the full issues() aggregation on every call (web.py:111-114), and the indexing UI polls it every second. Cache and invalidate on write.
+3. Cap the undo stack and fix session-id collisions — the undo stack is unbounded in memory (dataset.py:47), and session_id is second-resolution, so two launches in the same second share a backup dir (dataset.py:49).
+4. Predictor batch resilience — one failing image aborts the whole batch and leaves job.state="error" with partial results (predictor.py:289-293). Skip-and-report-per-image is a small change with real UX payoff.
+5. Small hygiene — dedupe the except KeyError → 404 boilerplate across ~9 endpoints, use JSONResponse instead of hand-built JSON strings (web.py:103-107), and factor the annotation-copy idiom repeated at dataset.py:367,400,423.
 
-Build a local, single-user web application for creating, inspecting, correcting, and validating YOLO detection and segmentation annotations. The application is launched with a dataset YAML path and category, binds to localhost, and writes annotation changes directly to the dataset using atomic files, backups, and undo/redo.
+Medium effort, high payoff
 
-## Technology
+6. Per-class object index — GET /api/v1/objects iterates every image and annotation on every request (web.py:155); this was explicitly deferred in PLAN2.md. A class_id → [(record, annotation)] index maintained on write would make the Exploration tab scale.
+7. Reduce refetch storm after each save — every edit triggers loadImages, loadObjects, and loadIssues, each a full server scan (app.js:857-859). Return updated state from the PUT, or refresh only the affected image.
+8. Move blocking work off the event loop — predict_image and Pillow thumbnail rendering run synchronously inside async def handlers (predictor.py:312, web.py:279), freezing the server during inference. Wrap in run_in_executor.
+9. Server-side "has predictions" filter — the current filter is client-side over the fetched page, so counts and pagination are wrong when active (app.js:367-370).
+10. Single source of truth for the palette — it's duplicated in web.py:20 and app.js:15 with a manual sync rule in CLAUDE.md. Serve it from an endpoint (or generate palette.js from Python) and delete the hazard.
+11. Frontend tests — the entire 1,710-line app.js (all canvas editing, predictor UI, embeddings scatter) has zero tests; PLAN.md already reserved Playwright for this. Even a smoke suite (load, draw box, save, undo) would protect the riskiest code.
 
-- Python 3.12, FastAPI, Uvicorn, PyYAML, Pillow, Typer, and Pydantic.
-- Browser UI using semantic HTML, modular CSS, and native JavaScript canvas APIs. The UI ships inside the Python package and requires no Node.js runtime.
-- Pytest and HTTPX for backend tests; Playwright is reserved for browser acceptance tests.
-- `uv` for local environments, dependency locking, and packaging.
+Larger investments
 
-## Features
+12. Split app.js into ES modules — one file with a single global state object holds annotation canvas, predictor, embeddings 3D renderer, and grid logic. Splitting into state / canvas / predictor / embeddings / api modules (still no build step needed with native ES modules) is the enabler for most future frontend work.
+13. New feature: dataset statistics tab — class balance histograms, box size/aspect distributions, images-per-split, annotation density. Cheap to compute from data you already index, and very useful for dataset quality work.
+14. New feature: split management — move images between train/val/test, or auto-split with stratification. Natural fit since all writes already go through the _commit backup/undo machinery.
+15. New feature: export/import — export the cleaned dataset (or a filtered subset) as a new YOLO dataset, or convert to/from COCO. Turns the tool from a validator into a pipeline step.
+16. Test the untested seams — cli.py, the embeddings compute_gt_viz path, undo/redo conflict handling, and the predictor batch-error path all have no coverage.
 
-- Resolve YOLO YAML paths, class names, train/val/test splits, list files, colocated labels, and parallel `images`/`labels` layouts.
-- Annotation tab with image grid, split/class/search filters, canvas box or polygon creation and editing, relabeling, deletion, zoom/pan, and history.
-- Exploration tab with class-filtered object crops, split filters, direct relabel/delete actions, and source-image navigation.
-- Validation dashboard for malformed labels, invalid class IDs and geometry, duplicate annotations, missing labels, orphan labels, and unreadable images.
-- Atomic label writes, per-session original backups, modification conflict detection, and session undo/redo.
-- Thumbnail and crop caches outside the dataset.
-
-## Interfaces
-
-```text
-yolo-workbench DATASET_YAML --category detection|segmentation
-  [--host HOST] [--port PORT] [--no-browser]
-```
-
-The local service exposes versioned JSON endpoints under `/api/v1` and streams images, thumbnails, and crops through dedicated media endpoints.
-
-## Acceptance
-
-- Both category modes can create, reshape, relabel, and delete annotations.
-- Saved edits survive reload and affect only the intended label file.
-- Undo/redo restores exact file content and original backups remain available.
-- Exploration changes update annotation state and crop results immediately.
-- Invalid data is reported without preventing valid images from being edited.
-- The pebble detection dataset resolves all train images and labels without modifying them during tests.
-
-## Boundaries
-
-- One category applies to a launched dataset; mixed annotation formats are unsupported.
-- Dataset YAML, image pixels, class definitions, model-assisted labeling, training, and collaborative editing are outside v1.
-- The server is intended for trusted localhost use and has no authentication.
+If I had to pick, the highest value-per-effort cluster is 6 + 7 + 2 (the scan-per-request performance issues, which compound on large datasets), followed by 10 (palette dedup) as a quick maintainability win.
