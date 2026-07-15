@@ -18,6 +18,36 @@ def ultralytics_available() -> bool:
 MODEL_EXTENSIONS = {".pt"}
 SCAN_DEPTH = 4
 SCAN_LIMIT = 50
+DEDUP_IOU = 0.6  # predictions matching an existing same-class annotation at or above this IoU are dropped
+
+
+def _bbox(category: str, points: list[float]) -> tuple[float, float, float, float]:
+    if category == "segmentation":
+        xs, ys = points[0::2], points[1::2]
+        return min(xs), min(ys), max(xs), max(ys)
+    cx, cy, w, h = points
+    return cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+
+
+def _bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    width = min(a[2], b[2]) - max(a[0], b[0])
+    height = min(a[3], b[3]) - max(a[1], b[1])
+    if width <= 0 or height <= 0:
+        return 0.0
+    intersection = width * height
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _matches_existing(category: str, class_id: int | None, points: list[float], annotations) -> bool:
+    """True when an existing annotation has the same class and overlaps at IoU >= DEDUP_IOU."""
+    if class_id is None:
+        return False
+    box = _bbox(category, points)
+    return any(
+        annotation.class_id == class_id and _bbox_iou(box, _bbox(category, annotation.points)) >= DEDUP_IOU
+        for annotation in annotations
+    )
 
 
 def _clamp(value: float) -> float:
@@ -262,7 +292,7 @@ class PredictorManager:
                     self.job["error"] = f"{record.path.name}: {exc}"
                 return
             with self._lock:
-                self.predictions[record.id] = [self._prediction(record, item) for item in raw]
+                self.predictions[record.id] = self._filter_new(record, [self._prediction(record, item) for item in raw])
                 self.job["done"] += 1
         with self._lock:
             self.job["state"] = "done"
@@ -292,8 +322,16 @@ class PredictorManager:
         except Exception as exc:
             raise DatasetError(f"Prediction failed: {exc}") from exc
         with self._lock:
-            self.predictions[record.id] = [self._prediction(record, item) for item in raw]
+            self.predictions[record.id] = self._filter_new(record, [self._prediction(record, item) for item in raw])
         return self.predictions_for(record.id)
+
+    def _filter_new(self, record: ImageRecord, items: list[dict]) -> list[dict]:
+        """Drop predictions that duplicate an existing annotation (same class, overlapping geometry)."""
+        return [
+            item
+            for item in items
+            if not _matches_existing(self.dataset.category, item["class_id"], item["points"], record.annotations)
+        ]
 
     def predictions_for(self, image_id: str) -> dict:
         record = self.dataset.require_image(image_id)
@@ -325,6 +363,8 @@ class PredictorManager:
                 chosen = [item for item in chosen if item["class_id"] is not None]
             elif any(item["class_id"] is None for item in chosen):
                 raise DatasetError("Cannot accept predictions with unmapped classes; adjust the class mapping first")
+            # annotations may have changed since prediction time; never write a duplicate
+            chosen = self._filter_new(record, chosen)
             if not chosen:
                 raise DatasetError("No predictions to accept")
             annotations = [annotation.as_dict() for annotation in record.annotations]

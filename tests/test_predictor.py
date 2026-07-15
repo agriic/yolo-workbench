@@ -22,7 +22,8 @@ class FakeBackend:
 
     def predict(self, image_path):
         self.calls.append(image_path)
-        points = [0.5, 0.5, 0.2, 0.2] if self.category == "detection" else [0.1, 0.1, 0.9, 0.1, 0.5, 0.9]
+        # placed away from the sample's existing annotation so dedup filtering doesn't drop them
+        points = [0.85, 0.85, 0.2, 0.2] if self.category == "detection" else [0.05, 0.05, 0.15, 0.05, 0.1, 0.15]
         return [
             {"class_id": 0, "confidence": 0.9, "points": points},
             {"class_id": 2, "confidence": 0.4, "points": points},
@@ -91,7 +92,7 @@ def test_accept_merges_through_replace_annotations(tmp_path):
     result = manager.accept(record.id)  # accept-all skips the unmapped prediction
     assert result["accepted"] == 1
     assert len(record.annotations) == 2
-    assert "1 0.5 0.5 0.2 0.2" in label.read_text()
+    assert "1 0.85 0.85 0.2 0.2" in label.read_text()
     assert len(manager.predictions_for(record.id)["items"]) == 1  # unmapped stays pending
     dataset.history("undo")
     assert "0.2 0.2" not in label.read_text()
@@ -155,6 +156,76 @@ def test_segmentation_predictions_accept(tmp_path):
     wait_job(manager)
     manager.accept(record.id)
     assert len(record.annotations) == 2
+
+
+def overlapping_backend(points, model_class_id=0):
+    """Backend emitting one prediction with the given geometry (model class 0 maps to dataset class 1)."""
+
+    class Backend(FakeBackend):
+        def predict(self, image_path):
+            return [{"class_id": model_class_id, "confidence": 0.9, "points": points}]
+
+    return Backend
+
+
+def test_prediction_matching_existing_annotation_is_filtered(tmp_path):
+    # the sample image already has class 1 at [0.5, 0.5, 0.2, 0.4]; model class 0 maps to dataset class 1
+    dataset, _ = make_dataset(tmp_path)
+    manager = PredictorManager(dataset, backend_factory=overlapping_backend([0.5, 0.5, 0.2, 0.4]))
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    record = next(iter(dataset.images.values()))
+    assert manager.predict_image(record.id)["items"] == []
+    manager.run(image_ids=[record.id])
+    wait_job(manager)
+    assert manager.predictions_for(record.id)["items"] == []
+
+
+def test_overlapping_prediction_with_different_class_is_kept(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    # model class 1 maps to dataset class 0, which differs from the existing annotation's class 1
+    manager = PredictorManager(dataset, backend_factory=overlapping_backend([0.5, 0.5, 0.2, 0.4], model_class_id=1))
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    record = next(iter(dataset.images.values()))
+    assert len(manager.predict_image(record.id)["items"]) == 1
+
+
+def test_non_overlapping_same_class_prediction_is_kept(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    manager = PredictorManager(dataset, backend_factory=overlapping_backend([0.85, 0.85, 0.1, 0.1]))
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    record = next(iter(dataset.images.values()))
+    assert len(manager.predict_image(record.id)["items"]) == 1
+
+
+def test_accept_recheck_drops_predictions_duplicated_meanwhile(tmp_path):
+    dataset, label, manager, model = make_predictor(tmp_path)
+    manager.load(str(model))
+    record = next(iter(dataset.images.values()))
+    manager.predict_image(record.id)
+    # the user manually draws the same box the model predicted before accepting
+    annotations = [annotation.as_dict() for annotation in record.annotations]
+    annotations.append({"class_id": 1, "points": [0.85, 0.85, 0.2, 0.2]})
+    dataset.replace_annotations(record.id, annotations)
+    with pytest.raises(DatasetError):
+        manager.accept(record.id)  # only the now-duplicate mapped prediction was acceptable
+    assert label.read_text().count("0.85") == 2  # no duplicate row written
+
+
+def test_segmentation_prediction_matching_existing_polygon_is_filtered(tmp_path):
+    dataset, _ = make_dataset(tmp_path, "segmentation")
+    # same polygon as the existing class-1 annotation
+    manager = PredictorManager(dataset, backend_factory=overlapping_backend([0.2, 0.2, 0.8, 0.2, 0.5, 0.8]))
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    record = next(iter(dataset.images.values()))
+    assert manager.predict_image(record.id)["items"] == []
 
 
 def test_predict_single_image_synchronously(tmp_path):
