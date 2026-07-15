@@ -173,6 +173,7 @@ main { padding: 18px 22px 48px; }
 
 /* ---------- cards ---------- */
 .grid { display: grid; gap: 14px; }
+.load-more { display: block; margin: 16px auto 4px; }
 .image-grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
 .object-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
 .card {

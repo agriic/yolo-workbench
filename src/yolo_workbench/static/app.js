@@ -122,7 +122,9 @@ function bind() {
   });
   [$("image-split"), $("image-class"), $("show-overlays"), $("filter-predictions")].forEach(el => el.onchange = loadImages);
   $("image-search").oninput = debounce(loadImages, 250);
+  $("load-more-images").onclick = () => loadImages(true);
   [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects(); });
+  $("load-more-objects").onclick = () => loadObjects(true);
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
   $("bulk-delete").onclick = () => {
     if (confirm(`Delete ${state.objectSelection.size} annotation${state.objectSelection.size === 1 ? "" : "s"}?`)) runObjectBulk("delete");
@@ -354,18 +356,22 @@ function keyDown(e) {
 
 /* ---------- annotation grid ---------- */
 
-async function loadImages() {
-  const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value, limit: "500" });
+async function loadImages(append) {
+  const offset = append === true ? state.gridOffset : 0;
+  const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value, limit: "500", offset: String(offset) });
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   const data = await api(`/api/v1/images?${params}`);
-  if ($("filter-predictions").checked) {
-    data.items = data.items.filter(item => state.pred.pending[item.id]);
-    data.total = data.items.length;
-  }
-  state.gridImages = data.items;
-  $("image-total").textContent = `${data.items.length < data.total ? `${data.items.length} of ` : ""}${data.total} images`;
+  state.gridOffset = offset + data.items.length;
+  state.gridTotal = data.total;
+  let items = data.items;
+  if ($("filter-predictions").checked) items = items.filter(item => state.pred.pending[item.id]);
+  state.gridImages = append === true ? state.gridImages.concat(items) : items;
+  const remaining = state.gridTotal - state.gridOffset;
+  $("image-total").textContent = `${remaining > 0 ? `${state.gridImages.length} of ` : ""}${$("filter-predictions").checked && remaining <= 0 ? state.gridImages.length : state.gridTotal} images`;
+  $("load-more-images").hidden = remaining <= 0;
+  $("load-more-images").textContent = `Load ${Math.min(remaining, 500)} more`;
   const overlay = $("show-overlays").checked ? "&annotated=1" : "";
-  $("image-grid").innerHTML = data.items.map(item => {
+  const html = items.map(item => {
     const chips = item.classes.slice(0, 3).map(id =>
       `<span class="chip" style="--c:${classColor(id)}">${esc(state.meta.names[id] ?? `class ${id}`)}</span>`).join("");
     const more = item.classes.length > 3 ? `<span class="chip">+${item.classes.length - 3}</span>` : "";
@@ -379,7 +385,9 @@ async function loadImages() {
         <div class="chips">${chips}${more}</div>
       </div>
     </article>`;
-  }).join("") || `<p class="empty">No images match the current filters.</p>`;
+  }).join("");
+  if (append === true) $("image-grid").insertAdjacentHTML("beforeend", html);
+  else $("image-grid").innerHTML = html || `<p class="empty">No images match the current filters.</p>`;
   updateNavButtons();
 }
 
@@ -1150,22 +1158,26 @@ async function rejectPredictions(predictionIds) {
 
 const reloadObjectsDebounced = debounce(loadObjects, 300);
 
-async function loadObjects() {
+async function loadObjects(append) {
   if (!state.meta) return;
+  const offset = append === true ? state.gridObjects.length : 0;
   const classId = $("object-class").value || Object.keys(state.meta.names)[0];
-  const params = new URLSearchParams({ class_id: classId, split: $("object-split").value, limit: "500" });
+  const params = new URLSearchParams({ class_id: classId, split: $("object-split").value, limit: "500", offset: String(offset) });
   const data = await api(`/api/v1/objects?${params}`);
-  state.gridObjects = data.items;
-  const valid = new Set(data.items.map(objectKey));
+  state.gridObjects = append === true ? state.gridObjects.concat(data.items) : data.items;
+  const valid = new Set(state.gridObjects.map(objectKey));
   for (const key of [...state.objectSelection.keys()]) if (!valid.has(key)) state.objectSelection.delete(key);
   renderObjectBulkBar();
-  $("object-total").textContent = `${data.items.length < data.total ? `${data.items.length} of ` : ""}${data.total} objects`;
+  const remaining = data.total - state.gridObjects.length;
+  $("object-total").textContent = `${remaining > 0 ? `${state.gridObjects.length} of ` : ""}${data.total} objects`;
+  $("load-more-objects").hidden = remaining <= 0;
+  $("load-more-objects").textContent = `Load ${Math.min(remaining, 500)} more`;
   const padding = $("crop-padding").value;
-  $("object-grid").innerHTML = data.items.map((item, index) => `
+  const html = data.items.map((item, index) => `
     <article class="card object-card">
       <div class="thumb">
         <img loading="lazy" src="/api/v1/objects/${item.image_id}/${encodeURIComponent(item.id)}/crop?padding=${padding}" alt="">
-        <input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for range)" ${state.objectSelection.has(objectKey(item)) ? "checked" : ""}>
+        <input type="checkbox" class="card-check" data-index="${offset + index}" title="Select (Shift-click for range)" ${state.objectSelection.has(objectKey(item)) ? "checked" : ""}>
         <span class="class-tag" style="background:${classColor(item.class_id)}">${esc(state.meta.names[item.class_id] ?? `class ${item.class_id}`)}</span>
       </div>
       <div class="card-body">
@@ -1177,7 +1189,9 @@ async function loadObjects() {
           <button data-delete-object="${esc(item.id)}" data-owner="${item.image_id}" title="Delete annotation">×</button>
         </div>
       </div>
-    </article>`).join("") || `<p class="empty">No objects of this class in the selected split.</p>`;
+    </article>`).join("");
+  if (append === true) $("object-grid").insertAdjacentHTML("beforeend", html);
+  else $("object-grid").innerHTML = html || `<p class="empty">No objects of this class in the selected split.</p>`;
 }
 
 const objectKey = item => `${item.image_id}|${item.id}`;
