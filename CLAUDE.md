@@ -15,7 +15,7 @@ The embeddings feature additionally requires a local MongoDB for FiftyOne (see R
 
 ## Architecture
 
-Local, single-user FastAPI app for annotating and validating YOLO datasets. Python backend in `src/yolo_workbench/`, vanilla-JS frontend served from `src/yolo_workbench/static/` (no Node.js; `app.js` is a single ~1300-line file holding all UI state, canvas editing, and API calls).
+Local, single-user FastAPI app for annotating and validating YOLO datasets. Python backend in `src/yolo_workbench/`, vanilla-JS frontend served from `src/yolo_workbench/static/` with native ES modules and no Node.js/build step. `app.js` orchestrates the UI; shared state and API helpers live in `state.js`/`api.js`, virtualized galleries in `grid.js`, and the annotation editor, model-assisted labeling, and embedding renderer in `canvas.js`, `predictor.js`, and `embeddings.js`.
 
 - `cli.py` — Typer entrypoint: loads a `Dataset`, starts uvicorn on localhost, opens the browser.
 - `dataset.py` — the core. `Dataset` resolves the YOLO YAML (dirs, `.txt` file lists, colocated or parallel `images/`→`labels/` layouts), indexes every image with a stable sha1-based `record_id`, parses labels, and collects validation issues (malformed lines, unknown classes, out-of-range/zero-area/duplicate annotations, missing/orphan labels — some marked `fixable` and auto-repairable via `fix_issue`). All writes go through `_commit`: mtime-based conflict detection (`WriteConflict` → HTTP 409), one-time per-session backup under `<dataset>/.yolo-workbench/backups/<session-id>/`, atomic write (temp file + fsync + rename), and an undo/redo stack of transactions (each a list of before/after label-file contents, so bulk operations undo as one unit). Bulk operations (`fix_issues_bulk`, `bulk_edit_objects`) check all mtimes before writing any file — a conflict aborts the whole batch. Image dimensions are probed separately from label parsing: cached in `<dataset>/.yolo-workbench/index.json` (keyed by mtime_ns+size) and re-probed via a thread pool — in a background thread when `background_probe=True` (the CLI default), with progress in `Dataset.indexing` / the `indexing` field of `GET /api/v1/dataset`.
@@ -27,7 +27,7 @@ Local, single-user FastAPI app for annotating and validating YOLO datasets. Pyth
 
 The category (`detection` = 4 points cx/cy/w/h, `segmentation` = polygon, ≥6 even-count points) is fixed at launch and branches validation, rendering, and geometry throughout backend and frontend. All coordinates are normalized 0..1.
 
-The class-color `PALETTE` is duplicated in `web.py` and `static/app.js` — keep them in sync.
+The class-color `PALETTE` is duplicated in `web.py` and `static/api.js` — keep them in sync.
 
 ## Tests
 

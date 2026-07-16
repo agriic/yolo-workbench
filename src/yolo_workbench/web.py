@@ -19,7 +19,7 @@ from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 from .predictor import PredictorManager
 
-# Keep in sync with PALETTE in static/app.js so server-rendered overlays match the editor.
+# Keep in sync with PALETTE in static/api.js so server-rendered overlays match the editor.
 PALETTE = ("#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4", "#84cc16", "#a855f7", "#64748b")
 
 

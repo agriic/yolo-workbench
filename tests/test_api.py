@@ -13,6 +13,26 @@ def make_app(dataset, tmp_path):
     return create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"))
 
 
+def test_frontend_es_modules_are_served(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=make_app(dataset, tmp_path)), base_url="http://test") as client:
+            index = await client.get("/")
+            assert '<script type="module" src="/app.js"></script>' in index.text
+
+            app_script = await client.get("/app.js")
+            assert app_script.status_code == 200
+            assert 'from "./state.js"' in app_script.text
+
+            for name in ("api.js", "state.js", "grid.js", "canvas.js", "predictor.js", "embeddings.js"):
+                module = await client.get(f"/{name}")
+                assert module.status_code == 200
+                assert module.headers["cache-control"] == "no-cache"
+
+    asyncio.run(run())
+
+
 def test_metadata_images_and_edit_api(tmp_path):
     dataset, label = make_dataset(tmp_path)
     async def run():

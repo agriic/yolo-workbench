@@ -14,9 +14,8 @@
 
 ## Larger investments
 
-7. Split `app.js` into ES modules — one global state object holds the annotation canvas, predictor, embeddings renderer, and grid logic. Native state/canvas/predictor/embeddings/API modules would improve isolation without requiring a build step.
-8. New feature: split management — move images between train/val/test, or auto-split with stratification through the existing transactional write path.
-9. New feature: export/import — export the cleaned dataset or a filtered subset as YOLO, and convert to/from COCO.
-10. Test the remaining seams — `cli.py`, the FiftyOne-backed `compute_gt_viz` path, and undo/redo conflict handling still lack coverage.
+7. New feature: split management — move images between train/val/test, or auto-split with stratification through the existing transactional write path.
+8. New feature: export/import — export the cleaned dataset or a filtered subset as YOLO, and convert to/from COCO.
+9. Test the remaining seams — `cli.py`, the FiftyOne-backed `compute_gt_viz` path, and undo/redo conflict handling still lack coverage.
 
-If I had to pick next, start with 1 + 2 + 3 for contained correctness and maintenance wins, then tackle 5 while splitting the frontend under 7.
+If I had to pick next, start with 1 + 2 + 3 for contained correctness and maintenance wins, then tackle 5.
