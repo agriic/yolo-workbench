@@ -1,10 +1,3 @@
-# Remaining priorities
-
-## Highest-priority code improvements
-
-1. Split and test the frontend. Move the global-state app into native modules for API/state, grid, editor, predictor, and embeddings; add Playwright coverage for rapid navigation, serialized saves, save conflicts, undo/redo, and prediction review.
-2. Fix dependency and documentation boundaries. Define base, `predict`, `embeddings`, and `test` extras, then align the README and ONNX model-discovery behavior with those packages.
-3. Protect network-exposed mode. Binding beyond loopback should require an explicit unsafe flag or token authentication because the API can edit labels and load model files.
 
 ## Best feature opportunities
 
