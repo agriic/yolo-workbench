@@ -317,6 +317,8 @@ def render_thumbnail(record: ImageRecord, size: int, category: str | None = None
 
 
 def draw_annotation(draw: ImageDraw.ImageDraw, annotation: Annotation, category: str, width: int, height: int) -> None:
+    if category == "classification":
+        return  # the class covers the whole image; there is no geometry to draw
     color = class_color(annotation.class_id)
     if category == "detection":
         cx, cy, box_width, box_height = annotation.points
@@ -331,6 +333,11 @@ def draw_annotation(draw: ImageDraw.ImageDraw, annotation: Annotation, category:
 def render_crop(record, annotation, category: str, padding: float) -> bytes:
     with Image.open(record.path) as source:
         image = source.convert("RGB")
+        if category == "classification":
+            image.thumbnail((420, 320))
+            output = io.BytesIO()
+            image.save(output, "JPEG", quality=88)
+            return output.getvalue()
         if category == "detection":
             cx, cy, width, height = annotation.points
             left, top, right, bottom = cx - width / 2, cy - height / 2, cx + width / 2, cy + height / 2

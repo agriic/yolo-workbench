@@ -40,6 +40,7 @@ export function classOptions(selectedId) {
 
 async function init() {
   state.meta = await api("/api/v1/dataset");
+  document.body.classList.toggle("classification", state.meta.category === "classification");
   const yamlName = state.meta.yaml.split("/").slice(-2).join("/");
   $("dataset-name").textContent = `${yamlName} · ${state.meta.category}`;
   $("dataset-name").title = state.meta.yaml;
@@ -72,6 +73,18 @@ function watchIndexing() {
 }
 
 function renderShortcuts() {
+  if (state.meta.category === "classification") {
+    $("shortcut-list").innerHTML = [
+      ["1–9", "Set the image class"],
+      ["Scroll", "Zoom at cursor"],
+      ["Drag", "Pan the image"],
+      ["Ctrl+Z / Ctrl+⇧+Z", "Undo / redo"],
+      ["← →", "Previous / next image"],
+      ["F", "Fit image"],
+      ["Esc", "Close"],
+    ].map(([key, hint]) => `<dt><kbd>${key}</kbd></dt><dd>${hint}</dd>`).join("");
+    return;
+  }
   const detection = state.meta.category === "detection";
   const rows = [
     [detection ? "Drag" : "Click", detection ? "Draw a box" : "Add polygon points"],
@@ -333,6 +346,11 @@ function keyDown(e) {
   if (key >= "1" && key <= "9") {
     const classId = Object.keys(state.meta.names)[+key - 1];
     if (classId === undefined) return;
+    if (state.meta.category === "classification") {
+      const annotation = state.detail?.annotations[0];
+      if (annotation && annotation.class_id !== +classId) { annotation.class_id = +classId; save(); }
+      return;
+    }
     if (state.selected && state.detail) {
       const annotation = state.detail.annotations.find(a => a.id === state.selected);
       if (annotation && annotation.class_id !== +classId) { annotation.class_id = +classId; save(); }

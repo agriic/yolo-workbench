@@ -1,4 +1,5 @@
-"""FiftyOne (Voxel51) embeddings for ground-truth object patches (brain key "gt_viz")."""
+"""FiftyOne (Voxel51) embeddings, brain key "gt_viz": ground-truth object patches for
+detection/segmentation, whole images for classification."""
 
 from __future__ import annotations
 
@@ -87,6 +88,25 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
         fo.delete_dataset(name)
     ds = fo.Dataset(name)
     try:
+        if dataset.category == "classification":
+            # whole-image embeddings: the class covers the entire image, so there are no patches
+            samples = []
+            for record in dataset.images.values():
+                annotation = record.annotations[0]
+                sample = fo.Sample(filepath=str(record.path), ground_truth=fo.Classification(label=dataset.names.get(annotation.class_id, str(annotation.class_id))))
+                sample["workbench"] = "\x1f".join([record.id, annotation.id, str(annotation.class_id), record.split, record.path.name])
+                samples.append(sample)
+            if not samples:
+                raise RuntimeError("The dataset has no images to embed")
+            ds.add_samples(samples, progress=False)
+            sample_ids = ds.values("id")
+            meta = dict(zip(sample_ids, ds.values("workbench")))
+            num_dims = min(3, len(sample_ids))
+            method = "umap" if len(sample_ids) > num_dims + 1 and importlib.util.find_spec("umap") else "pca"
+            results = fob.compute_visualization(ds, brain_key="gt_viz", method=method, num_dims=num_dims, progress=False)
+            result_ids = getattr(results, "sample_ids", None)
+            result_ids = list(result_ids) if result_ids is not None and len(result_ids) else list(sample_ids)
+            return _build_items(meta, result_ids, _normalize_3d_points(results.points))
         samples = []
         for record in dataset.images.values():
             detections = []
@@ -127,27 +147,29 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
 
         result_ids = getattr(results, "label_ids", None)
         result_ids = list(result_ids) if result_ids is not None and len(result_ids) else list(label_ids)
-        points = _normalize_3d_points(results.points)
-
-        items = []
-        for label_id, (x, y, z) in zip(result_ids, points):
-            raw = meta.get(label_id)
-            if not raw:
-                continue
-            image_id, annotation_id, class_id, split, image_name = raw.split("\x1f")
-            items.append({
-                "x": x,
-                "y": y,
-                "z": z,
-                "image_id": image_id,
-                "annotation_id": annotation_id,
-                "class_id": int(class_id),
-                "split": split,
-                "image_name": image_name,
-            })
-        return items
+        return _build_items(meta, result_ids, _normalize_3d_points(results.points))
     finally:
         fo.delete_dataset(name)
+
+
+def _build_items(meta: dict, result_ids: list, points: list[tuple[float, float, float]]) -> list[dict]:
+    items = []
+    for result_id, (x, y, z) in zip(result_ids, points):
+        raw = meta.get(result_id)
+        if not raw:
+            continue
+        image_id, annotation_id, class_id, split, image_name = raw.split("\x1f")
+        items.append({
+            "x": x,
+            "y": y,
+            "z": z,
+            "image_id": image_id,
+            "annotation_id": annotation_id,
+            "class_id": int(class_id),
+            "split": split,
+            "image_name": image_name,
+        })
+    return items
 
 
 def _normalize_3d_points(points) -> list[tuple[float, float, float]]:

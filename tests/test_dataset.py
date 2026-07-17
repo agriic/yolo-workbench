@@ -207,3 +207,75 @@ def test_reports_nested_orphan_labels_recursively(tmp_path):
 
     assert dataset.orphan_labels == [orphan.resolve()]
     assert any(issue["kind"] == "orphan_label" and issue["image_name"] == "orphan.txt" for issue in dataset.issues())
+
+
+def make_classification_dataset(tmp_path: Path) -> Dataset:
+    for split in ("train", "val"):
+        for class_name in ("cat", "dog"):
+            directory = tmp_path / split / class_name
+            directory.mkdir(parents=True)
+            Image.new("RGB", (32, 24), "white").save(directory / f"{split}_{class_name}.png")
+    return Dataset(tmp_path, "classification")
+
+
+def test_classification_dataset_loads_classes_from_directories(tmp_path):
+    dataset = make_classification_dataset(tmp_path)
+    assert dataset.names == {0: "cat", 1: "dog"}
+    assert len(dataset.images) == 4
+    record = next(r for r in dataset.images.values() if r.path.name == "train_dog.png")
+    assert [a.class_id for a in record.annotations] == [1]
+    assert record.annotations[0].points == []
+    assert not record.issues
+    assert dataset.list_images(class_id=1)["total"] == 2
+
+
+def test_classification_reassign_moves_file_with_undo_redo(tmp_path):
+    dataset = make_classification_dataset(tmp_path)
+    record = next(r for r in dataset.images.values() if r.path.name == "train_cat.png")
+    detail = dataset.replace_annotations(record.id, [{"class_id": 1, "points": []}])
+    assert record.path == tmp_path / "train" / "dog" / "train_cat.png"
+    assert record.path.exists()
+    assert not (tmp_path / "train" / "cat" / "train_cat.png").exists()
+    assert detail["classes"] == [1]
+    dataset.history("undo")
+    assert record.path == tmp_path / "train" / "cat" / "train_cat.png"
+    assert record.path.exists()
+    assert record.annotations[0].class_id == 0
+    dataset.history("redo")
+    assert record.path == tmp_path / "train" / "dog" / "train_cat.png"
+    assert record.annotations[0].class_id == 1
+
+
+def test_classification_rejects_geometry_and_name_collisions(tmp_path):
+    dataset = make_classification_dataset(tmp_path)
+    record = next(r for r in dataset.images.values() if r.path.name == "train_cat.png")
+    with pytest.raises(DatasetError):
+        dataset.replace_annotations(record.id, [{"class_id": 1, "points": [0.5, 0.5, 0.2, 0.2]}])
+    (tmp_path / "train" / "dog" / "train_cat.png").write_bytes(b"collision")
+    with pytest.raises(DatasetError):
+        dataset.replace_annotations(record.id, [{"class_id": 1, "points": []}])
+    assert record.annotations[0].class_id == 0
+
+
+def test_classification_bulk_relabel_moves_and_delete_is_skipped(tmp_path):
+    dataset = make_classification_dataset(tmp_path)
+    cat = next(r for r in dataset.images.values() if r.path.name == "train_cat.png")
+    dog = next(r for r in dataset.images.values() if r.path.name == "val_dog.png")
+    result = dataset.bulk_edit_objects([
+        {"image_id": cat.id, "annotation_id": cat.annotations[0].id, "action": "relabel", "class_id": 1},
+        {"image_id": dog.id, "annotation_id": dog.annotations[0].id, "action": "delete", "class_id": None},
+    ])
+    assert result["applied"] == 1
+    assert result["skipped"][0]["reason"].startswith("Deleting images is not supported")
+    assert cat.path == tmp_path / "train" / "dog" / "train_cat.png"
+    assert dog.path.exists()
+    dataset.history("undo")
+    assert cat.path == tmp_path / "train" / "cat" / "train_cat.png"
+
+
+def test_classification_detects_external_move_as_conflict(tmp_path):
+    dataset = make_classification_dataset(tmp_path)
+    record = next(r for r in dataset.images.values() if r.path.name == "train_cat.png")
+    record.path.rename(tmp_path / "train" / "dog" / "renamed.png")
+    with pytest.raises(WriteConflict):
+        dataset.replace_annotations(record.id, [{"class_id": 1, "points": []}])

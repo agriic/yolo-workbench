@@ -9,6 +9,7 @@ uv sync                                   # set up environment (uv is the standa
 uv run pytest                             # run all tests
 uv run pytest tests/test_dataset.py -k name_of_test   # run a single test
 uv run yolo-workbench /path/to/dataset.yaml --category detection|segmentation [--no-browser]
+uv run yolo-workbench /path/to/dataset_dir --category classification   # <root>/<split>/<class>/ image folders
 ```
 
 The embeddings feature additionally requires a local MongoDB for FiftyOne (see README.md for the docker command and `~/.fiftyone/config.json`).
@@ -25,7 +26,7 @@ Local, single-user FastAPI app for annotating and validating YOLO datasets. Pyth
 - `embeddings.py` — optional FiftyOne/UMAP 3D patch-embedding visualization, computed in a background thread with status polled via `/api/v1/embeddings`; degrades to `status: "unavailable"` when fiftyone isn't installed.
 - `models.py` — `Annotation` and `ImageRecord` dataclasses.
 
-The category (`detection` = 4 points cx/cy/w/h, `segmentation` = polygon, ≥6 even-count points) is fixed at launch and branches validation, rendering, and geometry throughout backend and frontend. All coordinates are normalized 0..1.
+The category (`detection` = 4 points cx/cy/w/h, `segmentation` = polygon, ≥6 even-count points, `classification` = no points) is fixed at launch and branches validation, rendering, and geometry throughout backend and frontend. All coordinates are normalized 0..1. Classification datasets are directories (`<root>/<split>/<class name>/images`, class ids = sorted class-dir names); there are no label files — the class edit is a file move committed via `_commit_moves` (`MoveEntry` history entries, same undo/redo stack, no backups since moves are non-destructive), and the predictor reports `unavailable`. Embeddings work for classification too: `compute_gt_viz` embeds whole images (`fo.Classification`, no `patches_field`) instead of object patches.
 
 The class-color `PALETTE` is duplicated in `web.py` and `static/api.js` — keep them in sync.
 

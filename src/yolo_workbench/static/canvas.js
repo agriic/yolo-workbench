@@ -141,6 +141,7 @@ export function closeEditorSession() {
 
 export function zoomTo(annotation) {
   if (!state.img) return;
+  if (!annotation.points.length) return fit();
   const [l, t, r, b] = bounds(annotation);
   const width = Math.max((r - l) * state.img.width, 8), height = Math.max((b - t) * state.img.height, 8);
   state.view.scale = clamp(Math.min(cssW / width, cssH / height) * 0.5, 0.02, 12);
@@ -174,10 +175,12 @@ export function render() {
   if (!state.img || !state.detail) { updateStatus(); return; }
   ctx.imageSmoothingEnabled = state.view.scale < 3;
   ctx.drawImage(state.img, state.view.x, state.view.y, state.img.width * state.view.scale, state.img.height * state.view.scale);
-  for (const annotation of state.detail.annotations)
-    if (annotation.id !== state.selected) drawShape(ctx, annotation, false);
-  const selected = selectedAnnotation();
-  if (selected) drawShape(ctx, selected, true);
+  if (state.meta.category !== "classification") {
+    for (const annotation of state.detail.annotations)
+      if (annotation.id !== state.selected) drawShape(ctx, annotation, false);
+    const selected = selectedAnnotation();
+    if (selected) drawShape(ctx, selected, true);
+  }
   deps.drawPredictions(ctx);
   drawPreview(ctx);
   updateStatus();
@@ -295,7 +298,9 @@ export function updateStatus() {
     ? `${state.detail.width}×${state.detail.height}px · ${state.detail.annotations.length} annotation${state.detail.annotations.length === 1 ? "" : "s"}`
     : "";
   let hint;
-  if (state.drawing && state.meta.category === "segmentation")
+  if (state.meta.category === "classification")
+    hint = "Pick the class in the panel or press 1–9 · drag to pan · scroll to zoom";
+  else if (state.drawing && state.meta.category === "segmentation")
     hint = "Click to add points · click the first point or press ⏎ to close · Esc cancels";
   else if (state.drawing) hint = "Release to create the box";
   else if (state.meta.category === "detection") hint = "Drag on empty space to draw a box · scroll to zoom · Space+drag to pan";
@@ -341,6 +346,12 @@ export function pointerDown(e) {
     return;
   }
   if (e.button !== 0) return;
+  if (state.meta.category === "classification") {
+    // no geometry to draw or select; left-drag pans instead
+    state.pan = { sx: e.clientX, sy: e.clientY, ox: state.view.x, oy: state.view.y };
+    $("canvas").style.cursor = "grabbing";
+    return;
+  }
   const { screen, norm } = eventPoint(e);
   const clamped = [clamp(norm[0], 0, 1), clamp(norm[1], 0, 1)];
   if (state.meta.category === "segmentation" && state.drawing) {
@@ -392,7 +403,9 @@ export function pointerMove(e) {
   }
   // hover feedback
   let cursor = "crosshair", hovered = null;
-  if (state.spaceDown) {
+  if (state.meta.category === "classification") {
+    cursor = "grab";
+  } else if (state.spaceDown) {
     cursor = "grab";
   } else {
     const handle = hitHandle(screen);
@@ -484,6 +497,7 @@ export async function removeAnnotation(id) {
 }
 
 export async function deleteSelected() {
+  if (state.meta.category === "classification") return;
   if (state.selected && state.detail) await removeAnnotation(state.selected);
 }
 
@@ -587,6 +601,16 @@ export async function applyHistory(direction) {
 export function renderList() {
   if (!state.detail) return;
   const annotations = state.detail.annotations;
+  if (state.meta.category === "classification") {
+    $("annotation-count").textContent = "";
+    $("annotation-list").innerHTML = annotations.map(a => `
+      <div class="annotation-row" data-annotation="${esc(a.id)}">
+        <span class="swatch" style="background:${classColor(a.class_id)}"></span>
+        <select class="row-class">${deps.classOptions(a.class_id)}</select>
+        <span class="row-meta">whole image</span>
+      </div>`).join("");
+    return;
+  }
   $("annotation-count").textContent = annotations.length || "";
   $("annotation-list").innerHTML = annotations.map(a => `
     <div class="annotation-row ${a.id === state.selected ? "selected" : ""}" data-annotation="${esc(a.id)}" title="Double-click to zoom">

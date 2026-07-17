@@ -16,14 +16,17 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 
 @app.command()
 def main(
-    dataset_yaml: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
-    category: Literal["detection", "segmentation"] = typer.Option(..., "--category", case_sensitive=False),
+    dataset_yaml: Path = typer.Argument(..., exists=True, dir_okay=True, readable=True, help="Dataset YAML, or the dataset root directory for classification"),
+    category: Literal["detection", "segmentation", "classification"] = typer.Option(..., "--category", case_sensitive=False),
     host: str = typer.Option("127.0.0.1", help="Address to bind"),
     port: int = typer.Option(8765, min=1, max=65535),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open a browser automatically"),
     model: Path | None = typer.Option(None, "--model", help="Ultralytics model (.pt/.onnx) to preload for assisted labeling"),
 ) -> None:
     """Start the workbench for DATASET_YAML."""
+    if dataset_yaml.is_dir() and category != "classification":
+        typer.echo("Error: a directory dataset requires --category classification", err=True)
+        raise typer.Exit(2)
     try:
         dataset = Dataset(dataset_yaml, category, background_probe=True)
     except DatasetError as exc:

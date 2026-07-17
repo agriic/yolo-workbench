@@ -38,8 +38,8 @@
           <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
           <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
           <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
-          <label class="toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
-          <label class="toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
+          <label class="toggle" id="overlay-toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
+          <label class="toggle" id="prediction-filter-toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
         </div>
         <div class="toolbar-group prediction-controls" id="assist-bar">
           <label class="field model-field grow">Model<div class="model-picker">
@@ -76,7 +76,7 @@
       <div class="filters">
         <label class="field">Class<select id="object-class"></select></label>
         <label class="field">Split<select id="object-split"><option value="all">All splits</option></select></label>
-        <label class="field"><span class="field-label">Crop padding <span id="padding-value" class="muted">15%</span></span><input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
+        <label class="field" id="crop-padding-field"><span class="field-label">Crop padding <span id="padding-value" class="muted">15%</span></span><input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
         <div id="object-bulk" class="bulk-bar" hidden>
           <strong id="object-selected-count"></strong>
           <select id="bulk-class" title="Target class"></select>
@@ -166,7 +166,7 @@
           <button id="fit" class="icon-btn" title="Fit image (F)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/></svg></button>
         </div>
         <button id="predict-image" class="secondary" title="Predict annotations for this image (P)" hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.2 2.2m8.4 8.4 2.2 2.2m0-12.8-2.2 2.2M7.8 16.2l-2.2 2.2"/></svg>Predict</button>
-        <label class="field inline">Draw class<select id="draw-class"></select></label>
+        <label class="field inline" id="draw-class-field">Draw class<select id="draw-class"></select></label>
         <button id="delete" class="danger-btn" title="Delete selected (⌫)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6"/></svg>Delete</button>
       </div>
     </div>

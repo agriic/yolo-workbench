@@ -99,7 +99,7 @@ class PredictorManager:
     def __init__(self, dataset: Dataset, backend_factory=None):
         self.dataset = dataset
         self._backend_factory = backend_factory or self._default_factory
-        self._available = backend_factory is not None or ultralytics_available()
+        self._available = (backend_factory is not None or ultralytics_available()) and dataset.category != "classification"
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._cancel_event = threading.Event()
@@ -153,6 +153,8 @@ class PredictorManager:
 
     def load(self, path: str, conf: float | None = None, iou: float | None = None) -> dict:
         if not self._available:
+            if self.dataset.category == "classification":
+                raise DatasetError("Model-assisted labeling is not supported for classification datasets")
             raise DatasetError("ultralytics is not installed. Run 'uv sync' to install all dependencies")
         model_path = Path(path).expanduser()
         if not model_path.exists():

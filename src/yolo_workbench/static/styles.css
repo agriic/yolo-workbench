@@ -863,3 +863,18 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   padding: 1px 7px;
   vertical-align: 1px;
 }
+
+/* classification datasets: no geometry, no model-assisted labeling, no embeddings */
+body.classification #assist-bar,
+body.classification #overlay-toggle,
+body.classification #prediction-filter-toggle,
+body.classification #crop-padding-field,
+body.classification #draw-class-field,
+body.classification #delete,
+body.classification #predict-image,
+body.classification #bulk-delete,
+body.classification [data-delete-object],
+body.classification .stats-panel:has(#stats-density),
+body.classification .stats-panel:has(#stats-box-size),
+body.classification .stats-panel:has(#stats-aspect),
+body.classification .stats-panel:has(#stats-cooccurrence) { display: none !important; }
