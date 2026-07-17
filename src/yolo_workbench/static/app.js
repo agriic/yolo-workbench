@@ -5,7 +5,7 @@ import {
   applyHistory, bounds, closeEditorSession, configureCanvas, deleteSelected,
   editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerMove,
   pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
-  savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered,
+  savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
   zoomTo,
 } from "./canvas.js";
 import {

@@ -38,3 +38,5 @@ Things a user of a "YOLO dataset workbench" will reach for and not find:
 - Prediction persistence — pending predictions are memory-only; a long-running assisted-labeling session dies with the server.
 - Backup management — backups accumulate under .yolo-workbench/backups/<session>/ forever with no restore UI or retention policy.
 - Other YOLO task types — OBB, pose/keypoints, and classification datasets are unsupported; the Category branching is already centralized enough that OBB would slot in.
+
+- Other YOLO formats - separate images labels. Autodetect it.

@@ -1,4 +1,4 @@
-import { $, esc } from "./api.js";
+import { $, esc, clamp } from "./api.js";
 
 export class VirtualGallery {
   constructor({ gridId, scrollId, railId, errorId, noun, emptyMessage, fetchPage, renderCard, isPinned = () => false, onUpdate = () => {} }) {
