@@ -195,10 +195,24 @@ class Dataset:
                 for line in source.read_text(encoding="utf-8").splitlines():
                     if line.strip():
                         path = Path(line.strip())
-                        found.append((self.root / path).resolve() if not path.is_absolute() else path.resolve())
+                        resolved = (self.root / path).resolve() if not path.is_absolute() else path.resolve()
+                        if not resolved.exists():
+                            resolved = self._relocate_listed_image(path, resolved)
+                        found.append(resolved)
             elif source.suffix.lower() in IMAGE_EXTENSIONS and source.exists():
                 found.append(source)
         return sorted(set(found))
+
+    def _relocate_listed_image(self, path: Path, resolved: Path) -> Path:
+        # File-list entries exported from another machine or layout often carry a stale
+        # prefix (e.g. "data/images/train/x.png" when the file is at "<root>/images/train/x.png").
+        # Retry with leading components stripped until the entry matches under the root.
+        parts = path.parts[1:] if path.is_absolute() else path.parts
+        for start in range(1, len(parts)):
+            candidate = self.root.joinpath(*parts[start:])
+            if candidate.exists():
+                return candidate.resolve()
+        return resolved
 
     def _label_root_for(self, image_root: Path) -> Path:
         parts = list(image_root.parts)

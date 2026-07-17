@@ -173,6 +173,23 @@ def test_parallel_images_and_labels_layout(tmp_path):
     assert next(iter(dataset.images.values())).label_path == labels / "a.txt"
 
 
+def test_file_list_entries_with_stale_prefix_relocate_under_root(tmp_path):
+    images = tmp_path / "images" / "train" / "cam0"
+    labels = tmp_path / "labels" / "train" / "cam0"
+    images.mkdir(parents=True)
+    labels.mkdir(parents=True)
+    Image.new("RGB", (20, 20)).save(images / "a.png")
+    (labels / "a.txt").write_text("0 0.5 0.5 0.5 0.5\n")
+    (tmp_path / "train.txt").write_text("data/images/train/cam0/a.png\n")
+    yaml_path = tmp_path / "dataset.yaml"
+    yaml_path.write_text(yaml.safe_dump({"path": ".", "train": "train.txt", "names": ["object"]}))
+    dataset = Dataset(yaml_path, "detection")
+    record = next(iter(dataset.images.values()))
+    assert record.path == images / "a.png"
+    assert record.label_path == labels / "a.txt"
+    assert not record.issues
+
+
 def test_reports_nested_orphan_labels_recursively(tmp_path):
     images = tmp_path / "images" / "train"
     labels = tmp_path / "labels" / "train"
