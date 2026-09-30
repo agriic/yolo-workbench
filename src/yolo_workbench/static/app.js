@@ -6,7 +6,7 @@ import {
   editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerMove,
   pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
   savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
-  zoomTo,
+  zoomAt, zoomTo,
 } from "./canvas.js";
 import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor,
@@ -294,6 +294,7 @@ function bind() {
     closeEditorSession();
     state.detail = null; state.img = null; state.drawing = null; state.drag = null; state.selected = null;
     state.editorGridIndex = null;
+    state.editorDetached = false;
     state.pred.items = [];
     renderPredList();
   });
@@ -407,11 +408,30 @@ function fetchObjectPage(offset, limit, signal) {
 export async function loadImages(options = {}) {
   if (!imageGallery) return;
   await imageGallery.reload(options);
-  if (state.detail && state.editorGridIndex != null) {
-    const item = imageGallery.cache.get(state.editorGridIndex);
-    if (item && item.id !== state.detail.id) state.editorGridIndex = null;
-    updateNavButtons();
+  await syncEditorGridIndex();
+}
+
+// Keep prev/next working when an edit (e.g. accepting predictions under "Has predictions")
+// drops the open image out of the filtered grid: remember the gap instead of losing the position.
+async function syncEditorGridIndex() {
+  if (!state.detail || state.editorGridIndex == null) return;
+  const id = state.detail.id, index = state.editorGridIndex;
+  let item;
+  try {
+    item = await imageGallery.itemAt(index);
+  } catch (error) {
+    if (error.name !== "AbortError") toast(error.message, "error");
+    return;
   }
+  if (state.detail?.id !== id || state.editorGridIndex !== index) return;
+  if (item?.id === id) {
+    state.editorDetached = false;
+  } else if (!state.editorDetached) {
+    const moved = [...imageGallery.cache].find(([, cached]) => cached.id === id);
+    if (moved) state.editorGridIndex = moved[0];
+    else state.editorDetached = true;
+  }
+  updateNavButtons();
 }
 
 function renderImageCard(item, index) {

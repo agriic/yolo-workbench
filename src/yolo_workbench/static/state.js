@@ -4,6 +4,7 @@ export const state = {
   lastObjectIndex: null,
   objectSelectionBusy: false,
   editorGridIndex: null,
+  editorDetached: false,  // editor image dropped out of the filtered grid; editorGridIndex is where it was
   issues: [],
   issueFilter: null,
   statistics: null,

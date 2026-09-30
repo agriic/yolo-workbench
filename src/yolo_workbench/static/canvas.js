@@ -21,6 +21,7 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   const request = ++editorRequest;
   state.detail = null;
   state.editorGridIndex = null;
+  state.editorDetached = false;
   state.img = null;
   state.drawing = null;
   state.drag = null;
@@ -47,7 +48,6 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   state.hovered = null;
   state.img = null;
   $("editor-title").textContent = state.detail.name;
-  $("editor-subtitle").textContent = `${state.detail.split} · ${state.detail.width}×${state.detail.height}px`;
   if (!$("editor").open) $("editor").showModal();
   updateNavButtons();
   renderList();
@@ -69,8 +69,12 @@ export async function openEditor(id, focus = null, gridIndex = null) {
 
 export async function navigate(step) {
   if (!state.detail || state.editorGridIndex == null || !deps.imageGallery()?.total) return;
-  const target = state.editorGridIndex + step;
-  if (target < 0 || target >= deps.imageGallery().total) return;
+  const total = deps.imageGallery().total;
+  // a detached image left a gap at editorGridIndex: its old successor now sits there
+  const target = state.editorDetached
+    ? (step > 0 ? state.editorGridIndex : Math.min(state.editorGridIndex, total) - 1)
+    : state.editorGridIndex + step;
+  if (target < 0 || target >= total) return;
   try {
     const item = await deps.imageGallery().itemAt(target);
     if (item) openEditor(item.id, null, target);
@@ -82,8 +86,10 @@ export async function navigate(step) {
 export function updateNavButtons() {
   if (!$("editor").open || !state.detail) return;
   const index = state.editorGridIndex;
-  $("prev-image").disabled = index == null || index <= 0;
-  $("next-image").disabled = index == null || deps.imageGallery()?.total == null || index >= deps.imageGallery().total - 1;
+  const total = deps.imageGallery()?.total;
+  $("prev-image").disabled = index == null || index <= 0 || !total;
+  $("next-image").disabled = index == null || total == null || index + (state.editorDetached ? 0 : 1) >= total;
+  $("editor-subtitle").textContent = `${state.detail.split} · ${state.detail.width}×${state.detail.height}px${state.editorDetached ? " · no longer matches filters" : ""}`;
 }
 
 export function updateHistoryButtons() {
