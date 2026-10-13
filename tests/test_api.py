@@ -25,7 +25,7 @@ def test_frontend_es_modules_are_served(tmp_path):
             assert app_script.status_code == 200
             assert 'from "./state.js"' in app_script.text
 
-            for name in ("api.js", "state.js", "grid.js", "canvas.js", "predictor.js", "embeddings.js"):
+            for name in ("api.js", "state.js", "grid.js", "canvas.js", "predictor.js", "embeddings.js", "manage.js", "projects.js", "projects.html"):
                 module = await client.get(f"/{name}")
                 assert module.status_code == 200
                 assert module.headers["cache-control"] == "no-cache"
@@ -64,6 +64,19 @@ def test_server_side_prediction_filter_has_correct_total(tmp_path):
 
     asyncio.run(run())
 
+
+
+def test_images_endpoint_filters_by_label_count(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+
+    async def run():
+        app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.get("/api/v1/images", params={"min_labels": 1})).json()["total"] == 1
+            assert (await client.get("/api/v1/images", params={"max_labels": 0})).json()["total"] == 0
+            assert (await client.get("/api/v1/images", params={"min_labels": -1})).status_code == 422
+
+    asyncio.run(run())
 
 def test_image_and_object_endpoints_support_random_access_slices(tmp_path):
     dataset, _ = make_dataset(tmp_path)

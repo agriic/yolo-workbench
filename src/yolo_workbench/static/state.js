@@ -1,5 +1,10 @@
 export const state = {
+  mode: "single",      // "single" dataset or "projects" folder
+  project: null,       // project slug in projects mode
   meta: null,
+  imageSelection: new Map(),  // image id -> image item (Annotation grid bulk actions)
+  lastImageIndex: null,
+  imageSelectionBusy: false,
   objectSelection: new Map(),  // "imageId|annotationId" -> object item
   lastObjectIndex: null,
   objectSelectionBusy: false,

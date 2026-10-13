@@ -17,6 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from .models import Annotation, Category, ImageRecord
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+WORKBENCH_DIR = ".yolo-workbench"  # per-dataset state: backups, size index, trash, upload staging
 
 
 class DatasetError(ValueError):
@@ -46,6 +47,60 @@ class MoveEntry:
 
 
 @dataclass
+class FileEntry:
+    """History entry for a non-label file the dataset owns (data.yaml); replay compares content, not mtimes."""
+
+    path: Path
+    before: str
+    after: str
+    before_exists: bool
+    after_exists: bool
+
+
+@dataclass
+class RecordMoveEntry:
+    """History entry moving one image (and its label) between splits, into the trash, or back.
+
+    split_before=None means the record did not exist before (restore from trash);
+    split_after=None means it is removed from the dataset (moved to the trash).
+    """
+
+    image_id: str
+    split_before: str | None
+    split_after: str | None
+    files: list[tuple[Path, Path]]  # (src, dst) pairs; the image comes first
+
+
+@dataclass
+class DirEntry:
+    """History entry creating (created=True) or removing an empty directory."""
+
+    path: Path
+    created: bool
+
+
+@dataclass
+class DirMoveEntry:
+    """History entry renaming a directory (classification class folders)."""
+
+    src: Path
+    dst: Path
+
+
+@dataclass
+class SchemaEntry:
+    """Marks a transaction that changed class names; replay reloads names from disk.
+
+    mapping is old class id -> new class id (None = removed) for listeners such as the predictor.
+    """
+
+    mapping: dict[int, int | None]
+
+    def inverse(self) -> dict[int, int | None]:
+        return {new: old for old, new in self.mapping.items() if new is not None}
+
+
+@dataclass
 class PreparedChange:
     record: ImageRecord
     before: str
@@ -58,21 +113,28 @@ class PreparedChange:
 
 
 class Dataset:
-    def __init__(self, yaml_path: Path, category: Category, background_probe: bool = False):
+    def __init__(self, yaml_path: Path, category: Category, background_probe: bool = False, allow_empty: bool = False):
         self.yaml_path = yaml_path.resolve()
         self.category = category
         self.root = self.yaml_path.parent
+        # managed projects start with no images and no classes; external datasets must have both
+        self.allow_empty = allow_empty
+        self.background_probe = background_probe
         self.names: dict[int, str] = {}
+        self.names_style = "dict"  # how data.yaml spells names ("list" or "dict"); preserved on rewrite
         self.images: dict[str, ImageRecord] = {}
         self.orphan_labels: list[Path] = []
         self._label_scan_roots: set[Path] = set()
         self._split_dirs: dict[str, Path] = {}
+        self._split_image_dirs: dict[str, Path] = {}  # splits configured as exactly one image directory
         self._class_ids_by_name: dict[str, int] = {}
         self._mtimes: dict[Path, int | None] = {}
         self._revisions: dict[Path, int] = {}
         self._lock = threading.RLock()
         self._change_listeners: list = []
+        self._schema_listeners: list = []
         self.annotation_generation = 0
+        self.schema_generation = 0
         self._sorted_image_ids: list[str] = []
         self._split_image_ids: dict[str, set[str]] = {}
         self._class_image_ids: dict[int, set[str]] = {}
@@ -83,66 +145,84 @@ class Dataset:
         self._issue_count = 0
         self._orphan_issues: list[dict] = []
         self._statistics_cache: dict | None = None
-        # each history entry is a transaction: one or more label files written together
-        self._undo: list[list[HistoryEntry]] = []
-        self._redo: list[list[HistoryEntry]] = []
+        # each history entry is a transaction: one or more files written or moved together
+        self._undo: list[list] = []
+        self._redo: list[list] = []
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
         self._backed_up: set[Path] = set()
         self.indexing: dict[str, int] = {"done": 0, "total": 0}
         self._load()
         pending = [record for record in self.images.values() if record.width == 0 and record.probe_error is None]
         self.indexing = {"done": len(self.images) - len(pending), "total": len(self.images)}
+        self._start_probe(pending)
+
+    def _start_probe(self, pending: list[ImageRecord]) -> None:
         if not pending:
             return
-        if background_probe:
+        if self.background_probe:
             threading.Thread(target=self._probe_all, args=(pending,), daemon=True).start()
         else:
             self._probe_all(pending)
 
-    def _load(self) -> None:
-        if self.category == "classification":
-            return self._load_classification()
+    def _read_config(self) -> dict:
+        if not self.yaml_path.is_file():
+            return {}
         try:
             config = yaml.safe_load(self.yaml_path.read_text(encoding="utf-8")) or {}
         except (OSError, yaml.YAMLError) as exc:
             raise DatasetError(f"Cannot read dataset YAML: {exc}") from exc
+        if not isinstance(config, dict):
+            raise DatasetError("Dataset YAML must be a mapping")
+        return config
+
+    def _names_from_config(self, config: dict) -> dict[int, str]:
         raw_names = config.get("names")
         if isinstance(raw_names, list):
-            self.names = dict(enumerate(str(value) for value in raw_names))
-        elif isinstance(raw_names, dict):
+            self.names_style = "list"
+            return dict(enumerate(str(value) for value in raw_names))
+        if isinstance(raw_names, dict):
+            self.names_style = "dict"
             try:
-                self.names = {int(key): str(value) for key, value in raw_names.items()}
+                return {int(key): str(value) for key, value in raw_names.items()}
             except (TypeError, ValueError) as exc:
                 raise DatasetError("Dataset names must use integer class IDs") from exc
-        if not self.names:
+        return {}
+
+    def _classification_names(self) -> dict[int, str]:
+        class_names = sorted({child.name for directory in self._split_dirs.values() if directory.is_dir() for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")})
+        return dict(enumerate(class_names))
+
+    def _discover(self) -> list[tuple[str, Path]]:
+        """Read the YAML (names, root, splits) and list every (split, image path) on disk."""
+        if self.category == "classification":
+            return self._discover_classification()
+        config = self._read_config()
+        self.names = self._names_from_config(config)
+        if not self.names and not self.allow_empty:
             raise DatasetError("Dataset YAML has no class names")
         root_value = config.get("path", ".")
         root = Path(root_value)
         self.root = (self.yaml_path.parent / root).resolve() if not root.is_absolute() else root.resolve()
-        size_index = self._load_size_index()
+        self._label_scan_roots = set()
+        self._split_image_dirs = {}
+        found = []
         for split in ("train", "val", "test"):
-            for image_path in self._resolve_sources(config.get(split)):
-                record_id = hashlib.sha1(f"{split}:{image_path}".encode()).hexdigest()[:16]
-                label_path = self._label_for(image_path)
-                record = ImageRecord(record_id, split, image_path, label_path)
-                record.name_cf = image_path.name.casefold()
-                self._apply_cached_size(record, size_index)
-                self._read_record(record)
-                self.images[record_id] = record
-        if not self.images:
-            raise DatasetError("No supported images found in dataset splits")
-        self._find_orphans()
-        self._rebuild_indexes()
+            value = config.get(split)
+            single = value[0] if isinstance(value, list) and len(value) == 1 else value
+            if isinstance(single, str) and single:
+                directory = Path(single)
+                directory = (self.root / directory).resolve() if not directory.is_absolute() else directory.resolve()
+                if directory.suffix.lower() != ".txt" and directory.suffix.lower() not in IMAGE_EXTENSIONS:
+                    self._split_image_dirs[split] = directory
+            found.extend((split, image_path) for image_path in self._resolve_sources(value))
+        return found
 
-    def _load_classification(self) -> None:
-        """Load a YOLO classification dataset: <root>/<split>/<class name>/<images>."""
+    def _discover_classification(self) -> list[tuple[str, Path]]:
+        """<root>/<split>/<class name>/<images>; class ids are the sorted class-folder names."""
         self.root = (self.yaml_path if self.yaml_path.is_dir() else self.yaml_path.parent).resolve()
-        config: dict = {}
-        if self.yaml_path.is_file():
-            try:
-                config = yaml.safe_load(self.yaml_path.read_text(encoding="utf-8")) or {}
-            except (OSError, yaml.YAMLError) as exc:
-                raise DatasetError(f"Cannot read dataset YAML: {exc}") from exc
+        config = self._read_config()
+        if config:
+            self._names_from_config(config)  # names come from folders; this only records the YAML's style
             root_value = Path(str(config.get("path", ".")))
             self.root = (self.yaml_path.parent / root_value).resolve() if not root_value.is_absolute() else root_value.resolve()
         self._split_dirs = {}
@@ -151,26 +231,123 @@ class Dataset:
             directory = (self.root / directory) if not directory.is_absolute() else directory
             if directory.is_dir():
                 self._split_dirs[split] = directory.resolve()
-        if not self._split_dirs:
+        self._split_image_dirs = dict(self._split_dirs)
+        if not self._split_dirs and not self.allow_empty:
             raise DatasetError("Classification datasets need train/, val/, or test/ directories with one folder per class")
-        class_names = sorted({child.name for directory in self._split_dirs.values() for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")})
-        if not class_names:
+        self.names = self._classification_names()
+        if not self.names and not self.allow_empty:
             raise DatasetError("No class directories found under the dataset splits")
-        self.names = dict(enumerate(class_names))
         self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
-        size_index = self._load_size_index()
+        found = []
         for split, directory in self._split_dirs.items():
             for class_dir in sorted(child for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")):
-                for image_path in sorted(path for path in class_dir.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS):
-                    record_id = hashlib.sha1(f"{split}:{image_path}".encode()).hexdigest()[:16]
-                    record = ImageRecord(record_id, split, image_path, image_path)
-                    record.name_cf = image_path.name.casefold()
-                    self._apply_cached_size(record, size_index)
-                    self._read_record(record)
-                    self.images[record_id] = record
-        if not self.images:
+                found.extend((split, path) for path in sorted(class_dir.rglob("*")) if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(class_dir).parts)
+        return found
+
+    def _make_record(self, split: str, image_path: Path, record_id: str | None = None) -> ImageRecord:
+        record_id = record_id or hashlib.sha1(f"{split}:{image_path}".encode()).hexdigest()[:16]
+        label_path = image_path if self.category == "classification" else self._label_for(image_path)
+        record = ImageRecord(record_id, split, image_path, label_path)
+        record.name_cf = image_path.name.casefold()
+        return record
+
+    def _load(self) -> None:
+        size_index = self._load_size_index()
+        for split, image_path in self._discover():
+            record = self._make_record(split, image_path)
+            self._apply_cached_size(record, size_index)
+            self._read_record(record)
+            self.images[record.id] = record
+        if not self.images and not self.allow_empty:
             raise DatasetError("No supported images found in dataset splits")
+        self._find_orphans()
         self._rebuild_indexes()
+
+    def _resort(self) -> None:
+        self._sorted_image_ids = [record.id for record in sorted(self.images.values(), key=lambda item: (item.split, item.name_cf))]
+
+    def _add_record(self, record: ImageRecord, read: bool = True) -> None:
+        """Insert a record discovered (or restored) after load; caller re-sorts once per batch."""
+        self.images[record.id] = record
+        self._split_image_ids.setdefault(record.split, set()).add(record.id)
+        if read:
+            self._read_record(record)
+
+    def _remove_record(self, record: ImageRecord) -> None:
+        record.annotations = []
+        record.issues = []
+        self._refresh_record_indexes(record)
+        self.images.pop(record.id, None)
+        self._object_keys_by_image.pop(record.id, None)
+        self._issues_by_image.pop(record.id, None)
+        image_ids = self._split_image_ids.get(record.split)
+        if image_ids is not None:
+            image_ids.discard(record.id)
+            if not image_ids:
+                del self._split_image_ids[record.split]
+        self._mtimes.pop(record.label_path, None)
+
+    def _set_split(self, record: ImageRecord, split: str) -> None:
+        if record.split == split:
+            return
+        image_ids = self._split_image_ids.get(record.split)
+        if image_ids is not None:
+            image_ids.discard(record.id)
+            if not image_ids:
+                del self._split_image_ids[record.split]
+        record.split = split
+        self._split_image_ids.setdefault(split, set()).add(record.id)
+
+    def rescan(self) -> dict:
+        """Pick up images and labels added, removed, or edited on disk since load."""
+        with self._lock:
+            before_names = dict(self.names)
+            discovered = self._discover()
+            by_key = {(record.split, record.path): record for record in self.images.values()}
+            wanted = set(discovered)
+            removed = [record for key, record in by_key.items() if key not in wanted]
+            for record in removed:
+                self._remove_record(record)
+            size_index = self._load_size_index()
+            added = []
+            for split, image_path in discovered:
+                if (split, image_path) in by_key:
+                    continue
+                record = self._make_record(split, image_path)
+                if record.id in self.images:
+                    continue
+                self._apply_cached_size(record, size_index)
+                self._add_record(record)
+                added.append(record)
+            self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
+            names_changed = before_names != self.names
+            updated = 0
+            added_ids = {record.id for record in added}
+            for record in self.images.values():
+                if record.id in added_ids:
+                    continue
+                current = self._safe_stat(record.label_path)
+                if names_changed or (current.st_mtime_ns if current else None) != self._mtimes.get(record.label_path):
+                    self._read_record(record)
+                    updated += 1
+            self._resort()
+            self._find_orphans()
+            self._rebuild_orphan_issues()
+            self._statistics_cache = None
+            pending = [record for record in added if record.width == 0 and record.probe_error is None]
+            self.indexing = {"done": self.indexing["done"] + len(added) - len(pending), "total": self.indexing["total"] + len(added) - len(removed)}
+            self.indexing["done"] = min(self.indexing["done"], self.indexing["total"])
+            changed = bool(added or removed or updated or names_changed)
+            if changed:
+                self.annotation_generation += 1
+            if names_changed:
+                self.schema_generation += 1
+        self._start_probe(pending)
+        if changed:
+            self._notify_changes([record.id for record in added])
+        if names_changed:
+            self._notify_schema(None)
+        return {"added": len(added), "removed": len(removed), "updated": updated, "names_changed": names_changed}
 
     def _class_name_for(self, record: ImageRecord) -> str:
         return record.path.relative_to(self._split_dirs[record.split]).parts[0]
@@ -244,7 +421,7 @@ class Dataset:
             source = (self.root / source).resolve() if not source.is_absolute() else source.resolve()
             if source.is_dir():
                 self._label_scan_roots.add(self._label_root_for(source))
-                found.extend(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS)
+                found.extend(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(source).parts)
             elif source.suffix.lower() == ".txt" and source.exists():
                 for line in source.read_text(encoding="utf-8").splitlines():
                     if line.strip():
@@ -361,7 +538,7 @@ class Dataset:
         roots = self._label_scan_roots | {record.label_path.parent for record in self.images.values()}
         for root in roots:
             if root.exists():
-                candidates.update(path.resolve() for path in root.rglob("*.txt") if ".yolo-workbench" not in path.parts)
+                candidates.update(path.resolve() for path in root.rglob("*.txt") if WORKBENCH_DIR not in path.parts)
         self.orphan_labels = sorted(candidates - expected)
 
     def _rebuild_indexes(self) -> None:
@@ -379,6 +556,9 @@ class Dataset:
         for record in self.images.values():
             self._split_image_ids.setdefault(record.split, set()).add(record.id)
             self._refresh_record_indexes(record)
+        self._rebuild_orphan_issues()
+
+    def _rebuild_orphan_issues(self) -> None:
         self._orphan_issues = [
             {
                 "id": hashlib.sha1(str(path).encode()).hexdigest()[:16],
@@ -437,6 +617,17 @@ class Dataset:
     def add_change_listener(self, listener) -> None:
         self._change_listeners.append(listener)
 
+    def add_schema_listener(self, listener) -> None:
+        """listener(mapping) after class names change; mapping is old id -> new id (None = removed), or None if unknown."""
+        self._schema_listeners.append(listener)
+
+    def _notify_schema(self, mapping: dict[int, int | None] | None) -> None:
+        for listener in tuple(self._schema_listeners):
+            try:
+                listener(mapping)
+            except Exception:
+                pass  # listeners hold derived state only; a committed schema change must stand
+
     def _notify_changes(self, image_ids: list[str]) -> None:
         for listener in tuple(self._change_listeners):
             try:
@@ -456,7 +647,19 @@ class Dataset:
                 "issue_count": self._issue_count + len(self._orphan_issues),
                 "session_id": self.session_id,
                 "indexing": dict(self.indexing),
+                "schema_generation": self.schema_generation,
+                "capabilities": self.capabilities(),
+                "can_undo": bool(self._undo),
+                "can_redo": bool(self._redo),
             }
+
+    def capabilities(self) -> dict:
+        """What the UI may offer: image moves/imports need each split to be a single image directory."""
+        return {
+            "classes": self.category == "classification" or self.yaml_path.is_file(),
+            "image_ops": bool(self._split_image_dirs),
+            "splits": [split for split in ("train", "val", "test") if split in self._split_image_dirs],
+        }
 
     def statistics(self) -> dict:
         """Return cached dataset-wide annotation statistics.
@@ -677,7 +880,7 @@ class Dataset:
             item.pop("score", None)
         return outliers[:100]
 
-    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None) -> dict:
+    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None) -> dict:
         with self._lock:
             allowed: set[str] | None = None
             if split != "all":
@@ -691,6 +894,15 @@ class Dataset:
             if search:
                 query = search.casefold()
                 records = [record for record in records if query in record.name_cf]
+            if min_labels is not None or max_labels is not None:
+                # With a class filter, count only that class's labels ("images with >= 3 cars").
+                def label_count(record: ImageRecord) -> int:
+                    if class_id is None:
+                        return len(record.annotations)
+                    return sum(1 for a in record.annotations if a.class_id == class_id)
+                low = min_labels if min_labels is not None else 0
+                high = max_labels if max_labels is not None else math.inf
+                records = [record for record in records if low <= label_count(record) <= high]
             return {"total": len(records), "items": [record.summary() for record in records[offset : offset + limit]]}
 
     def list_objects(self, class_id: int, split="all", offset=0, limit=100) -> dict:
@@ -748,54 +960,18 @@ class Dataset:
                 if dst.exists():
                     raise DatasetError(f"Cannot move {src.name}: a file with that name already exists in {self.names[class_id]}/")
                 planned.append((record, src, dst))
-            transaction: list[MoveEntry] = []
-            for record, src, dst in planned:
-                self._move_file(src, dst)
-                self._apply_move(record, dst)
-                transaction.append(MoveEntry(record.id, src, dst))
-            if history and transaction:
-                self._undo.append(transaction)
-                self._redo.clear()
-            changed_ids = [record.id for record, _, _ in planned]
-            if changed_ids:
-                self.annotation_generation += 1
-        if changed_ids:
-            self._notify_changes(changed_ids)
+            entries = [MoveEntry(record.id, src, dst) for record, src, dst in planned]
+            if not entries:
+                return
+            if history:
+                self._execute(entries)
+            else:
+                self._run_transaction(entries, "redo")
 
     @staticmethod
     def _move_file(src: Path, dst: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
         os.replace(src, dst)
-
-    def _apply_move(self, record: ImageRecord, dst: Path) -> None:
-        old_key = record.label_path
-        record.path = dst
-        record.label_path = dst
-        record.name_cf = dst.name.casefold()
-        self._mtimes.pop(old_key, None)
-        self._revisions[dst] = self._revisions.pop(old_key, 0)
-        self._read_record(record)
-
-    def _replay_moves(self, entries: list[MoveEntry], direction: str) -> list[str]:
-        with self._lock:
-            operations = []
-            for entry in reversed(entries) if direction == "undo" else entries:
-                record = self.images[entry.image_id]
-                src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
-                if record.path != src or not src.exists():
-                    raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
-                if dst.exists():
-                    raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
-                operations.append((record, src, dst))
-            for record, src, dst in operations:
-                self._move_file(src, dst)
-                self._apply_move(record, dst)
-            image_ids = [record.id for record, _, _ in operations]
-            if image_ids:
-                self.annotation_generation += 1
-        if image_ids:
-            self._notify_changes(image_ids)
-        return image_ids
 
     def _prepare(self, record: ImageRecord, raw_annotations: list[dict], expected_revision: int | None = None) -> PreparedChange:
         """Validate raw annotations and capture the label state this change is based on."""
@@ -896,45 +1072,265 @@ class Dataset:
             path.unlink(missing_ok=True)
 
     def history(self, direction: str) -> dict:
-        source, target = (self._undo, self._redo) if direction == "undo" else (self._redo, self._undo)
-        if not source:
-            raise DatasetError(f"Nothing to {direction}")
-        transaction = source.pop()
-        if transaction and isinstance(transaction[0], MoveEntry):
-            try:
-                image_ids = self._replay_moves(transaction, direction)
-            except WriteConflict:
-                source.append(transaction)
-                raise
+        with self._lock:
+            source, target = (self._undo, self._redo) if direction == "undo" else (self._redo, self._undo)
+            if not source:
+                raise DatasetError(f"Nothing to {direction}")
+            transaction = source[-1]
+            image_ids, schema_changed = self._run_transaction(transaction, direction)
+            source.pop()
             target.append(transaction)
-            return {"image_ids": image_ids, "image_id": image_ids[0], "can_undo": bool(self._undo), "can_redo": bool(self._redo)}
-        entries = list(reversed(transaction)) if direction == "undo" else transaction
-        changes = []
-        for entry in entries:
-            record = next(record for record in self.images.values() if record.label_path == entry.label_path)
-            if direction == "undo":
-                before, after = entry.after, entry.before
-                before_exists, after_exists = entry.after_exists, entry.before_exists
+            return {
+                "image_ids": image_ids,
+                "image_id": image_ids[0] if image_ids else None,
+                "schema_changed": schema_changed,
+                "can_undo": bool(self._undo),
+                "can_redo": bool(self._redo),
+            }
+
+    def history_state(self) -> dict:
+        with self._lock:
+            return {"can_undo": bool(self._undo), "can_redo": bool(self._redo)}
+
+    def _execute(self, entries: list) -> tuple[list[str], bool]:
+        """Apply a new transaction forward and make it undoable as one unit."""
+        with self._lock:
+            result = self._run_transaction(entries, "redo")
+            if entries:
+                self._undo.append(entries)
+                self._redo.clear()
+            return result
+
+    def _run_transaction(self, entries: list, direction: str) -> tuple[list[str], bool]:
+        """Replay a transaction in either direction: every entry is checked before anything is touched.
+
+        Records are re-read once at the end so that a class-folder rename or a names change
+        inside the same transaction is in place before labels are interpreted.
+        """
+        with self._lock:
+            ordered = list(reversed(entries)) if direction == "undo" else list(entries)
+            records_by_label = {record.label_path: record for record in self.images.values()}
+            for entry in ordered:
+                self._check_entry(entry, direction, records_by_label)
+            touched: dict[str, ImageRecord] = {}
+            schema: SchemaEntry | None = None
+            resort = False
+            for entry in ordered:
+                if isinstance(entry, SchemaEntry):
+                    schema = entry
+                else:
+                    resort |= self._apply_entry(entry, direction, records_by_label, touched)
+            if schema is not None:
+                self._reload_schema()
             else:
-                before, after = entry.before, entry.after
-                before_exists, after_exists = entry.before_exists, entry.after_exists
-            changes.append(PreparedChange(
-                record=record,
-                before=before,
-                after=after,
-                before_exists=before_exists,
-                after_exists=after_exists,
-                base_mtime=self._mtimes[record.label_path],
-                base_revision=self._revisions[record.label_path],
-            ))
+                for record in touched.values():
+                    if record.id in self.images:
+                        self._read_record(record)
+            if resort:
+                self._resort()
+                self._find_orphans()
+                self._rebuild_orphan_issues()
+            image_ids = list(touched)
+            if image_ids or schema is not None:
+                self.annotation_generation += 1
+        if image_ids or schema is not None:
+            self._notify_changes(image_ids)
+        if schema is not None:
+            self._notify_schema(schema.mapping if direction == "redo" else schema.inverse())
+        return image_ids, schema is not None
+
+    @staticmethod
+    def _states(entry, direction: str):
+        """(expected current content/exists, target content/exists) for content entries."""
+        if direction == "undo":
+            return (entry.after, entry.after_exists), (entry.before, entry.before_exists)
+        return (entry.before, entry.before_exists), (entry.after, entry.after_exists)
+
+    def _check_entry(self, entry, direction: str, records_by_label: dict) -> None:
+        if isinstance(entry, HistoryEntry):
+            record = records_by_label.get(entry.label_path)
+            if record is None:
+                raise WriteConflict(f"{entry.label_path.name} is no longer part of the dataset; cannot {direction}")
+            current = entry.label_path.stat().st_mtime_ns if entry.label_path.exists() else None
+            if current != self._mtimes.get(entry.label_path):
+                self._read_record(record)
+                raise WriteConflict(f"{entry.label_path.name} changed outside this application; reload before saving")
+        elif isinstance(entry, FileEntry):
+            (expected, expected_exists), _ = self._states(entry, direction)
+            exists = entry.path.exists()
+            if exists != expected_exists or (exists and entry.path.read_text(encoding="utf-8") != expected):
+                raise WriteConflict(f"{entry.path.name} changed outside this application; cannot {direction}")
+        elif isinstance(entry, MoveEntry):
+            src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
+            record = self.images.get(entry.image_id)
+            if record is None or record.path != src or not src.exists():
+                raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
+            if dst.exists():
+                raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
+        elif isinstance(entry, RecordMoveEntry):
+            pairs = [(dst, src) for src, dst in entry.files] if direction == "undo" else entry.files
+            present = entry.split_after if direction == "undo" else entry.split_before
+            if present is not None:
+                record = self.images.get(entry.image_id)
+                if record is None or record.path != pairs[0][0]:
+                    raise WriteConflict(f"{pairs[0][0].name} changed outside this application; cannot {direction}")
+            elif entry.image_id in self.images:
+                raise WriteConflict(f"{pairs[0][1].name} is already part of the dataset; cannot {direction}")
+            for src, dst in pairs:
+                if not src.exists():
+                    raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
+                if dst.exists():
+                    raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
+        elif isinstance(entry, DirMoveEntry):
+            src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
+            if not src.is_dir():
+                raise WriteConflict(f"Folder {src.name}/ changed outside this application; cannot {direction}")
+            if dst.exists():
+                raise WriteConflict(f"Cannot {direction}: folder {dst.name}/ already exists")
+
+    def _apply_entry(self, entry, direction: str, records_by_label: dict, touched: dict) -> bool:
+        """Apply one checked entry; returns True when record membership or order changed."""
+        if isinstance(entry, HistoryEntry):
+            record = records_by_label[entry.label_path]
+            (before, _), (after, after_exists) = self._states(entry, direction)
+            self._backup(entry.label_path, before)
+            self._write_state(entry.label_path, after, after_exists)
+            touched[record.id] = record
+            return False
+        if isinstance(entry, FileEntry):
+            (before, before_exists), (after, after_exists) = self._states(entry, direction)
+            if before_exists:
+                self._backup(entry.path, before)
+            self._write_state(entry.path, after, after_exists)
+            return False
+        if isinstance(entry, MoveEntry):
+            record = self.images[entry.image_id]
+            dst = entry.src if direction == "undo" else entry.dst
+            self._move_file(record.path, dst)
+            self._relocate(record, dst, dst)
+            touched[record.id] = record
+            return True
+        if isinstance(entry, RecordMoveEntry):
+            pairs = [(dst, src) for src, dst in entry.files] if direction == "undo" else entry.files
+            split_from, split_to = (entry.split_after, entry.split_before) if direction == "undo" else (entry.split_before, entry.split_after)
+            for src, dst in pairs:
+                self._move_file(src, dst)
+            if split_to is None:
+                self._remove_record(self.images[entry.image_id])
+                return True
+            image_path = pairs[0][1]
+            if split_from is None:
+                record = self._make_record(split_to, image_path, entry.image_id)
+                self._add_record(record, read=False)
+            else:
+                record = self.images[entry.image_id]
+                label_path = image_path if self.category == "classification" else self._label_for(image_path)
+                self._relocate(record, image_path, label_path)
+                self._set_split(record, split_to)
+            touched[record.id] = record
+            return True
+        if isinstance(entry, DirEntry):
+            create = entry.created != (direction == "undo")
+            if create:
+                entry.path.mkdir(parents=True, exist_ok=True)
+            else:
+                try:
+                    entry.path.rmdir()
+                except OSError:
+                    pass  # a folder that gained files outside the app is left in place
+            return False
+        if isinstance(entry, DirMoveEntry):
+            src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dst)
+            for record in list(self.images.values()):
+                if record.path.is_relative_to(src):
+                    moved = dst / record.path.relative_to(src)
+                    label = dst / record.label_path.relative_to(src) if record.label_path.is_relative_to(src) else record.label_path
+                    self._relocate(record, moved, label)
+                    touched[record.id] = record
+            return True
+        raise TypeError(f"Unknown history entry {entry!r}")
+
+    def _relocate(self, record: ImageRecord, image_path: Path, label_path: Path) -> None:
+        """Point a record at moved files, carrying its revision and mtime bookkeeping along."""
+        old_label = record.label_path
+        record.path = image_path
+        record.label_path = label_path
+        record.name_cf = image_path.name.casefold()
+        if old_label != label_path:
+            self._revisions[label_path] = self._revisions.pop(old_label, 0)
+            self._mtimes.pop(old_label, None)
+        stat = self._safe_stat(label_path)
+        self._mtimes[label_path] = stat.st_mtime_ns if stat else None
+
+    def _reload_schema(self) -> None:
+        """Re-read class names from disk and re-interpret every record against them."""
+        if self.category == "classification":
+            self.names = self._classification_names()
+        else:
+            self.names = self._names_from_config(self._read_config())
+        self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
+        self.schema_generation += 1
+        for record in list(self.images.values()):
+            self._read_record(record)
+        self._statistics_cache = None
+
+    def _trash_path(self, path: Path) -> Path:
         try:
-            self._commit_many(changes, history=False)
-        except WriteConflict:
-            source.append(transaction)
-            raise
-        target.append(transaction)
-        image_ids = [change.record.id for change in changes]
-        return {"image_ids": image_ids, "image_id": image_ids[0], "can_undo": bool(self._undo), "can_redo": bool(self._redo)}
+            relative = path.resolve().relative_to(self.root)
+        except ValueError:
+            relative = Path(path.name)
+        target = self.root / WORKBENCH_DIR / "trash" / self.session_id / relative
+        counter = 1
+        while target.exists():
+            target = target.with_name(f"{path.stem}.{counter}{path.suffix}")
+            counter += 1
+        return target
+
+    def delete_images(self, image_ids: list[str]) -> dict:
+        """Move images (and their labels) into the dataset trash as one undoable transaction."""
+        with self._lock:
+            entries = []
+            for image_id in dict.fromkeys(image_ids):
+                record = self.require_image(image_id)
+                files = [(record.path, self._trash_path(record.path))]
+                if record.label_path != record.path and record.label_path.exists():
+                    files.append((record.label_path, self._trash_path(record.label_path)))
+                entries.append(RecordMoveEntry(record.id, record.split, None, files))
+            if not entries:
+                raise DatasetError("No images selected")
+            self._execute(entries)
+            return {"deleted": len(entries), **self.history_state()}
+
+    def move_images(self, image_ids: list[str], split: str) -> dict:
+        """Move images (and their labels) to another split as one undoable transaction."""
+        with self._lock:
+            target_root = self._split_image_dirs.get(split)
+            if target_root is None:
+                raise DatasetError(f"Split {split} is not a single image directory in this dataset")
+            entries, skipped, targets = [], 0, set()
+            for image_id in dict.fromkeys(image_ids):
+                record = self.require_image(image_id)
+                if record.split == split:
+                    skipped += 1
+                    continue
+                source_root = self._split_image_dirs.get(record.split)
+                relative = record.path.relative_to(source_root) if source_root and record.path.is_relative_to(source_root) else Path(record.path.name)
+                image_path = target_root / relative
+                if image_path.exists() or image_path in targets:
+                    raise DatasetError(f"Cannot move {record.path.name}: {split} already has a file with that name")
+                targets.add(image_path)
+                files = [(record.path, image_path)]
+                if record.label_path != record.path and record.label_path.exists():
+                    label_path = self._label_for(image_path)
+                    if label_path.exists():
+                        raise DatasetError(f"Cannot move {record.path.name}: {label_path.name} already exists in {split}")
+                    files.append((record.label_path, label_path))
+                entries.append(RecordMoveEntry(record.id, record.split, split, files))
+            if entries:
+                self._execute(entries)
+            return {"moved": len(entries), "skipped": skipped, **self.history_state()}
 
     def issues(self) -> list[dict]:
         with self._lock:

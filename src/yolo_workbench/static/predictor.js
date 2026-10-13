@@ -12,14 +12,14 @@ const UNMAPPED_COLOR = "#8b8f98";
 
 export async function refreshPredictor() {
   try {
-    applyPredictorState(await api("/api/v1/predictor"));
+    applyPredictorState(await api("/predictor"));
     if (state.pred.status !== "unavailable") await loadModelOptions();
   } catch (error) { deps.toast(error.message, "error"); }
 }
 
 export async function loadModelOptions() {
   try {
-    state.pred.models = (await api("/api/v1/predictor/models")).items;
+    state.pred.models = (await api("/predictor/models")).items;
   } catch { state.pred.models = []; }
   // the most recently used model is the best default for a returning session
   const recent = state.pred.models.find(item => item.source === "recent");
@@ -112,7 +112,7 @@ export async function loadModel() {
   $("predictor-status").textContent = "Loading model…";
   $("predictor-status").title = "Loading model…";
   try {
-    applyPredictorState(await api("/api/v1/predictor/load", { method: "POST", body: JSON.stringify({ path }) }));
+    applyPredictorState(await api("/predictor/load", { method: "POST", body: JSON.stringify({ path }) }));
     deps.toast("Model loaded");
     loadModelOptions(); // recents changed
   } catch (error) {
@@ -125,7 +125,7 @@ export async function loadModel() {
 
 export async function runPredict() {
   try {
-    applyPredictorState(await api("/api/v1/predictor/run", {
+    applyPredictorState(await api("/predictor/run", {
       method: "POST",
       body: JSON.stringify({ split: $("image-split").value, only_unlabeled: $("predict-unlabeled").checked }),
     }));
@@ -134,13 +134,13 @@ export async function runPredict() {
 
 export async function cancelPredict() {
   try {
-    applyPredictorState(await api("/api/v1/predictor/cancel", { method: "POST" }));
+    applyPredictorState(await api("/predictor/cancel", { method: "POST" }));
   } catch (error) { deps.toast(error.message, "error"); }
 }
 
 export async function retryPredict() {
   try {
-    applyPredictorState(await api("/api/v1/predictor/retry", { method: "POST" }));
+    applyPredictorState(await api("/predictor/retry", { method: "POST" }));
   } catch (error) { deps.toast(error.message, "error"); }
 }
 
@@ -151,7 +151,7 @@ export async function predictImage() {
   const button = $("predict-image");
   button.disabled = true;
   try {
-    const data = await api(`/api/v1/images/${id}/predictions/compute`, { method: "POST" });
+    const data = await api(`/images/${id}/predictions/compute`, { method: "POST" });
     if (state.detail?.id === id) {
       state.pred.items = data.items;
       renderPredList();
@@ -170,7 +170,7 @@ export async function predictImage() {
 export async function loadEditorPredictions(id) {
   if (state.pred.status === "unavailable") return;
   try {
-    const data = await api(`/api/v1/images/${id}/predictions`);
+    const data = await api(`/images/${id}/predictions`);
     if (!state.detail || state.detail.id !== id) return;
     state.pred.items = data.items;
   } catch { state.pred.items = []; }
@@ -259,7 +259,7 @@ export async function acceptPredictions(predictionIds, minConfidence = null) {
   if (predictionIds === null && minConfidence !== null) body.min_confidence = minConfidence;
   try {
     await deps.saveQueue();
-    const result = await api(`/api/v1/images/${imageId}/predictions/accept`, { method: "POST", body: JSON.stringify(body) });
+    const result = await api(`/images/${imageId}/predictions/accept`, { method: "POST", body: JSON.stringify(body) });
     state.pred.pending[imageId] = result.predictions.length;
     state.canUndo = true;
     state.canRedo = false;
@@ -281,7 +281,7 @@ export async function rejectPredictions(predictionIds) {
   const imageId = state.detail.id;
   const request = deps.editorRequest();
   try {
-    const result = await api(`/api/v1/images/${imageId}/predictions/reject`, { method: "POST", body: JSON.stringify({ prediction_ids: predictionIds }) });
+    const result = await api(`/images/${imageId}/predictions/reject`, { method: "POST", body: JSON.stringify({ prediction_ids: predictionIds }) });
     state.pred.pending[imageId] = result.predictions.length;
     if (request === deps.editorRequest() && state.detail?.id === imageId) {
       state.pred.items = result.predictions;

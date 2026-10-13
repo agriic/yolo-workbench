@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Projects · YOLO Workbench</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%230c7a63' stroke-width='2.4' stroke-linecap='round'%3E%3Crect x='4' y='4' width='16' height='16' rx='2'/%3E%3Crect x='9' y='9' width='11' height='11' rx='1.4' fill='%230c7a63' stroke='none' opacity='.35'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script>
+    if (localStorage.getItem("theme") === "dark") document.documentElement.dataset.theme = "dark";
+  </script>
+</head>
+<body class="projects-page">
+  <header>
+    <div class="brand">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="11" height="11" rx="1.4" fill="currentColor" stroke="none" opacity=".3"/></svg>
+      <strong>YOLO Workbench</strong>
+      <span id="projects-root" class="dataset-chip"></span>
+    </div>
+    <button id="theme-toggle" class="icon-btn header-end" title="Toggle dark mode" aria-label="Toggle dark mode">
+      <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+    </button>
+  </header>
+
+  <main class="projects-main">
+    <div class="section-title">
+      <div><h1>Projects</h1><p class="section-subtitle">Each project is one YOLO dataset. Only one project is open at a time.</p></div>
+      <button id="new-project" class="primary-btn">New project</button>
+    </div>
+    <div id="projects-message" class="banner" role="status" hidden></div>
+    <div id="project-grid" class="project-grid"><p class="empty">Loading…</p></div>
+
+    <section id="unmanaged-section" hidden>
+      <h2 class="subsection-title">Datasets without a project</h2>
+      <p class="section-subtitle">These folders look like datasets. Adopt one to open it as a project; nothing is moved or rewritten.</p>
+      <div id="unmanaged-list" class="plain-list"></div>
+    </section>
+
+    <details id="trash-section" class="trash-section" hidden>
+      <summary>Trash <span id="trash-count" class="badge"></span></summary>
+      <p class="section-subtitle">Deleted projects stay in <code>.trash</code> inside the projects folder until you delete them permanently.</p>
+      <div id="trash-list" class="plain-list"></div>
+    </details>
+  </main>
+
+  <dialog id="project-dialog" class="modal">
+    <form method="dialog" id="project-form">
+      <h2 id="project-dialog-title">New project</h2>
+      <label class="field">Name<input name="name" required maxlength="120" autocomplete="off"></label>
+      <div class="field" id="category-field"><span>Category</span>
+        <div class="segmented" role="radiogroup">
+          <label><input type="radio" name="category" value="detection" checked><span>Detection</span></label>
+          <label><input type="radio" name="category" value="segmentation"><span>Segmentation</span></label>
+          <label><input type="radio" name="category" value="classification"><span>Classification</span></label>
+        </div>
+      </div>
+      <label class="field" id="classes-field"><span>Classes <span class="muted">— one per line; you can change them later</span></span><textarea name="classes" rows="5" spellcheck="false"></textarea></label>
+      <label class="field">Description<textarea name="description" rows="2"></textarea></label>
+      <p id="project-dialog-error" class="warn-text" hidden></p>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button value="confirm" id="project-dialog-confirm" class="primary-btn">Create</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="adopt-dialog" class="modal">
+    <form method="dialog" id="adopt-form">
+      <h2>Adopt <span id="adopt-slug"></span></h2>
+      <label class="field">Name<input name="name" autocomplete="off"></label>
+      <label class="field">Category<select name="category">
+        <option value="detection">Detection</option>
+        <option value="segmentation">Segmentation</option>
+        <option value="classification">Classification</option>
+      </select></label>
+      <p class="modal-text muted">A <code>project.json</code> is added to the folder. Classification folders without a YAML also get a <code>data.yaml</code>.</p>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button value="confirm" class="primary-btn">Adopt</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status"></div>
+  <script type="module" src="/projects.js"></script>
+</body>
+</html>

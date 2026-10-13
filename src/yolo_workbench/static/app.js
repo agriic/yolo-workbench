@@ -1,4 +1,4 @@
-import { $, api, esc, debounce, classColor } from "./api.js";
+import { $, api, apiUrl, setApiBase, esc, debounce, classColor } from "./api.js";
 import { state } from "./state.js";
 import { VirtualGallery } from "./grid.js";
 import {
@@ -19,6 +19,7 @@ import {
   embedPointerUp, embedWheel, refreshEmbeddings, reclassifyEmbedObject,
   renderEmbeddings, renderEmbedSelection, resetEmbedView, setEmbedMode,
 } from "./embeddings.js";
+import { bindManage, configureManage, loadClasses, renderManageMeta } from "./manage.js";
 
 export let imageGallery = null;
 let objectGallery = null;
@@ -39,25 +40,127 @@ export function classOptions(selectedId) {
 }
 
 async function init() {
-  state.meta = await api("/api/v1/dataset");
-  document.body.classList.toggle("classification", state.meta.category === "classification");
-  const yamlName = state.meta.yaml.split("/").slice(-2).join("/");
-  $("dataset-name").textContent = `${yamlName} · ${state.meta.category}`;
-  $("dataset-name").title = state.meta.yaml;
-  for (const select of [$("image-class"), $("object-class"), $("draw-class"), $("bulk-class")])
-    for (const [id, name] of Object.entries(state.meta.names))
-      select.insertAdjacentHTML("beforeend", `<option value="${esc(id)}">${esc(id)} · ${esc(name)}</option>`);
-  for (const select of [$("image-split"), $("object-split"), $("embed-split")])
-    for (const split of Object.keys(state.meta.split_counts))
-      select.insertAdjacentHTML("beforeend", `<option>${esc(split)}</option>`);
-  $("embed-classes").innerHTML = Object.entries(state.meta.names).map(([id, name]) =>
-    `<button class="class-chip" data-class="${esc(id)}" style="--c:${classColor(+id)}">${esc(name)}</button>`).join("");
+  const info = await api("/api/v1/app");
+  state.mode = info.mode;
+  if (info.mode === "projects") {
+    const slug = new URLSearchParams(location.search).get("project");
+    if (!slug) { location.replace("/projects.html"); return; }
+    state.project = slug;
+    setApiBase(`/api/v1/projects/${encodeURIComponent(slug)}`);
+  }
+  try {
+    state.meta = await api("/dataset");
+  } catch (error) {
+    if (state.mode === "projects") {
+      // a deleted or busy project: go back to the list, which explains what is open
+      sessionStorage.setItem("projects-message", error.message);
+      location.replace("/projects.html");
+      return;
+    }
+    throw error;
+  }
+  state.canUndo = state.meta.can_undo;
+  state.canRedo = state.meta.can_redo;
+  renderMetaControls();
   renderShortcuts();
   setupVirtualGalleries();
   bind();
+  bindManage();
   updateHistoryButtons();
   watchIndexing();
+  if (state.mode === "projects") renderProjectSwitch();
+  if (!state.meta.image_count && state.meta.capabilities.image_ops) showTab("dataset");
   await Promise.all([loadImages(), loadObjects(), loadIssues(), refreshPredictor()]);
+}
+
+// Fill every class/split control from state.meta; safe to call again after a class change.
+function renderMetaControls() {
+  const meta = state.meta;
+  document.body.classList.toggle("classification", meta.category === "classification");
+  document.body.classList.toggle("image-ops", !!meta.capabilities.image_ops);
+  if (state.mode !== "projects") {
+    const yamlName = meta.yaml.split("/").slice(-2).join("/");
+    $("dataset-name").textContent = `${yamlName} · ${meta.category}`;
+    $("dataset-name").title = meta.yaml;
+  } else {
+    $("dataset-name").hidden = true;
+    $("project-category").textContent = meta.category;
+    document.title = `${meta.project?.name ?? "Project"} · YOLO Workbench`;
+  }
+  const names = Object.entries(meta.names);
+  for (const [id, keepAll] of [["image-class", true], ["object-class", false], ["draw-class", false], ["bulk-class", false]]) {
+    const select = $(id);
+    const previous = select.selectedOptions[0]?.dataset.name;
+    select.innerHTML = (keepAll ? `<option value="">All classes</option>` : "") + names.map(([classId, name]) =>
+      `<option value="${esc(classId)}" data-name="${esc(name)}">${esc(classId)} · ${esc(name)}</option>`).join("");
+    // keep the same class selected by name: ids may have been renumbered
+    const match = [...select.options].find(option => option.dataset.name === previous);
+    if (match) select.value = match.value;
+  }
+  const splits = [...new Set([...Object.keys(meta.split_counts), ...meta.capabilities.splits])];
+  for (const id of ["image-split", "object-split", "embed-split"]) {
+    const select = $(id);
+    const previous = select.value;
+    select.innerHTML = `<option value="all">All splits</option>` + Object.keys(meta.split_counts).map(split => `<option>${esc(split)}</option>`).join("");
+    select.value = [...select.options].some(option => option.value === previous) ? previous : "all";
+  }
+  $("image-move-split").innerHTML = meta.capabilities.splits.map(split => `<option>${esc(split)}</option>`).join("");
+  $("embed-classes").innerHTML = names.map(([id, name]) =>
+    `<button class="class-chip ${state.embed.classes.has(+id) ? "active" : ""}" data-class="${esc(id)}" style="--c:${classColor(+id)}">${esc(name)}</button>`).join("");
+  if (imageGallery) imageGallery.emptyMessage = imageEmptyMessage();
+  renderManageMeta();
+}
+
+const imageEmptyMessage = () => state.meta.image_count
+  ? "No images match the current filters."
+  : state.meta.capabilities.image_ops ? "No images yet — import some in the Dataset tab." : "This dataset has no images.";
+
+async function renderProjectSwitch() {
+  $("project-switch").hidden = false;
+  const select = $("project-select");
+  const current = state.meta.project;
+  select.innerHTML = `<option value="${esc(state.project)}">${esc(current?.name ?? state.project)}</option>`;
+  select.onchange = () => { location.href = `/?project=${encodeURIComponent(select.value)}`; };
+  try {
+    const { projects } = await api("/api/v1/projects");
+    select.innerHTML = projects.map(project =>
+      `<option value="${esc(project.slug)}" ${project.slug === state.project ? "selected" : ""}>${esc(project.name)}</option>`).join("");
+  } catch { /* the switcher is a convenience; the projects link still works */ }
+}
+
+async function refreshMeta() {
+  state.meta = { ...state.meta, ...(await api("/dataset")) };
+  renderMetaControls();
+}
+
+// Something changed beyond one image (class schema, import, image delete/move, undo of those):
+// refresh metadata and every view that caches classes, splits, or images.
+export async function datasetChanged({ schema = false } = {}) {
+  if (schema && $("editor").open) $("editor").close();
+  if (schema) {
+    state.embed.classes.clear();
+    state.embed.selection = [];
+    clearObjectSelection();
+  }
+  clearImageSelection();
+  try { await refreshMeta(); } catch (error) { toast(error.message, "error"); }
+  statisticsChanged();
+  updateHistoryButtons();
+  const tasks = [loadImages({ reset: schema }), loadObjects({ reset: schema }), loadIssues(), refreshPredictor()];
+  if ($("dataset").classList.contains("active")) tasks.push(loadClasses());
+  if ($("embeddings").classList.contains("active")) tasks.push(refreshEmbeddings());
+  await Promise.all(tasks.map(task => Promise.resolve(task).catch(error => toast(error.message, "error"))));
+}
+
+function showTab(tab) {
+  document.querySelectorAll(".tab,.view").forEach(el => el.classList.remove("active"));
+  document.querySelector(`.tab[data-tab="${tab}"]`).classList.add("active");
+  $(tab).classList.add("active");
+  if (tab === "annotation") imageGallery?.refreshLayout();
+  if (tab === "exploration") objectGallery?.refreshLayout();
+  if (tab === "embeddings") refreshEmbeddings();
+  if (tab === "statistics") loadStatistics();
+  if (tab === "dataset") loadClasses();
 }
 
 function watchIndexing() {
@@ -66,8 +169,9 @@ function watchIndexing() {
   if (!idx || idx.done >= idx.total) { el.hidden = true; return; }
   el.hidden = false;
   el.textContent = `Indexing ${idx.done}/${idx.total}…`;
-  setTimeout(async () => {
-    try { state.meta = { ...state.meta, ...(await api("/api/v1/dataset")) }; } catch { /* retry on next tick */ }
+  clearTimeout(watchIndexing.timer);
+  watchIndexing.timer = setTimeout(async () => {
+    try { state.meta = { ...state.meta, ...(await api("/dataset")) }; } catch { /* retry on next tick */ }
     watchIndexing();
   }, 1000);
 }
@@ -103,18 +207,11 @@ function renderShortcuts() {
 }
 
 function bind() {
-  document.querySelectorAll(".tab").forEach(button => button.onclick = () => {
-    document.querySelectorAll(".tab,.view").forEach(el => el.classList.remove("active"));
-    button.classList.add("active");
-    $(button.dataset.tab).classList.add("active");
-    if (button.dataset.tab === "annotation") imageGallery.refreshLayout();
-    if (button.dataset.tab === "exploration") objectGallery.refreshLayout();
-    if (button.dataset.tab === "embeddings") refreshEmbeddings();
-    if (button.dataset.tab === "statistics") loadStatistics();
-  });
+  document.querySelectorAll(".tab").forEach(button => button.onclick = () => showTab(button.dataset.tab));
   [$("image-split"), $("image-class"), $("filter-predictions")].forEach(el => el.onchange = () => loadImages({ reset: true }));
   $("show-overlays").onchange = () => loadImages();
   $("image-search").oninput = debounce(() => loadImages({ reset: true }), 250);
+  [$("label-min"), $("label-max")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
   [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects({ reset: true }); });
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
   $("bulk-delete").onclick = () => {
@@ -157,7 +254,7 @@ function bind() {
     const select = e.target.closest("[data-model-class]");
     if (!select) return;
     try {
-      applyPredictorState(await api("/api/v1/predictor/mapping", {
+      applyPredictorState(await api("/predictor/mapping", {
         method: "PUT",
         body: JSON.stringify({ mapping: { [select.dataset.modelClass]: select.value === "" ? null : +select.value } }),
       }));
@@ -219,9 +316,14 @@ function bind() {
   new ResizeObserver(() => { if ($("embeddings").classList.contains("active")) renderEmbeddings(); }).observe($("embed-wrap"));
 
   $("image-grid").addEventListener("click", e => {
+    const check = e.target.closest(".card-check");
+    if (check) return handleImageCheck(check, e.shiftKey);
     const card = e.target.closest("[data-image]");
     if (card) openEditor(card.dataset.image, null, +card.dataset.index);
   });
+  $("image-move").onclick = () => runImageBulk("move");
+  $("image-delete").onclick = () => runImageBulk("delete");
+  $("image-select-clear").onclick = clearImageSelection;
   $("image-grid").addEventListener("keydown", e => {
     const card = e.target.closest("[data-image]");
     if (card && e.key === "Enter") openEditor(card.dataset.image, null, +card.dataset.index);
@@ -252,7 +354,7 @@ function bind() {
     const fix = e.target.closest("[data-fix]");
     if (!fix) return;
     try {
-      await api(`/api/v1/issues/${fix.dataset.fix}/fix`, { method: "POST" });
+      await api(`/issues/${fix.dataset.fix}/fix`, { method: "POST" });
       state.canUndo = true; state.canRedo = false; updateHistoryButtons();
       statisticsChanged();
       toast("Issue fixed");
@@ -370,9 +472,10 @@ function setupVirtualGalleries() {
     railId: "image-scroll-labels",
     errorId: "image-load-error",
     noun: "Images",
-    emptyMessage: "No images match the current filters.",
+    emptyMessage: imageEmptyMessage(),
     fetchPage: fetchImagePage,
     renderCard: renderImageCard,
+    isPinned: item => state.imageSelection.has(item.id),
     onUpdate: total => {
       $("image-total").textContent = `${total.toLocaleString()} image${total === 1 ? "" : "s"}`;
       updateNavButtons();
@@ -396,13 +499,20 @@ function fetchImagePage(offset, limit, signal) {
   const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value, limit: String(limit), offset: String(offset) });
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   if ($("filter-predictions").checked) params.set("has_predictions", "true");
-  return api(`/api/v1/images?${params}`, { signal });
+  if (state.meta.category !== "classification") {
+    for (const [id, key] of [["label-min", "min_labels"], ["label-max", "max_labels"]]) {
+      const value = $(id).value.trim();
+      if (/^\d+$/.test(value)) params.set(key, value);
+    }
+  }
+  return api(`/images?${params}`, { signal });
 }
 
 function fetchObjectPage(offset, limit, signal) {
   const classId = $("object-class").value || Object.keys(state.meta.names)[0];
+  if (classId === undefined) return Promise.resolve({ total: 0, items: [] });
   const params = new URLSearchParams({ class_id: classId, split: $("object-split").value, limit: String(limit), offset: String(offset) });
-  return api(`/api/v1/objects?${params}`, { signal });
+  return api(`/objects?${params}`, { signal });
 }
 
 export async function loadImages(options = {}) {
@@ -439,8 +549,10 @@ function renderImageCard(item, index) {
   const chips = item.classes.slice(0, 3).map(id =>
     `<span class="chip" style="--c:${classColor(id)}">${esc(state.meta.names[id] ?? `class ${id}`)}</span>`).join("");
   const more = item.classes.length > 3 ? `<span class="chip">+${item.classes.length - 3}</span>` : "";
-  return `<article class="card" data-image="${item.id}" data-index="${index}" tabindex="0">
-      <div class="thumb"><img loading="lazy" src="/api/v1/images/${item.id}/thumbnail?size=320${overlay}" alt="">
+  const selectable = state.meta.capabilities.image_ops;
+  return `<article class="card ${state.imageSelection.has(item.id) ? "selected" : ""}" data-image="${item.id}" data-index="${index}" tabindex="0">
+      <div class="thumb"><img loading="lazy" src="${apiUrl(`/images/${item.id}/thumbnail?size=320${overlay}`)}" alt="">
+        ${selectable ? `<input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for range)" aria-label="Select ${esc(item.name)}" ${state.imageSelection.has(item.id) ? "checked" : ""}>` : ""}
         ${item.issue_count ? `<span class="issue-flag">${item.issue_count} ⚠</span>` : ""}
         ${state.pred.pending[item.id] ? `<span class="pred-flag" title="Pending predictions">${state.pred.pending[item.id]} ✨</span>` : ""}</div>
       <div class="card-body">
@@ -449,6 +561,61 @@ function renderImageCard(item, index) {
         <div class="chips">${chips}${more}</div>
       </div>
     </article>`;
+}
+
+async function handleImageCheck(check, shiftKey) {
+  if (state.imageSelectionBusy) return imageGallery.render();
+  const index = +check.dataset.index;
+  const on = check.checked;
+  const start = shiftKey && state.lastImageIndex != null ? Math.min(index, state.lastImageIndex) : index;
+  const end = shiftKey && state.lastImageIndex != null ? Math.max(index, state.lastImageIndex) + 1 : index + 1;
+  state.imageSelectionBusy = end - start > 1;
+  renderImageBulkBar();
+  try {
+    const items = await imageGallery.ensureRange(start, end);
+    if (items.length !== end - start) throw new Error("Could not load the complete selection range");
+    for (const item of items) on ? state.imageSelection.set(item.id, item) : state.imageSelection.delete(item.id);
+    state.lastImageIndex = index;
+  } catch (error) {
+    if (error.name !== "AbortError") toast(error.message, "error");
+  } finally {
+    state.imageSelectionBusy = false;
+    imageGallery.render();
+    renderImageBulkBar();
+  }
+}
+
+function renderImageBulkBar() {
+  const count = state.imageSelection.size;
+  $("image-bulk").hidden = !count && !state.imageSelectionBusy;
+  $("image-selected-count").textContent = state.imageSelectionBusy ? "Selecting range…" : `${count} selected`;
+  $("image-bulk").querySelectorAll("button,select").forEach(control => control.disabled = state.imageSelectionBusy);
+}
+
+function clearImageSelection() {
+  state.imageSelection.clear();
+  state.lastImageIndex = null;
+  renderImageBulkBar();
+  imageGallery?.render();
+}
+
+async function runImageBulk(action) {
+  const image_ids = [...state.imageSelection.keys()];
+  if (!image_ids.length) return;
+  const count = `${image_ids.length} image${image_ids.length === 1 ? "" : "s"}`;
+  if (action === "delete" && !confirm(`Delete ${count}? They are moved to the dataset trash with their labels; Ctrl+Z undoes.`)) return;
+  try {
+    const split = $("image-move-split").value;
+    const result = action === "delete"
+      ? await api("/images/delete", { method: "POST", body: JSON.stringify({ image_ids }) })
+      : await api("/images/move", { method: "POST", body: JSON.stringify({ image_ids, split }) });
+    state.canUndo = result.can_undo;
+    state.canRedo = result.can_redo;
+    toast(action === "delete" ? `Deleted ${count} — Ctrl+Z undoes` : `Moved ${result.moved} to ${split}${result.skipped ? ` · ${result.skipped} already there` : ""} — Ctrl+Z undoes`);
+    await datasetChanged();
+  } catch (error) {
+    toast(error.message, "error");
+  }
 }
 
 /* ---------- exploration ---------- */
@@ -465,7 +632,7 @@ function renderObjectCard(item, index) {
   const padding = $("crop-padding").value;
   return `<article class="card object-card">
       <div class="thumb">
-        <img loading="lazy" src="/api/v1/objects/${item.image_id}/${encodeURIComponent(item.id)}/crop?padding=${padding}" alt="">
+        <img loading="lazy" src="${apiUrl(`/objects/${item.image_id}/${encodeURIComponent(item.id)}/crop?padding=${padding}`)}" alt="">
         <input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for range)" ${state.objectSelection.has(objectKey(item)) ? "checked" : ""}>
         <span class="class-tag" style="background:${classColor(item.class_id)}">${esc(state.meta.names[item.class_id] ?? `class ${item.class_id}`)}</span>
       </div>
@@ -530,7 +697,7 @@ async function runObjectBulk(action, classId = null) {
     ({ image_id: item.image_id, annotation_id: item.id, action, class_id: classId }));
   if (!operations.length) return;
   try {
-    const result = await api("/api/v1/objects/bulk", { method: "POST", body: JSON.stringify({ operations }) });
+    const result = await api("/objects/bulk", { method: "POST", body: JSON.stringify({ operations }) });
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
@@ -546,10 +713,10 @@ async function runObjectBulk(action, classId = null) {
 
 export async function editObject(imageId, id, change) {
   try {
-    const detail = await api(`/api/v1/images/${imageId}`);
+    const detail = await api(`/images/${imageId}`);
     if (change) change(detail.annotations.find(a => a.id === id));
     else detail.annotations = detail.annotations.filter(a => a.id !== id);
-    await api(`/api/v1/images/${imageId}/annotations`, {
+    await api(`/images/${imageId}/annotations`, {
       method: "PUT",
       body: JSON.stringify({ revision: detail.revision, annotations: detail.annotations }),
     });
@@ -571,7 +738,7 @@ async function loadStatistics() {
   $("statistics-loading").hidden = false;
   $("statistics-content").hidden = true;
   try {
-    const data = await api("/api/v1/statistics");
+    const data = await api("/statistics");
     if (request !== statisticsRequest) return;
     state.statistics = data;
     renderStatistics();
@@ -667,7 +834,7 @@ export function statisticsChanged() {
 
 export async function loadIssues() {
   if (!state.meta) return;
-  const data = await api("/api/v1/issues");
+  const data = await api("/issues");
   state.issues = data.items;
   $("issue-count").textContent = data.items.length || "";
   renderIssues();
@@ -703,7 +870,7 @@ function renderIssues() {
 async function fixAllIssues(kind, count) {
   if (!confirm(`Fix all ${count} ${kind.replaceAll("_", " ")} issue${count === 1 ? "" : "s"}? Ctrl+Z undoes the whole batch.`)) return;
   try {
-    const result = await api("/api/v1/issues/fix-bulk", { method: "POST", body: JSON.stringify({ kind }) });
+    const result = await api("/issues/fix-bulk", { method: "POST", body: JSON.stringify({ kind }) });
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
@@ -719,6 +886,7 @@ async function fixAllIssues(kind, count) {
 configureCanvas({
   acceptPredictions,
   classOptions,
+  datasetChanged,
   drawPredictions,
   hitPrediction,
   imageGallery: () => imageGallery,
@@ -748,5 +916,6 @@ configurePredictor({
   updateHistoryButtons,
 });
 configureEmbeddings({ classOptions, editObject, toast });
+configureManage({ datasetChanged, toast });
 
 init().catch(error => toast(error.message, "error"));

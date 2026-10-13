@@ -5,7 +5,7 @@ import math
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -13,11 +13,14 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
 
+from . import classes, importer
 from .dataset import Dataset, DatasetError, WriteConflict
-from .embeddings import EmbeddingsManager
+from .jobs import JobManager
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 from .predictor import PredictorManager
+from .session import DatasetSession
+from .workspace import Workspace
 
 # Keep in sync with PALETTE in static/api.js so server-rendered overlays match the editor.
 PALETTE = ("#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4", "#84cc16", "#a855f7", "#64748b")
@@ -84,15 +87,76 @@ class PredictionRejectPayload(BaseModel):
     prediction_ids: list[str] | None = None
 
 
-def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None) -> FastAPI:
-    app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0")
-    app.state.dataset = dataset
-    embeddings = EmbeddingsManager(dataset)
-    app.state.embeddings = embeddings
-    predictor = predictor or PredictorManager(dataset)
-    app.state.predictor = predictor
-    cache = media_cache or MediaCache()
-    app.state.media_cache = cache
+class ClassAddPayload(BaseModel):
+    names: list[str]
+
+
+class ClassRenamePayload(BaseModel):
+    name: str
+
+
+class ClassRemovePayload(BaseModel):
+    mode: Literal["delete", "merge"]
+    target_id: int | None = None
+
+
+class ClassMergePayload(BaseModel):
+    source_ids: list[int]
+    target_id: int
+
+
+class ClassReorderPayload(BaseModel):
+    order: list[int]
+
+
+class ImageIdsPayload(BaseModel):
+    image_ids: list[str]
+
+
+class ImageMovePayload(BaseModel):
+    image_ids: list[str]
+    split: Literal["train", "val", "test"]
+
+
+class ImportSourcePayload(BaseModel):
+    path: str | None = None
+    staging_id: str | None = None
+
+
+class ImportCommitPayload(ImportSourcePayload):
+    split_mode: Literal["fixed", "auto", "source"] = "fixed"
+    split: Literal["train", "val", "test"] = "train"
+    ratios: dict[str, float] = Field(default_factory=lambda: {"train": 0.8, "val": 0.2, "test": 0.0})
+    seed: int = 0
+    mapping: dict[str, int | Literal["new"] | None] | None = None
+    skip_duplicates: bool = True
+
+
+class ProjectCreatePayload(BaseModel):
+    name: str
+    category: Literal["detection", "segmentation", "classification"]
+    classes: list[str] = Field(default_factory=list)
+    description: str = ""
+
+
+class ProjectUpdatePayload(BaseModel):
+    name: str | None = None
+    description: str | None = None
+
+
+class ProjectAdoptPayload(BaseModel):
+    category: Literal["detection", "segmentation", "classification"]
+    name: str | None = None
+
+
+MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+CSRF_HEADER = "x-workbench"
+
+
+def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRouter:
+    """Every per-dataset endpoint; mounted at /api/v1 (single mode) or /api/v1/projects/{slug}."""
+    router = APIRouter()
+    current = Depends(get_session)
 
     def label_mtime(record: ImageRecord) -> int:
         try:
@@ -106,6 +170,260 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
         except OSError:
             return 0
 
+    def require_image(session: DatasetSession, image_id: str) -> ImageRecord:
+        try:
+            return session.dataset.require_image(image_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.get("/dataset")
+    def metadata(session: DatasetSession = current):
+        meta = session.dataset.metadata()
+        if session.slug is not None:
+            meta["project"] = session.project
+        return meta
+
+    @router.get("/statistics")
+    def statistics(session: DatasetSession = current):
+        return session.dataset.statistics()
+
+    @router.get("/images")
+    def images(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
+        prediction_ids = session.predictor.pending_image_ids() if has_predictions else None
+        return session.dataset.list_images(split, class_id, search, max(0, offset), limit, prediction_ids, min_labels, max_labels)
+
+    @router.post("/images/delete")
+    def delete_images(payload: ImageIdsPayload, session: DatasetSession = current):
+        try:
+            return session.dataset.delete_images(payload.image_ids)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.post("/images/move")
+    def move_images(payload: ImageMovePayload, session: DatasetSession = current):
+        try:
+            return session.dataset.move_images(payload.image_ids, payload.split)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.get("/images/{image_id}")
+    def image_detail(image_id: str, session: DatasetSession = current):
+        try:
+            return session.dataset.detail(image_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.get("/images/{image_id}/file")
+    def image_file(image_id: str, session: DatasetSession = current):
+        return FileResponse(require_image(session, image_id).path)
+
+    @router.get("/images/{image_id}/thumbnail")
+    def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False, session: DatasetSession = current):
+        record = require_image(session, image_id)
+        category = session.dataset.category
+        key = cache.key("thumbnail", record.path, image_mtime(record), size, annotated, label_mtime(record) if annotated else 0, PALETTE_VERSION)
+        if request.headers.get("if-none-match") == f'"{key}"':
+            return Response(status_code=304)
+        content = cache.get_or_render(key, lambda: render_thumbnail(record, size, category if annotated else None))
+        return jpeg_response(content, etag=key)
+
+    @router.put("/images/{image_id}/annotations")
+    def update_annotations(image_id: str, payload: AnnotationListPayload, session: DatasetSession = current):
+        try:
+            return session.dataset.replace_annotations(
+                image_id,
+                [annotation.model_dump() for annotation in payload.annotations],
+                expected_revision=payload.revision,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.get("/objects")
+    def objects(class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
+        return session.dataset.list_objects(class_id, split, max(0, offset), limit)
+
+    @router.get("/objects/{image_id}/{annotation_id:path}/crop")
+    def object_crop(request: Request, image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1), session: DatasetSession = current):
+        record = require_image(session, image_id)
+        annotation = next((item for item in record.annotations if item.id == annotation_id), None)
+        if not annotation:
+            raise HTTPException(404, "Annotation not found")
+        category = session.dataset.category
+        key = cache.key("crop", record.path, image_mtime(record), annotation.class_id, annotation.points, padding, PALETTE_VERSION)
+        if request.headers.get("if-none-match") == f'"{key}"':
+            return Response(status_code=304)
+        content = cache.get_or_render(key, lambda: render_crop(record, annotation, category, padding))
+        return jpeg_response(content, etag=key)
+
+    @router.get("/issues")
+    def issues(session: DatasetSession = current):
+        return {"items": session.dataset.issues()}
+
+    @router.post("/issues/fix-bulk")
+    def fix_issues_bulk(payload: BulkFixPayload, session: DatasetSession = current):
+        return session.dataset.fix_issues_bulk(payload.kind, payload.split, payload.issue_ids)
+
+    @router.post("/issues/{issue_id}/fix")
+    def fix_issue(issue_id: str, session: DatasetSession = current):
+        return session.dataset.fix_issue(issue_id)
+
+    @router.post("/objects/bulk")
+    def bulk_objects(payload: BulkObjectPayload, session: DatasetSession = current):
+        return session.dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations])
+
+    # ---------- classes ----------
+
+    @router.get("/classes")
+    def class_list(session: DatasetSession = current):
+        return classes.class_summary(session.dataset)
+
+    @router.post("/classes")
+    def class_add(payload: ClassAddPayload, session: DatasetSession = current):
+        return classes.add_classes(session.dataset, payload.names)
+
+    @router.patch("/classes/{class_id}")
+    def class_rename(class_id: int, payload: ClassRenamePayload, session: DatasetSession = current):
+        return classes.rename_class(session.dataset, class_id, payload.name)
+
+    @router.post("/classes/merge")
+    def class_merge(payload: ClassMergePayload, session: DatasetSession = current):
+        return classes.merge_classes(session.dataset, payload.source_ids, payload.target_id)
+
+    @router.post("/classes/reorder")
+    def class_reorder(payload: ClassReorderPayload, session: DatasetSession = current):
+        return classes.reorder_classes(session.dataset, payload.order)
+
+    @router.post("/classes/{class_id}/remove")
+    def class_remove(class_id: int, payload: ClassRemovePayload, session: DatasetSession = current):
+        return classes.remove_class(session.dataset, class_id, payload.mode, payload.target_id)
+
+    @router.post("/rescan")
+    def rescan(session: DatasetSession = current):
+        return session.dataset.rescan()
+
+    # ---------- import ----------
+
+    def require_import(session: DatasetSession) -> None:
+        if not session.dataset.capabilities()["image_ops"]:
+            raise DatasetError("This dataset's splits are not plain image folders, so images cannot be imported into it")
+
+    @router.post("/import/staging")
+    def staging_create(session: DatasetSession = current):
+        require_import(session)
+        return importer.create_staging(session.dataset)
+
+    @router.put("/import/staging/{staging_id}/files")
+    async def staging_upload(request: Request, staging_id: str, path: str, session: DatasetSession = current):
+        content = await request.body()
+        return importer.write_staged_file(session.dataset, staging_id, path, content)
+
+    @router.delete("/import/staging/{staging_id}")
+    def staging_discard(staging_id: str, session: DatasetSession = current):
+        importer.discard_staging(session.dataset, staging_id)
+        return {"discarded": staging_id}
+
+    @router.post("/import/scan")
+    def import_scan(payload: ImportSourcePayload, session: DatasetSession = current):
+        require_import(session)
+        return importer.scan(session.dataset, importer.resolve_source(session.dataset, payload.path, payload.staging_id))
+
+    @router.post("/import/commit")
+    def import_commit(payload: ImportCommitPayload, session: DatasetSession = current):
+        require_import(session)
+        dataset = session.dataset
+        source = importer.resolve_source(dataset, payload.path, payload.staging_id)
+        if jobs.running(session.slug):
+            raise DatasetError("Another import is still running")
+        options = payload.model_dump()
+
+        def work(job):
+            try:
+                return importer.run_import(dataset, source, options, job)
+            finally:
+                if payload.staging_id:
+                    importer.discard_staging(dataset, payload.staging_id)
+
+        return jobs.start("import", session.slug, f"Import into {session.project.get('name', dataset.root.name)}", work)
+
+    # ---------- model-assisted labeling ----------
+
+    @router.get("/predictor")
+    def predictor_state(session: DatasetSession = current):
+        return session.predictor.payload()
+
+    @router.get("/predictor/models")
+    def predictor_models(session: DatasetSession = current):
+        return session.predictor.discover_models()
+
+    @router.post("/predictor/load")
+    def predictor_load(payload: PredictorLoadPayload, session: DatasetSession = current):
+        return session.predictor.load(payload.path, payload.conf, payload.iou)
+
+    @router.put("/predictor/mapping")
+    def predictor_mapping(payload: PredictorMappingPayload, session: DatasetSession = current):
+        return session.predictor.set_mapping(payload.mapping)
+
+    @router.post("/predictor/run")
+    def predictor_run(payload: PredictorRunPayload, session: DatasetSession = current):
+        return session.predictor.run(payload.image_ids, payload.split, payload.only_unlabeled)
+
+    @router.post("/predictor/cancel")
+    def predictor_cancel(session: DatasetSession = current):
+        return session.predictor.cancel()
+
+    @router.post("/predictor/retry")
+    def predictor_retry(session: DatasetSession = current):
+        return session.predictor.retry_failed()
+
+    @router.post("/images/{image_id}/predictions/compute")
+    def compute_predictions(image_id: str, session: DatasetSession = current):
+        try:
+            return session.predictor.predict_image(image_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.get("/images/{image_id}/predictions")
+    def image_predictions(image_id: str, session: DatasetSession = current):
+        try:
+            return session.predictor.predictions_for(image_id)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.post("/images/{image_id}/predictions/accept")
+    def accept_predictions(image_id: str, payload: PredictionAcceptPayload, session: DatasetSession = current):
+        try:
+            return session.predictor.accept(image_id, payload.prediction_ids, payload.min_confidence)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.post("/images/{image_id}/predictions/reject")
+    def reject_predictions(image_id: str, payload: PredictionRejectPayload, session: DatasetSession = current):
+        try:
+            return session.predictor.reject(image_id, payload.prediction_ids)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @router.get("/embeddings")
+    def embeddings_state(session: DatasetSession = current):
+        return session.embeddings.payload()
+
+    @router.post("/embeddings/compute")
+    def embeddings_compute(session: DatasetSession = current):
+        return session.embeddings.start()
+
+    @router.post("/history/{direction}")
+    def history(direction: str, session: DatasetSession = current):
+        if direction not in {"undo", "redo"}:
+            raise HTTPException(400, "Direction must be undo or redo")
+        return session.dataset.history(direction)
+
+    return router
+
+
+def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, require_header: bool) -> FastAPI:
+    app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0")
+    app.state.jobs = jobs
+
     @app.exception_handler(DatasetError)
     async def dataset_error(_, exc: DatasetError):
         return Response(content=f'{{"detail": {json_string(str(exc))}}}', status_code=400, media_type="application/json")
@@ -118,171 +436,126 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     async def validation_error(_, exc: RequestValidationError):
         return JSONResponse(status_code=422, content={"detail": json_safe(jsonable_encoder(exc.errors()))})
 
-    @app.get("/api/v1/dataset")
-    def metadata():
-        return dataset.metadata()
+    @app.get("/api/v1/app")
+    def app_info():
+        return {"mode": mode, "version": app.version}
 
-    @app.get("/api/v1/statistics")
-    def statistics():
-        return dataset.statistics()
+    @app.get("/api/v1/jobs")
+    def job_list(project: str | None = None):
+        return {"items": jobs.list(project)}
 
-    @app.get("/api/v1/images")
-    def images(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, offset: int = 0, limit: int = Query(100, ge=1, le=500)):
-        prediction_ids = predictor.pending_image_ids() if has_predictions else None
-        return dataset.list_images(split, class_id, search, max(0, offset), limit, prediction_ids)
-
-    @app.get("/api/v1/images/{image_id}")
-    def image_detail(image_id: str):
+    @app.get("/api/v1/jobs/{job_id}")
+    def job_detail(job_id: str):
         try:
-            return dataset.detail(image_id)
+            return jobs.get(job_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
-    @app.get("/api/v1/images/{image_id}/file")
-    def image_file(image_id: str):
+    @app.post("/api/v1/jobs/{job_id}/cancel")
+    def job_cancel(job_id: str):
         try:
-            return FileResponse(dataset.require_image(image_id).path)
+            return jobs.cancel(job_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
-
-    @app.get("/api/v1/images/{image_id}/thumbnail")
-    def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False):
-        try:
-            record = dataset.require_image(image_id)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-        key = cache.key("thumbnail", record.path, image_mtime(record), size, annotated, label_mtime(record) if annotated else 0, PALETTE_VERSION)
-        if request.headers.get("if-none-match") == f'"{key}"':
-            return Response(status_code=304)
-        content = cache.get_or_render(key, lambda: render_thumbnail(record, size, dataset.category if annotated else None))
-        return jpeg_response(content, etag=key)
-
-    @app.put("/api/v1/images/{image_id}/annotations")
-    def update_annotations(image_id: str, payload: AnnotationListPayload):
-        try:
-            return dataset.replace_annotations(
-                image_id,
-                [annotation.model_dump() for annotation in payload.annotations],
-                expected_revision=payload.revision,
-            )
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-
-    @app.get("/api/v1/objects")
-    def objects(class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500)):
-        return dataset.list_objects(class_id, split, max(0, offset), limit)
-
-    @app.get("/api/v1/objects/{image_id}/{annotation_id:path}/crop")
-    def object_crop(request: Request, image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1)):
-        try:
-            record = dataset.require_image(image_id)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-        annotation = next((item for item in record.annotations if item.id == annotation_id), None)
-        if not annotation:
-            raise HTTPException(404, "Annotation not found")
-        key = cache.key("crop", record.path, image_mtime(record), annotation.class_id, annotation.points, padding, PALETTE_VERSION)
-        if request.headers.get("if-none-match") == f'"{key}"':
-            return Response(status_code=304)
-        content = cache.get_or_render(key, lambda: render_crop(record, annotation, dataset.category, padding))
-        return jpeg_response(content, etag=key)
-
-    @app.get("/api/v1/issues")
-    def issues():
-        return {"items": dataset.issues()}
-
-    @app.post("/api/v1/issues/fix-bulk")
-    def fix_issues_bulk(payload: BulkFixPayload):
-        return dataset.fix_issues_bulk(payload.kind, payload.split, payload.issue_ids)
-
-    @app.post("/api/v1/issues/{issue_id}/fix")
-    def fix_issue(issue_id: str):
-        return dataset.fix_issue(issue_id)
-
-    @app.post("/api/v1/objects/bulk")
-    def bulk_objects(payload: BulkObjectPayload):
-        return dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations])
-
-    @app.get("/api/v1/predictor")
-    def predictor_state():
-        return predictor.payload()
-
-    @app.get("/api/v1/predictor/models")
-    def predictor_models():
-        return predictor.discover_models()
-
-    @app.post("/api/v1/predictor/load")
-    def predictor_load(payload: PredictorLoadPayload):
-        return predictor.load(payload.path, payload.conf, payload.iou)
-
-    @app.put("/api/v1/predictor/mapping")
-    def predictor_mapping(payload: PredictorMappingPayload):
-        return predictor.set_mapping(payload.mapping)
-
-    @app.post("/api/v1/predictor/run")
-    def predictor_run(payload: PredictorRunPayload):
-        return predictor.run(payload.image_ids, payload.split, payload.only_unlabeled)
-
-    @app.post("/api/v1/predictor/cancel")
-    def predictor_cancel():
-        return predictor.cancel()
-
-    @app.post("/api/v1/predictor/retry")
-    def predictor_retry():
-        return predictor.retry_failed()
-
-    @app.post("/api/v1/images/{image_id}/predictions/compute")
-    def compute_predictions(image_id: str):
-        try:
-            return predictor.predict_image(image_id)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-
-    @app.get("/api/v1/images/{image_id}/predictions")
-    def image_predictions(image_id: str):
-        try:
-            return predictor.predictions_for(image_id)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-
-    @app.post("/api/v1/images/{image_id}/predictions/accept")
-    def accept_predictions(image_id: str, payload: PredictionAcceptPayload):
-        try:
-            return predictor.accept(image_id, payload.prediction_ids, payload.min_confidence)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-
-    @app.post("/api/v1/images/{image_id}/predictions/reject")
-    def reject_predictions(image_id: str, payload: PredictionRejectPayload):
-        try:
-            return predictor.reject(image_id, payload.prediction_ids)
-        except KeyError as exc:
-            raise HTTPException(404, str(exc)) from exc
-
-    @app.get("/api/v1/embeddings")
-    def embeddings_state():
-        return embeddings.payload()
-
-    @app.post("/api/v1/embeddings/compute")
-    def embeddings_compute():
-        return embeddings.start()
-
-    @app.post("/api/v1/history/{direction}")
-    def history(direction: str):
-        if direction not in {"undo", "redo"}:
-            raise HTTPException(400, "Direction must be undo or redo")
-        return dataset.history(direction)
 
     @app.middleware("http")
-    async def no_static_cache(request, call_next):
+    async def guard(request: Request, call_next):
+        # The API can write anywhere in the dataset (and the projects folder): refuse requests
+        # that a web page in the same browser could forge (DNS rebinding, cross-site POSTs).
+        if allowed_hosts is not None:
+            host = (request.headers.get("host") or "").rsplit(":", 1)[0] if not (request.headers.get("host") or "").startswith("[") else (request.headers.get("host") or "").split("]")[0] + "]"
+            if host not in allowed_hosts:
+                return JSONResponse(status_code=403, content={"detail": "Host not allowed"})
+        if require_header and request.method in MUTATING_METHODS and request.url.path.startswith("/api/") and request.headers.get(CSRF_HEADER) != "1":
+            return JSONResponse(status_code=403, content={"detail": "Missing X-Workbench header"})
         response = await call_next(request)
         if not request.url.path.startswith("/api/"):
             # the UI ships with the package; stale cached scripts break new endpoints
             response.headers["Cache-Control"] = "no-cache"
         return response
 
+    return app
+
+
+def _mount_static(app: FastAPI) -> None:
     static = Path(__file__).parent / "static"
     app.mount("/", StaticFiles(directory=static, html=True), name="static")
+
+
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None) -> FastAPI:
+    """Single-dataset mode: the dataset API lives directly under /api/v1."""
+    jobs = jobs or JobManager()
+    app = _base_app("single", jobs, allowed_hosts, require_header)
+    session = DatasetSession.open(dataset, predictor)
+    app.state.dataset = dataset
+    app.state.session = session
+    app.state.predictor = session.predictor
+    app.state.embeddings = session.embeddings
+    cache = media_cache or MediaCache()
+    app.state.media_cache = cache
+    app.include_router(dataset_router(lambda: session, cache, jobs), prefix="/api/v1")
+    _mount_static(app)
+    return app
+
+
+def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False) -> FastAPI:
+    """Projects mode: workspace endpoints plus the dataset API under /api/v1/projects/{slug}."""
+    app = _base_app("projects", workspace.jobs, allowed_hosts, require_header)
+    app.state.workspace = workspace
+    cache = media_cache or MediaCache()
+    app.state.media_cache = cache
+
+    def project_session(slug: str) -> DatasetSession:
+        try:
+            return workspace.session(slug)
+        except KeyError as exc:
+            raise HTTPException(404, "Project not found") from exc
+
+    def not_found(call):
+        try:
+            return call()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc.args[0]) if exc.args else "Not found") from exc
+
+    @app.get("/api/v1/projects")
+    def project_list():
+        return workspace.list_projects()
+
+    @app.post("/api/v1/projects")
+    def project_create(payload: ProjectCreatePayload):
+        return workspace.create(payload.name, payload.category, payload.classes, payload.description)
+
+    @app.patch("/api/v1/projects/{slug}")
+    def project_update(slug: str, payload: ProjectUpdatePayload):
+        return not_found(lambda: workspace.update(slug, payload.name, payload.description))
+
+    @app.delete("/api/v1/projects/{slug}")
+    def project_trash(slug: str):
+        return not_found(lambda: workspace.trash(slug))
+
+    @app.post("/api/v1/projects/{slug}/adopt")
+    def project_adopt(slug: str, payload: ProjectAdoptPayload):
+        return not_found(lambda: workspace.adopt(slug, payload.category, payload.name))
+
+    @app.get("/api/v1/projects/{slug}/cover")
+    def project_cover(slug: str):
+        path = not_found(lambda: workspace.cover(slug))
+        return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "no-cache"})
+
+    @app.get("/api/v1/trash")
+    def trash_list():
+        return {"items": workspace.list_trash()}
+
+    @app.post("/api/v1/trash/{entry}/restore")
+    def trash_restore(entry: str):
+        return not_found(lambda: workspace.restore(entry))
+
+    @app.delete("/api/v1/trash/{entry}")
+    def trash_purge(entry: str):
+        return not_found(lambda: workspace.purge(entry))
+
+    app.include_router(dataset_router(project_session, cache, workspace.jobs), prefix="/api/v1/projects/{slug}")
+    _mount_static(app)
     return app
 
 

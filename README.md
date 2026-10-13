@@ -34,6 +34,22 @@ yolo-workbench /path/to/dataset.yaml --category detection
 
 Open `http://127.0.0.1:8765` if the browser does not open automatically. Use `--category segmentation` for polygon datasets and `--no-browser` in headless environments.
 
+### Projects mode
+
+```
+yolo-workbench --projects /path/to/projects
+```
+
+The projects page lists every project in the folder. Each project is one YOLO dataset that the tool creates, with `data.yaml`, `images/`, `labels/` (or `train/<class>/…` for classification), plus `models/` and `runs/` for training later. From the UI you can:
+
+- create, rename, and delete projects (deleted projects go to `<projects>/.trash/` and can be restored);
+- adopt existing dataset folders that are dropped into the projects folder;
+- add, rename, reorder, merge, and remove classes (all of these also work in single-dataset mode);
+- import images by browser upload or from a local folder, with a choice of target split or a seeded random split, and class names mapped from the source's `data.yaml`/`classes.txt`;
+- move images between splits, or delete them into the dataset trash.
+
+Only one project is open at a time. Class changes, image moves, and image deletes are undoable with Ctrl+Z. Imports are logged to `.yolo-workbench/imports.jsonl`.
+
 The application writes edited YOLO labels atomically. Before a label is first changed in a session, its original content is copied below `<dataset>/.yolo-workbench/backups/<session-id>/`.
 
 ## Tests

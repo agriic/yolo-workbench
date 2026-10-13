@@ -1,4 +1,4 @@
-import { $, api, clamp, classColor, esc } from "./api.js";
+import { $, api, apiUrl, clamp, classColor, esc } from "./api.js";
 import { state } from "./state.js";
 let deps;
 
@@ -10,13 +10,13 @@ export function configureEmbeddings(dependencies) {
 
 export async function refreshEmbeddings() {
   try {
-    applyEmbedState(await api("/api/v1/embeddings"));
+    applyEmbedState(await api("/embeddings"));
   } catch (error) { deps.toast(error.message, "error"); }
 }
 
 export async function computeEmbeddings() {
   try {
-    applyEmbedState(await api("/api/v1/embeddings/compute", { method: "POST" }));
+    applyEmbedState(await api("/embeddings/compute", { method: "POST" }));
   } catch (error) { deps.toast(error.message, "error"); }
 }
 
@@ -257,7 +257,7 @@ export function embedPointerMove(e) {
     const tooltip = $("embed-tooltip");
     if (best) {
       tooltip.innerHTML = `
-        <img src="/api/v1/objects/${best.image_id}/${encodeURIComponent(best.annotation_id)}/crop?padding=0.15" alt="">
+        <img src="${apiUrl(`/objects/${best.image_id}/${encodeURIComponent(best.annotation_id)}/crop?padding=0.15`)}" alt="">
         <div><span class="class-tag" style="background:${classColor(best.class_id)}">${esc(state.meta.names[best.class_id] ?? `class ${best.class_id}`)}</span>
         <strong>${esc(best.image_name)}</strong> · ${esc(best.split)}</div>`;
       tooltip.hidden = false;
@@ -369,7 +369,7 @@ export function renderEmbedSelection() {
     : "Drag a box to select points. Shift adds to the selection. Ctrl + drag pans and scrolling zooms.";
   $("embed-selection").innerHTML = selection.map(point => `
     <div class="embed-object">
-      <img loading="lazy" src="/api/v1/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.version || 0}" alt="">
+      <img loading="lazy" src="${apiUrl(`/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.version || 0}`)}" alt="">
       <div class="embed-object-body">
         <div class="name" title="${esc(point.image_name)}">${esc(point.image_name)}</div>
         <div class="meta"><span class="split-badge">${esc(point.split)}</span></div>

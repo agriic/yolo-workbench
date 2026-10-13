@@ -1,6 +1,14 @@
 export const $ = id => document.getElementById(id);
+
+// Dataset endpoints live at /api/v1 (single-dataset mode) or /api/v1/projects/<slug> (projects mode).
+// Paths starting with /api/ are absolute (workspace, jobs); anything else is relative to the dataset base.
+let apiBase = "/api/v1";
+export const setApiBase = base => { apiBase = base; };
+export const apiUrl = path => path.startsWith("/api/") ? path : `${apiBase}${path}`;
 export const api = async (path, options = {}) => {
-  const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  // X-Workbench marks the request as coming from this UI; the server refuses mutating requests without it
+  const headers = { "Content-Type": "application/json", "X-Workbench": "1", ...(options.headers || {}) };
+  const response = await fetch(apiUrl(path), { ...options, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
     throw new Error(body.detail || response.statusText);

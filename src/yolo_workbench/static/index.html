@@ -16,6 +16,11 @@
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="11" height="11" rx="1.4" fill="currentColor" stroke="none" opacity=".3"/></svg>
       <strong>YOLO Workbench</strong>
       <span id="dataset-name" class="dataset-chip"></span>
+      <div id="project-switch" class="project-switch" hidden>
+        <a href="/projects.html" class="icon-btn projects-link" title="All projects" aria-label="All projects"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></a>
+        <select id="project-select" title="Switch project" aria-label="Switch project"></select>
+        <span id="project-category" class="dataset-chip"></span>
+      </div>
       <span id="indexing-status" class="indexing-status" hidden></span>
     </div>
     <nav aria-label="Workspace">
@@ -24,6 +29,7 @@
       <button class="tab" data-tab="statistics">Statistics</button>
       <button class="tab" data-tab="embeddings">Embeddings</button>
       <button class="tab" data-tab="validation">Validation <span id="issue-count" class="badge"></span></button>
+      <button class="tab" data-tab="dataset">Dataset</button>
     </nav>
     <button id="theme-toggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">
       <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -37,6 +43,11 @@
         <div class="toolbar-group filter-controls">
           <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
           <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
+          <div class="field" id="label-count-field" title="Number of labels per image (of the selected class, if one is chosen)">Labels<div class="count-range">
+            <input id="label-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum labels">
+            <span aria-hidden="true">–</span>
+            <input id="label-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum labels">
+          </div></div>
           <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
           <label class="toggle" id="overlay-toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
           <label class="toggle" id="prediction-filter-toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
@@ -60,6 +71,13 @@
           <button id="cancel-predict" class="secondary" hidden>Cancel</button>
           <button id="retry-predict" class="secondary" hidden>Retry failed</button>
           <div id="predictor-status" class="toolbar-status" role="status" aria-live="polite"></div>
+        </div>
+        <div id="image-bulk" class="bulk-bar toolbar-group" hidden>
+          <strong id="image-selected-count"></strong>
+          <select id="image-move-split" title="Target split"></select>
+          <button id="image-move" class="secondary">Move</button>
+          <button id="image-delete" class="danger-btn" title="Move the selected images and their labels to the dataset trash (Ctrl+Z undoes)">Delete</button>
+          <button id="image-select-clear" class="secondary">Clear</button>
         </div>
         <div id="image-total" class="total toolbar-total"></div>
       </div>
@@ -142,7 +160,65 @@
       <div id="issue-summary" class="issue-summary"></div>
       <div id="issues" class="issue-list"></div>
     </section>
+
+    <section id="dataset" class="view">
+      <div class="section-title">
+        <div><h1>Dataset</h1><p class="section-subtitle" id="dataset-path"></p></div>
+        <button id="rescan" class="secondary" title="Pick up images and labels changed on disk">Rescan</button>
+      </div>
+      <div class="manage-grid">
+        <article class="stats-panel manage-panel" id="classes-panel">
+          <div class="panel-head"><h2>Classes <span id="class-count" class="muted"></span></h2></div>
+          <p class="panel-note" id="class-note"></p>
+          <form id="class-add-form" class="inline-form">
+            <input id="class-add-name" type="text" placeholder="New class name — separate several with commas" autocomplete="off" aria-label="New class names">
+            <button type="submit" class="secondary">Add</button>
+          </form>
+          <div id="class-table" class="class-table"></div>
+        </article>
+        <div class="manage-side">
+          <article class="stats-panel manage-panel" id="import-panel">
+            <div class="panel-head"><h2>Import images</h2></div>
+            <div id="import-start">
+              <div id="import-drop" class="dropzone" tabindex="0">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4m0 0-4 4m4-4 4 4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+                <span>Drop images or folders here</span>
+                <span class="dropzone-actions"><button type="button" id="import-pick-files" class="secondary">Choose files</button><button type="button" id="import-pick-folder" class="secondary">Choose folder</button></span>
+                <span class="panel-note">YOLO <code>.txt</code> labels and <code>data.yaml</code>/<code>classes.txt</code> next to the images are picked up too.</span>
+                <input id="import-files" type="file" multiple accept="image/*,.txt,.yaml,.yml,.json" hidden>
+                <input id="import-folder" type="file" webkitdirectory multiple hidden>
+              </div>
+              <form id="import-path-form" class="inline-form">
+                <input id="import-path" type="text" placeholder="…or a folder on this machine, e.g. /data/export" spellcheck="false" autocomplete="off" aria-label="Folder to import">
+                <button type="submit" class="secondary">Scan</button>
+              </form>
+            </div>
+            <div id="import-progress" class="import-progress" hidden>
+              <div class="import-progress-text"><span id="import-progress-label"></span><span id="import-progress-count" class="muted"></span></div>
+              <progress id="import-progress-bar" max="1" value="0"></progress>
+              <button id="import-cancel" class="secondary" type="button">Cancel</button>
+            </div>
+            <div id="import-review" hidden></div>
+          </article>
+          <article class="stats-panel manage-panel" id="splits-panel">
+            <div class="panel-head"><h2>Splits</h2></div>
+            <div id="split-overview"></div>
+          </article>
+        </div>
+      </div>
+    </section>
   </main>
+
+  <dialog id="class-remove-dialog" class="modal">
+    <form method="dialog" id="class-remove-form">
+      <h2 id="class-remove-title"></h2>
+      <p id="class-remove-usage" class="modal-text"></p>
+      <label class="radio-row"><input type="radio" name="remove-mode" value="merge" checked><span><strong>Merge into</strong> <select id="class-remove-target"></select><br><span class="muted" id="class-merge-hint"></span></span></label>
+      <label class="radio-row"><input type="radio" name="remove-mode" value="delete"><span><strong id="class-delete-label">Delete its annotations</strong><br><span class="muted" id="class-delete-hint"></span></span></label>
+      <p class="modal-text muted">Remaining class ids are renumbered. Ctrl+Z undoes the whole change.</p>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button value="confirm" id="class-remove-confirm" class="danger-btn">Remove class</button></div>
+    </form>
+  </dialog>
 
   <dialog id="editor">
     <div class="editor-head">

@@ -28,6 +28,28 @@ def test_loads_colocated_detection_dataset(tmp_path):
     assert dataset.list_images(class_id=1)["total"] == 1
 
 
+
+def test_list_images_filters_by_label_count(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    split = tmp_path / "train"
+    Image.new("RGB", (100, 80), "white").save(split / "empty.jpg")
+    (split / "empty.txt").write_text("")
+    Image.new("RGB", (100, 80), "white").save(split / "many.jpg")
+    (split / "many.txt").write_text("0 0.2 0.2 0.1 0.1\n0 0.5 0.5 0.1 0.1\n1 0.8 0.8 0.1 0.1\n")
+    dataset = Dataset(tmp_path / "dataset.yaml", "detection")
+
+    def names(**kwargs):
+        return sorted(item["name"] for item in dataset.list_images(**kwargs)["items"])
+
+    assert names(max_labels=0) == ["empty.jpg"]
+    assert names(min_labels=1) == ["many.jpg", "sample.jpg"]
+    assert names(min_labels=2, max_labels=3) == ["many.jpg"]
+    assert names(min_labels=4) == []
+    # With a class filter only that class's labels are counted.
+    assert names(class_id=0, min_labels=2) == ["many.jpg"]
+    assert names(class_id=1, max_labels=1) == ["many.jpg", "sample.jpg"]
+    assert dataset.list_images(min_labels=1, limit=1)["total"] == 2
+
 def test_annotation_indexes_and_cached_aggregates_refresh_after_write(tmp_path):
     dataset, _ = make_dataset(tmp_path)
     record = next(iter(dataset.images.values()))

@@ -1,4 +1,4 @@
-import { $, api, clamp, classColor, esc, HANDLE_CURSORS, pointInPolygon } from "./api.js";
+import { $, api, apiUrl, clamp, classColor, esc, HANDLE_CURSORS, pointInPolygon } from "./api.js";
 import { state } from "./state.js";
 let deps;
 
@@ -31,7 +31,7 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   if (request !== editorRequest) return;
   let detail;
   try {
-    detail = await api(`/api/v1/images/${id}`);
+    detail = await api(`/images/${id}`);
   } catch (error) {
     if (request === editorRequest) deps.toast(error.message, "error");
     return;
@@ -64,7 +64,7 @@ export async function openEditor(id, focus = null, gridIndex = null) {
     }
   };
   img.onerror = () => deps.toast("Failed to load image file", "error");
-  img.src = `/api/v1/images/${id}/file?v=${Date.now()}`;
+  img.src = apiUrl(`/images/${id}/file?v=${Date.now()}`);
 }
 
 export async function navigate(step) {
@@ -525,7 +525,7 @@ export async function save(selectIndex = null) {
   const persist = async () => {
     let detail;
     try {
-      detail = await api(`/api/v1/images/${image.id}/annotations`, {
+      detail = await api(`/images/${image.id}/annotations`, {
         method: "PUT",
         body: JSON.stringify({
           revision: savedRevisionByImage.get(image.id) ?? image.revision,
@@ -541,7 +541,7 @@ export async function save(selectIndex = null) {
       deps.toast(error.message, "error");
       if (request === editorRequest && state.detail?.id === image.id && latestSaveByImage.get(image.id) === sequence) {
         try {
-          detail = await api(`/api/v1/images/${image.id}`);
+          detail = await api(`/images/${image.id}`);
           if (request !== editorRequest || state.detail?.id !== image.id || latestSaveByImage.get(image.id) !== sequence) return;
           savedRevisionByImage.set(image.id, detail.revision);
           state.detail = detail;
@@ -579,15 +579,20 @@ export async function applyHistory(direction) {
   if (direction === "undo" ? !state.canUndo : !state.canRedo) return;
   await saveQueue;
   try {
-    const result = await api(`/api/v1/history/${direction}`, { method: "POST" });
+    const result = await api(`/history/${direction}`, { method: "POST" });
     state.canUndo = result.can_undo;
     state.canRedo = result.can_redo;
     updateHistoryButtons();
+    if (result.schema_changed) {
+      // class names or ids changed: every class control and cached view must be rebuilt
+      deps.toast(`${direction === "undo" ? "Undid" : "Redid"} a class change`);
+      return deps.datasetChanged({ schema: true });
+    }
     deps.statisticsChanged();
     const request = editorRequest;
     const imageId = state.detail?.id;
     if (imageId && result.image_ids.includes(imageId)) {
-      const detail = await api(`/api/v1/images/${imageId}`);
+      const detail = await api(`/images/${imageId}`);
       if (request === editorRequest && state.detail?.id === imageId) {
         state.detail = detail;
         savedRevisionByImage.set(imageId, detail.revision);
@@ -596,7 +601,8 @@ export async function applyHistory(direction) {
         render();
       }
     }
-    await Promise.all([deps.loadImages(), deps.loadObjects(), deps.loadIssues()]);
+    // image deletes and split moves are undoable too, so counts and splits may have changed
+    await deps.datasetChanged();
   } catch (error) {
     deps.toast(error.message, "error");
   }

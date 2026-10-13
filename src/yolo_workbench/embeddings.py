@@ -3,6 +3,7 @@ detection/segmentation, whole images for classification."""
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import threading
 
@@ -25,6 +26,7 @@ class EmbeddingsManager:
         self.items: list[dict] | None = None
         self.source_generation: int | None = None
         dataset.add_change_listener(self._annotations_changed)
+        dataset.add_schema_listener(lambda _mapping: self._annotations_changed([], dataset.annotation_generation))
 
     def payload(self) -> dict:
         with self._lock:
@@ -83,7 +85,9 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
     import fiftyone as fo
     import fiftyone.brain as fob
 
-    name = f"yolo-workbench-{dataset.session_id}"
+    # several projects can be opened in one server process; keep their FiftyOne datasets apart
+    root_hash = hashlib.sha1(str(dataset.root).encode()).hexdigest()[:8]
+    name = f"yolo-workbench-{root_hash}-{dataset.session_id}"
     if fo.dataset_exists(name):
         fo.delete_dataset(name)
     ds = fo.Dataset(name)

@@ -114,6 +114,26 @@ class PredictorManager:
         self.predictions: dict[str, list[dict]] = {}  # image_id -> pending predictions
         self.job: dict = self._new_job()
         self._counter = 0
+        dataset.add_schema_listener(self._schema_changed)
+
+    def _schema_changed(self, mapping: dict[int, int | None] | None) -> None:
+        """Follow dataset class renumbering so the mapping and pending predictions stay correct."""
+        with self._lock:
+            names = self.dataset.names
+            if mapping is None:
+                self.mapping = {model_id: target if target in names else None for model_id, target in self.mapping.items()}
+            else:
+                self.mapping = {model_id: None if target is None else mapping.get(target) for model_id, target in self.mapping.items()}
+            if self.backend:
+                # a class added or renamed to match a model class gets mapped automatically
+                taken = {target for target in self.mapping.values() if target is not None}
+                for model_id, target in self._auto_map(self.backend.names).items():
+                    if self.mapping.get(model_id) is None and target is not None and target not in taken:
+                        self.mapping[model_id] = target
+                        taken.add(target)
+            for items in self.predictions.values():
+                for item in items:
+                    item["class_id"] = self.mapping.get(item["model_class_id"])
 
     @staticmethod
     def _new_job(state: str = "idle", total: int = 0) -> dict:
