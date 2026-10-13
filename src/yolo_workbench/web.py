@@ -116,6 +116,12 @@ class ImageIdsPayload(BaseModel):
 class ImageMovePayload(BaseModel):
     image_ids: list[str]
     split: Literal["train", "val", "test"]
+    folder: str | None = None  # one of the split's folders; default: its first
+
+
+class FolderAddPayload(BaseModel):
+    split: Literal["train", "val", "test"]
+    path: str
 
 
 class ImportSourcePayload(BaseModel):
@@ -129,6 +135,7 @@ class ImportCommitPayload(ImportSourcePayload):
     ratios: dict[str, float] = Field(default_factory=lambda: {"train": 0.8, "val": 0.2, "test": 0.0})
     seed: int = 0
     mapping: dict[str, int | Literal["new"] | None] | None = None
+    folders: dict[str, str] | None = None  # split -> target folder (as listed by GET /folders)
     skip_duplicates: bool = True
 
 
@@ -202,7 +209,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRoute
     @router.post("/images/move")
     def move_images(payload: ImageMovePayload, session: DatasetSession = current):
         try:
-            return session.dataset.move_images(payload.image_ids, payload.split)
+            return session.dataset.move_images(payload.image_ids, payload.split, payload.folder)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -296,6 +303,14 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRoute
     @router.post("/classes/{class_id}/remove")
     def class_remove(class_id: int, payload: ClassRemovePayload, session: DatasetSession = current):
         return classes.remove_class(session.dataset, class_id, payload.mode, payload.target_id)
+
+    @router.get("/folders")
+    def folder_list(session: DatasetSession = current):
+        return session.dataset.folders()
+
+    @router.post("/folders")
+    def folder_add(payload: FolderAddPayload, session: DatasetSession = current):
+        return session.dataset.add_folder(payload.split, payload.path)
 
     @router.post("/rescan")
     def rescan(session: DatasetSession = current):

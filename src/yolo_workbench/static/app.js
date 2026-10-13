@@ -104,7 +104,10 @@ function renderMetaControls() {
     select.innerHTML = `<option value="all">All splits</option>` + Object.keys(meta.split_counts).map(split => `<option>${esc(split)}</option>`).join("");
     select.value = [...select.options].some(option => option.value === previous) ? previous : "all";
   }
-  $("image-move-split").innerHTML = meta.capabilities.splits.map(split => `<option>${esc(split)}</option>`).join("");
+  // move targets are split folders; the folder is only spelled out when a split has several
+  const folders = meta.capabilities.folders || {};
+  $("image-move-split").innerHTML = meta.capabilities.splits.map(split => (folders[split] || []).map(folder =>
+    `<option value="${esc(`${split}|${folder}`)}" title="${esc(folder)}">${esc(folders[split].length > 1 ? `${split} · ${folder}` : split)}</option>`).join("")).join("");
   $("embed-classes").innerHTML = names.map(([id, name]) =>
     `<button class="class-chip ${state.embed.classes.has(+id) ? "active" : ""}" data-class="${esc(id)}" style="--c:${classColor(+id)}">${esc(name)}</button>`).join("");
   if (imageGallery) imageGallery.emptyMessage = imageEmptyMessage();
@@ -436,7 +439,10 @@ function keyDown(e) {
     return applyHistory(e.shiftKey ? "redo" : "undo");
   }
   if ((e.ctrlKey || e.metaKey) && key.toLowerCase() === "y") { e.preventDefault(); return applyHistory("redo"); }
-  if (!$("editor").open) return;
+  if (!$("editor").open) {
+    if (key === "Escape" && state.imageSelection.size && $("annotation").classList.contains("active")) clearImageSelection();
+    return;
+  }
   if (key === " ") { e.preventDefault(); state.spaceDown = true; $("canvas").style.cursor = "grab"; return; }
   if (key === "Delete" || key === "Backspace") return deleteSelected();
   if (key === "ArrowLeft") return navigate(-1);
@@ -480,6 +486,11 @@ function setupVirtualGalleries() {
       $("image-total").textContent = `${total.toLocaleString()} image${total === 1 ? "" : "s"}`;
       updateNavButtons();
     },
+  });
+  imageGallery.enableMarquee({
+    canStart: () => !!state.meta.capabilities.image_ops && !state.imageSelectionBusy,
+    onSelect: marqueeSelect,
+    onClear: additive => { if (!additive && state.imageSelection.size) clearImageSelection(); },
   });
   objectGallery = new VirtualGallery({
     gridId: "object-grid",
@@ -552,7 +563,7 @@ function renderImageCard(item, index) {
   const selectable = state.meta.capabilities.image_ops;
   return `<article class="card ${state.imageSelection.has(item.id) ? "selected" : ""}" data-image="${item.id}" data-index="${index}" tabindex="0">
       <div class="thumb"><img loading="lazy" src="${apiUrl(`/images/${item.id}/thumbnail?size=320${overlay}`)}" alt="">
-        ${selectable ? `<input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for range)" aria-label="Select ${esc(item.name)}" ${state.imageSelection.has(item.id) ? "checked" : ""}>` : ""}
+        ${selectable ? `<input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for a range, or drag a rectangle from the space between images)" aria-label="Select ${esc(item.name)}" ${state.imageSelection.has(item.id) ? "checked" : ""}>` : ""}
         ${item.issue_count ? `<span class="issue-flag">${item.issue_count} ⚠</span>` : ""}
         ${state.pred.pending[item.id] ? `<span class="pred-flag" title="Pending predictions">${state.pred.pending[item.id]} ✨</span>` : ""}</div>
       <div class="card-body">
@@ -585,6 +596,29 @@ async function handleImageCheck(check, shiftKey) {
   }
 }
 
+// Rectangle selection from the gallery: replaces the selection, or adds to it with Shift/Ctrl.
+async function marqueeSelect(indices, additive) {
+  if (!additive) state.imageSelection.clear();
+  if (!indices.length) return renderImageBulkBar(), imageGallery.render();
+  const first = Math.min(...indices), last = Math.max(...indices);
+  state.imageSelectionBusy = last - first > 0;
+  renderImageBulkBar();
+  try {
+    await imageGallery.ensureRange(first, last + 1);
+    for (const index of indices) {
+      const item = imageGallery.cache.get(index);
+      if (item) state.imageSelection.set(item.id, item);
+    }
+    state.lastImageIndex = last;
+  } catch (error) {
+    if (error.name !== "AbortError") toast(error.message, "error");
+  } finally {
+    state.imageSelectionBusy = false;
+    imageGallery.render();
+    renderImageBulkBar();
+  }
+}
+
 function renderImageBulkBar() {
   const count = state.imageSelection.size;
   $("image-bulk").hidden = !count && !state.imageSelectionBusy;
@@ -605,13 +639,15 @@ async function runImageBulk(action) {
   const count = `${image_ids.length} image${image_ids.length === 1 ? "" : "s"}`;
   if (action === "delete" && !confirm(`Delete ${count}? They are moved to the dataset trash with their labels; Ctrl+Z undoes.`)) return;
   try {
-    const split = $("image-move-split").value;
+    const target = $("image-move-split").value;
+    const separator = target.indexOf("|");
+    const split = target.slice(0, separator), folder = target.slice(separator + 1);
     const result = action === "delete"
       ? await api("/images/delete", { method: "POST", body: JSON.stringify({ image_ids }) })
-      : await api("/images/move", { method: "POST", body: JSON.stringify({ image_ids, split }) });
+      : await api("/images/move", { method: "POST", body: JSON.stringify({ image_ids, split, folder }) });
     state.canUndo = result.can_undo;
     state.canRedo = result.can_redo;
-    toast(action === "delete" ? `Deleted ${count} — Ctrl+Z undoes` : `Moved ${result.moved} to ${split}${result.skipped ? ` · ${result.skipped} already there` : ""} — Ctrl+Z undoes`);
+    toast(action === "delete" ? `Deleted ${count} — Ctrl+Z undoes` : `Moved ${result.moved} to ${split} (${folder})${result.skipped ? ` · ${result.skipped} already there` : ""} — Ctrl+Z undoes`);
     await datasetChanged();
   } catch (error) {
     toast(error.message, "error");

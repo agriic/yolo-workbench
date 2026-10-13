@@ -95,6 +95,7 @@ class SchemaEntry:
     """
 
     mapping: dict[int, int | None]
+    layout_only: bool = False  # only split folders changed; class ids are untouched
 
     def inverse(self) -> dict[int, int | None]:
         return {new: old for old, new in self.mapping.items() if new is not None}
@@ -125,8 +126,9 @@ class Dataset:
         self.images: dict[str, ImageRecord] = {}
         self.orphan_labels: list[Path] = []
         self._label_scan_roots: set[Path] = set()
-        self._split_dirs: dict[str, Path] = {}
-        self._split_image_dirs: dict[str, Path] = {}  # splits configured as exactly one image directory
+        # image folders per split, in YAML order; a split may list several (train: [images/a, images/b])
+        self._split_folders: dict[str, list[Path]] = {}
+        self._split_sources: dict[str, object] = {}  # raw YAML value per split (folders, .txt lists, files)
         self._class_ids_by_name: dict[str, int] = {}
         self._mtimes: dict[Path, int | None] = {}
         self._revisions: dict[Path, int] = {}
@@ -189,60 +191,158 @@ class Dataset:
         return {}
 
     def _classification_names(self) -> dict[int, str]:
-        class_names = sorted({child.name for directory in self._split_dirs.values() if directory.is_dir() for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")})
+        class_names = sorted({child.name for directory in self._all_folders() if directory.is_dir() for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")})
         return dict(enumerate(class_names))
 
-    def _discover(self) -> list[tuple[str, Path]]:
-        """Read the YAML (names, root, splits) and list every (split, image path) on disk."""
-        if self.category == "classification":
-            return self._discover_classification()
-        config = self._read_config()
-        self.names = self._names_from_config(config)
-        if not self.names and not self.allow_empty:
-            raise DatasetError("Dataset YAML has no class names")
-        root_value = config.get("path", ".")
-        root = Path(root_value)
-        self.root = (self.yaml_path.parent / root).resolve() if not root.is_absolute() else root.resolve()
-        self._label_scan_roots = set()
-        self._split_image_dirs = {}
-        found = []
-        for split in ("train", "val", "test"):
-            value = config.get(split)
-            single = value[0] if isinstance(value, list) and len(value) == 1 else value
-            if isinstance(single, str) and single:
-                directory = Path(single)
-                directory = (self.root / directory).resolve() if not directory.is_absolute() else directory.resolve()
-                if directory.suffix.lower() != ".txt" and directory.suffix.lower() not in IMAGE_EXTENSIONS:
-                    self._split_image_dirs[split] = directory
-            found.extend((split, image_path) for image_path in self._resolve_sources(value))
-        return found
+    def _all_folders(self) -> list[Path]:
+        return [folder for folders in self._split_folders.values() for folder in folders]
 
-    def _discover_classification(self) -> list[tuple[str, Path]]:
-        """<root>/<split>/<class name>/<images>; class ids are the sorted class-folder names."""
-        self.root = (self.yaml_path if self.yaml_path.is_dir() else self.yaml_path.parent).resolve()
+    def _resolve_path(self, value) -> Path:
+        path = Path(str(value))
+        return (self.root / path).resolve() if not path.is_absolute() else path.resolve()
+
+    def _read_layout(self) -> dict:
+        """Read the YAML: names, dataset root, and the image folders of every split."""
+        if self.category == "classification":
+            self.root = (self.yaml_path if self.yaml_path.is_dir() else self.yaml_path.parent).resolve()
         config = self._read_config()
-        if config:
-            self._names_from_config(config)  # names come from folders; this only records the YAML's style
+        if self.category == "classification":
+            if config:
+                self._names_from_config(config)  # names come from folders; this only records the YAML's style
+        else:
+            self.names = self._names_from_config(config)
+        if config or self.category != "classification":
             root_value = Path(str(config.get("path", ".")))
             self.root = (self.yaml_path.parent / root_value).resolve() if not root_value.is_absolute() else root_value.resolve()
-        self._split_dirs = {}
+        self._split_folders = {}
+        self._split_sources = {}
         for split in ("train", "val", "test"):
-            directory = Path(str(config.get(split) or split))
-            directory = (self.root / directory) if not directory.is_absolute() else directory
-            if directory.is_dir():
-                self._split_dirs[split] = directory.resolve()
-        self._split_image_dirs = dict(self._split_dirs)
-        if not self._split_dirs and not self.allow_empty:
-            raise DatasetError("Classification datasets need train/, val/, or test/ directories with one folder per class")
-        self.names = self._classification_names()
-        if not self.names and not self.allow_empty:
-            raise DatasetError("No class directories found under the dataset splits")
+            value = config.get(split)
+            if self.category == "classification" and not value:
+                value = split  # <root>/<split>/ is the convention without a YAML entry
+            values = value if isinstance(value, list) else [value] if value else []
+            folders = []
+            for item in values:
+                path = self._resolve_path(item)
+                if self.category == "classification":
+                    if path.is_dir():
+                        folders.append(path)
+                elif path.suffix.lower() != ".txt" and path.suffix.lower() not in IMAGE_EXTENSIONS:
+                    folders.append(path)
+            if folders:
+                self._split_folders[split] = folders
+            if value:
+                self._split_sources[split] = value
+        if self.category == "classification":
+            self.names = self._classification_names()
         self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
+        return config
+
+    def _discover(self) -> list[tuple[str, Path]]:
+        """Read the layout and list every (split, image path) on disk."""
+        self._read_layout()
+        if self.category == "classification":
+            if not self._split_folders and not self.allow_empty:
+                raise DatasetError("Classification datasets need train/, val/, or test/ directories with one folder per class")
+            if not self.names and not self.allow_empty:
+                raise DatasetError("No class directories found under the dataset splits")
+            found = []
+            for split, folders in self._split_folders.items():
+                for folder in folders:
+                    for class_dir in sorted(child for child in folder.iterdir() if child.is_dir() and not child.name.startswith(".")):
+                        found.extend((split, path) for path in sorted(class_dir.rglob("*")) if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(class_dir).parts)
+            return found
+        if not self.names and not self.allow_empty:
+            raise DatasetError("Dataset YAML has no class names")
+        self._label_scan_roots = set()
         found = []
-        for split, directory in self._split_dirs.items():
-            for class_dir in sorted(child for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")):
-                found.extend((split, path) for path in sorted(class_dir.rglob("*")) if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(class_dir).parts)
+        for split in ("train", "val", "test"):
+            found.extend((split, image_path) for image_path in self._resolve_sources(self._split_sources.get(split)))
         return found
+
+    def folder_label(self, folder: Path) -> str:
+        """How a folder is shown and addressed in the API: relative to the dataset root when inside it."""
+        return folder.relative_to(self.root).as_posix() if folder.is_relative_to(self.root) else str(folder)
+
+    def _folder_of(self, record: ImageRecord) -> Path | None:
+        for folder in self._split_folders.get(record.split, []):
+            if record.path.is_relative_to(folder):
+                return folder
+        return None
+
+    def resolve_folder(self, split: str, folder: str | None = None) -> Path:
+        """The split folder named by `folder` (as folder_label shows it), or the split's first folder."""
+        folders = self._split_folders.get(split)
+        if not folders:
+            raise DatasetError(f"Split {split} has no image folder in this dataset")
+        if not folder:
+            return folders[0]
+        for candidate in folders:
+            if folder in (self.folder_label(candidate), str(candidate)):
+                return candidate
+        raise DatasetError(f"{folder} is not a folder of the {split} split")
+
+    def folders(self) -> dict:
+        """Every split folder with its image count (for the Dataset tab)."""
+        with self._lock:
+            counts: dict[Path, int] = {}
+            for record in self.images.values():
+                folder = self._folder_of(record)
+                if folder is not None:
+                    counts[folder] = counts.get(folder, 0) + 1
+            items = [
+                {"split": split, "path": self.folder_label(folder), "images": counts.get(folder, 0), "exists": folder.is_dir()}
+                for split, folders in self._split_folders.items()
+                for folder in folders
+            ]
+            return {"items": items, "editable": self.yaml_path.is_file()}
+
+    def add_folder(self, split: str, path: str) -> dict:
+        """Create a new image folder and list it under `split` in the YAML (one undoable step)."""
+        from .yamledit import write_key
+
+        if split not in ("train", "val", "test"):
+            raise DatasetError("Split must be train, val, or test")
+        if not self.yaml_path.is_file():
+            raise DatasetError("This dataset has no YAML file to record the new folder in")
+        raw = str(path).strip().replace("\\", "/").strip("/")
+        parts = [part for part in raw.split("/") if part not in ("", ".")]
+        if not parts or any(part == ".." or part.startswith(".") for part in parts):
+            raise DatasetError("Use a folder path inside the dataset, without '..' or hidden folders")
+        with self._lock:
+            folder = self.root.joinpath(*parts).resolve()
+            if not folder.is_relative_to(self.root) or folder == self.root:
+                raise DatasetError("The folder must be inside the dataset root")
+            for existing in self._all_folders():
+                if folder == existing or folder.is_relative_to(existing) or existing.is_relative_to(folder):
+                    raise DatasetError(f"{self.folder_label(folder)} overlaps the existing split folder {self.folder_label(existing)}")
+            if folder.exists() and any(folder.iterdir()):
+                raise DatasetError(f"{self.folder_label(folder)} already exists and is not empty; add it to data.yaml by hand or rescan")
+            entries: list = []
+            created = []
+            for directory in [folder] + ([] if self.category == "classification" else [self._label_root_for(folder)]):
+                if directory != folder and directory.exists():
+                    continue
+                missing = []
+                current = directory
+                while not current.exists() and current != self.root:
+                    missing.append(current)
+                    current = current.parent
+                for item in reversed(missing):
+                    if item not in created:
+                        entries.append(DirEntry(item, True))
+                        created.append(item)
+            config = self._read_config()
+            current_value = config.get(split)
+            listed = current_value if isinstance(current_value, list) else [current_value] if current_value else []
+            if self.category == "classification" and not listed and split in self._split_folders:
+                listed = [self.folder_label(self._split_folders[split][0])]
+            new_value = listed + ["/".join(parts)]
+            before = self.yaml_path.read_text(encoding="utf-8")
+            entries.append(FileEntry(self.yaml_path, before, write_key(before, split, new_value[0] if len(new_value) == 1 else new_value), True, True))
+            entries.append(SchemaEntry({class_id: class_id for class_id in self.names}, layout_only=True))
+            self._execute(entries)
+            return {"split": split, "path": self.folder_label(folder), **self.folders(), **self.history_state()}
 
     def _make_record(self, split: str, image_path: Path, record_id: str | None = None) -> ImageRecord:
         record_id = record_id or hashlib.sha1(f"{split}:{image_path}".encode()).hexdigest()[:16]
@@ -350,7 +450,8 @@ class Dataset:
         return {"added": len(added), "removed": len(removed), "updated": updated, "names_changed": names_changed}
 
     def _class_name_for(self, record: ImageRecord) -> str:
-        return record.path.relative_to(self._split_dirs[record.split]).parts[0]
+        folder = self._folder_of(record)
+        return record.path.relative_to(folder).parts[0] if folder else record.path.parent.name
 
     @property
     def _index_path(self) -> Path:
@@ -657,8 +758,10 @@ class Dataset:
         """What the UI may offer: image moves/imports need each split to be a single image directory."""
         return {
             "classes": self.category == "classification" or self.yaml_path.is_file(),
-            "image_ops": bool(self._split_image_dirs),
-            "splits": [split for split in ("train", "val", "test") if split in self._split_image_dirs],
+            "image_ops": bool(self._split_folders),
+            "splits": [split for split in ("train", "val", "test") if split in self._split_folders],
+            "folders": {split: [self.folder_label(folder) for folder in folders] for split, folders in self._split_folders.items()},
+            "folders_editable": self.yaml_path.is_file(),
         }
 
     def statistics(self) -> dict:
@@ -956,7 +1059,7 @@ class Dataset:
                     raise WriteConflict(f"{src.name} has a newer revision; reload before saving")
                 if self.names[class_id] == self._class_name_for(record):
                     continue
-                dst = self._split_dirs[record.split] / self.names[class_id] / src.name
+                dst = (self._folder_of(record) or src.parent.parent) / self.names[class_id] / src.name
                 if dst.exists():
                     raise DatasetError(f"Cannot move {src.name}: a file with that name already exists in {self.names[class_id]}/")
                 planned.append((record, src, dst))
@@ -1135,7 +1238,7 @@ class Dataset:
                 self.annotation_generation += 1
         if image_ids or schema is not None:
             self._notify_changes(image_ids)
-        if schema is not None:
+        if schema is not None and not schema.layout_only:
             self._notify_schema(schema.mapping if direction == "redo" else schema.inverse())
         return image_ids, schema is not None
 
@@ -1265,12 +1368,8 @@ class Dataset:
         self._mtimes[label_path] = stat.st_mtime_ns if stat else None
 
     def _reload_schema(self) -> None:
-        """Re-read class names from disk and re-interpret every record against them."""
-        if self.category == "classification":
-            self.names = self._classification_names()
-        else:
-            self.names = self._names_from_config(self._read_config())
-        self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
+        """Re-read class names and split folders from disk and re-interpret every record against them."""
+        self._read_layout()
         self.schema_generation += 1
         for record in list(self.images.values()):
             self._read_record(record)
@@ -1303,29 +1402,28 @@ class Dataset:
             self._execute(entries)
             return {"deleted": len(entries), **self.history_state()}
 
-    def move_images(self, image_ids: list[str], split: str) -> dict:
-        """Move images (and their labels) to another split as one undoable transaction."""
+    def move_images(self, image_ids: list[str], split: str, folder: str | None = None) -> dict:
+        """Move images (and their labels) to a split folder as one undoable transaction."""
         with self._lock:
-            target_root = self._split_image_dirs.get(split)
-            if target_root is None:
-                raise DatasetError(f"Split {split} is not a single image directory in this dataset")
+            target_root = self.resolve_folder(split, folder)
             entries, skipped, targets = [], 0, set()
             for image_id in dict.fromkeys(image_ids):
                 record = self.require_image(image_id)
-                if record.split == split:
+                source_root = self._folder_of(record)
+                if record.split == split and source_root == target_root:
                     skipped += 1
                     continue
-                source_root = self._split_image_dirs.get(record.split)
-                relative = record.path.relative_to(source_root) if source_root and record.path.is_relative_to(source_root) else Path(record.path.name)
+                relative = record.path.relative_to(source_root) if source_root else Path(record.path.name)
                 image_path = target_root / relative
+                where = f"{split} ({self.folder_label(target_root)})"
                 if image_path.exists() or image_path in targets:
-                    raise DatasetError(f"Cannot move {record.path.name}: {split} already has a file with that name")
+                    raise DatasetError(f"Cannot move {record.path.name}: {where} already has a file with that name")
                 targets.add(image_path)
                 files = [(record.path, image_path)]
                 if record.label_path != record.path and record.label_path.exists():
                     label_path = self._label_for(image_path)
                     if label_path.exists():
-                        raise DatasetError(f"Cannot move {record.path.name}: {label_path.name} already exists in {split}")
+                        raise DatasetError(f"Cannot move {record.path.name}: {label_path.name} already exists in {where}")
                     files.append((record.label_path, label_path))
                 entries.append(RecordMoveEntry(record.id, record.split, split, files))
             if entries:

@@ -264,4 +264,5 @@ Each phase can ship on its own, and the tests stay green between phases.
 - The import dialog also offers **keep the source splits** when the source has `train/`, `val/` (or `valid/`), or `test/` folders.
 - Class reorder is up/down buttons (each move is one undoable step) rather than drag and drop.
 - A cancelled import keeps the files copied so far (they are indexed by the rescan).
+- Added after the first pass: **several folders per split**. The Splits panel lists each split's folders with image counts and can add a folder (created with its `labels/` twin and appended to the split in `data.yaml`, undoable). The import review has a destination-folder picker per split (with “New folder…”), and the Move bar targets a split folder.
 - Not done yet: filtering the grid by import batch; migrating predictor/embeddings polling onto `JobManager`.

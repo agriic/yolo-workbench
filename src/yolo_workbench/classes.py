@@ -12,8 +12,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import yaml
-
 from .dataset import (
     WORKBENCH_DIR,
     Dataset,
@@ -26,6 +24,7 @@ from .dataset import (
     RecordMoveEntry,
     SchemaEntry,
 )
+from .yamledit import write_key
 
 MAX_NAME_LENGTH = 100
 
@@ -202,44 +201,11 @@ def _names_entry(dataset: Dataset, new_names: dict[int, str]) -> FileEntry:
     return FileEntry(path, before, after, exists, True)
 
 
-def _names_block(names: dict[int, str], style: str) -> str:
+def write_names(text: str, names: dict[int, str], style: str = "dict") -> str:
+    """Replace only the top-level `names:` block, keeping every other line (and comment) intact."""
     contiguous = sorted(names) == list(range(len(names)))
     value = [names[key] for key in sorted(names)] if style == "list" and contiguous else {key: names[key] for key in sorted(names)}
-    return yaml.safe_dump({"names": value}, sort_keys=False, allow_unicode=True, default_flow_style=False)
-
-
-def write_names(text: str, names: dict[int, str], style: str = "dict") -> str:
-    """Replace only the top-level `names:` block, keeping every other line (and comment) intact.
-
-    Falls back to a full dump when the block cannot be located or the edit would not parse back.
-    """
-    block = _names_block(names, style)
-    lines = text.splitlines(keepends=True)
-    start = next((index for index, line in enumerate(lines) if re.match(r"^names\s*:", line)), None)
-    if start is None:
-        candidate = text + ("" if not text or text.endswith("\n") else "\n") + block
-    else:
-        end = start + 1
-        while end < len(lines):
-            line = lines[end]
-            if line.strip() and not line[0].isspace() and not line.startswith("-") and not line.lstrip().startswith("#"):
-                break
-            end += 1
-        while end > start + 1 and (not lines[end - 1].strip() or lines[end - 1].lstrip().startswith("#")):
-            end -= 1  # trailing blank lines and comments belong to whatever follows
-        candidate = "".join(lines[:start]) + block + "".join(lines[end:])
-    try:
-        original = yaml.safe_load(text) or {} if text.strip() else {}
-        parsed = yaml.safe_load(candidate) or {}
-        expected_names = yaml.safe_load(block)["names"]
-        if isinstance(original, dict) and parsed.get("names") == expected_names and {k: v for k, v in parsed.items() if k != "names"} == {k: v for k, v in original.items() if k != "names"}:
-            return candidate
-    except yaml.YAMLError:
-        pass
-    config = yaml.safe_load(text) if text.strip() else {}
-    config = config if isinstance(config, dict) else {}
-    config["names"] = yaml.safe_load(block)["names"]
-    return yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
+    return write_key(text, "names", value)
 
 
 # ---------- classification (classes are folders) ----------
@@ -262,16 +228,16 @@ def _classification_yaml(dataset: Dataset, names: list[str]) -> list:
     return [_names_entry(dataset, dict(enumerate(sorted(names))))]
 
 
-def _split_dirs(dataset: Dataset) -> dict[str, Path]:
-    if dataset._split_dirs:
-        return dataset._split_dirs
+def _class_folders(dataset: Dataset) -> list[Path]:
+    """Every split folder (each holds one subfolder per class)."""
+    folders = dataset._all_folders()
     # an empty managed project may not have split folders yet
-    return {"train": dataset.root / "train"}
+    return folders or [dataset.root / "train"]
 
 
 def _classification_add(dataset: Dataset, names: list[str]) -> dict:
     entries: list = []
-    for directory in _split_dirs(dataset).values():
+    for directory in _class_folders(dataset):
         for name in names:
             entries.append(DirEntry(directory / name, True))
     all_names = list(dataset.names.values()) + names
@@ -279,16 +245,15 @@ def _classification_add(dataset: Dataset, names: list[str]) -> dict:
     mapping = {class_id: position[name] for class_id, name in dataset.names.items()}
     entries += _classification_yaml(dataset, all_names)
     entries.append(SchemaEntry(mapping))
-    if not dataset._split_dirs:
-        dataset._split_dirs = dict(_split_dirs(dataset))
-        dataset._split_image_dirs = dict(dataset._split_dirs)
+    if not dataset._split_folders:
+        dataset._split_folders = {"train": _class_folders(dataset)}
     dataset._execute(entries)
     return _result(dataset, mapping)
 
 
 def _classification_rename(dataset: Dataset, old: str, new: str) -> dict:
     entries: list = []
-    for directory in dataset._split_dirs.values():
+    for directory in dataset._all_folders():
         if (directory / old).is_dir():
             if (directory / new).exists():
                 raise DatasetError(f"Folder {new}/ already exists in {directory.name}/")
@@ -324,12 +289,12 @@ def _classification_remove(dataset: Dataset, class_ids: list[int], target_id: in
         if target_name is None:
             entries.append(RecordMoveEntry(record.id, record.split, None, [(record.path, dataset._trash_path(record.path))]))
             continue
-        dst = dataset._split_dirs[record.split] / target_name / record.path.name
+        dst = (dataset._folder_of(record) or record.path.parent.parent) / target_name / record.path.name
         if dst.exists() or dst in destinations:
             raise DatasetError(f"Cannot merge: {target_name}/ in {record.split} already has a file named {record.path.name}")
         destinations.add(dst)
         entries.append(MoveEntry(record.id, record.path, dst))
-    for directory in dataset._split_dirs.values():
+    for directory in dataset._all_folders():
         for name in sorted(removed):
             folder = directory / name
             if folder.is_dir():

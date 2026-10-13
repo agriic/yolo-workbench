@@ -248,3 +248,71 @@ def test_workspace_api_end_to_end(tmp_path):
                 assert (await evil.get("/api/v1/projects")).status_code == 403
 
     asyncio.run(run())
+
+
+def test_split_with_several_folders_import_move_and_add_folder(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Multi", "detection", ["dog", "cat"])
+    root = workspace.root / "multi"
+    yaml_path = root / "data.yaml"
+    # a hand-written layout: train is two folders, with a comment to keep
+    text = yaml_path.read_text().replace("train: images/train\n", "# training data\ntrain:\n- images/train\n- images/extra  # second batch\n")
+    yaml_path.write_text(text)
+    (root / "images" / "extra").mkdir()
+    (root / "labels" / "extra").mkdir()
+    dataset = workspace.session("multi").dataset
+    assert dataset.capabilities()["folders"]["train"] == ["images/train", "images/extra"]
+
+    result = importer.run_import(dataset, make_source(tmp_path), {"split_mode": "source", "folders": {"train": "images/extra"}})
+    assert result["by_split"] == {"train": 2, "val": 1}
+    assert (root / "images" / "extra" / "a.jpg").exists() and (root / "labels" / "extra" / "a.txt").exists()
+    assert (root / "images" / "val" / "c.jpg").exists()
+    counts = {(item["split"], item["path"]): item["images"] for item in dataset.folders()["items"]}
+    assert counts[("train", "images/extra")] == 2 and counts[("train", "images/train")] == 0
+
+    # move between folders of the same split, then to another split's folder
+    record = next(record for record in dataset.images.values() if record.path.name == "a.jpg")
+    assert dataset.move_images([record.id], "train", "images/train")["moved"] == 1
+    assert (root / "labels" / "train" / "a.txt").exists()
+    assert dataset.move_images([record.id], "train", "images/train")["skipped"] == 1
+    with pytest.raises(DatasetError):
+        dataset.move_images([record.id], "val", "images/nope")
+
+    # a new folder is created (with its labels twin) and recorded in data.yaml, keeping comments
+    added = dataset.add_folder("val", "images/val_2")
+    assert added["path"] == "images/val_2"
+    assert (root / "images" / "val_2").is_dir() and (root / "labels" / "val_2").is_dir()
+    content = yaml_path.read_text()
+    assert "# training data" in content and "# second batch" in content
+    assert yaml.safe_load(content)["val"] == ["images/val", "images/val_2"]
+    assert dataset.capabilities()["folders"]["val"] == ["images/val", "images/val_2"]
+    for bad in ["images/train/sub", "images", "../outside", ".hidden"]:
+        with pytest.raises(DatasetError):
+            dataset.add_folder("val", bad)
+    dataset.history("undo")
+    assert not (root / "images" / "val_2").exists()
+    assert yaml.safe_load(yaml_path.read_text())["val"] == "images/val"
+    assert dataset.capabilities()["folders"]["val"] == ["images/val"]
+
+
+def test_classification_split_with_several_folders(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Animals", "classification", ["cat", "dog"])
+    root = workspace.root / "animals"
+    dataset = workspace.session("animals").dataset
+    dataset.add_folder("train", "train_more")
+    assert yaml.safe_load((root / "data.yaml").read_text())["train"] == ["train", "train_more"]
+    from yolo_workbench import classes
+    classes.add_classes(dataset, ["owl"])
+    assert (root / "train_more" / "owl").is_dir() and (root / "train" / "owl").is_dir()
+    source = tmp_path / "src"
+    (source / "dog").mkdir(parents=True)
+    Image.new("RGB", (8, 8), "red").save(source / "dog" / "1.jpg")
+    importer.run_import(dataset, source, {"split_mode": "fixed", "split": "train", "folders": {"train": "train_more"}})
+    assert (root / "train_more" / "dog" / "1.jpg").exists()
+    record = next(iter(dataset.images.values()))
+    assert record.annotations[0].class_id == 1
+    dataset.replace_annotations(record.id, [{"class_id": 2, "points": []}])
+    assert (root / "train_more" / "owl" / "1.jpg").exists()
+    classes.rename_class(dataset, 2, "eagle")
+    assert (root / "train_more" / "eagle" / "1.jpg").exists() and dataset.names == {0: "cat", 1: "dog", 2: "eagle"}

@@ -351,6 +351,9 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
     if not items:
         raise DatasetError("No images found in the selected folder")
     _assign_splits(items, options, allowed)
+    # each split may have several folders; the caller picks one per split (default: the first)
+    chosen = options.get("folders") or {}
+    folders = {split: dataset.resolve_folder(split, chosen.get(split)) for split in {item["target"] for item in items}}
     mapping = _resolve_mapping(dataset, scanned, options.get("mapping"))
     label_mapping = {int(key): value for key, value in mapping.items()} if dataset.category != "classification" and scanned["names_source"] else None
     fingerprints = _Fingerprints(record.path for record in list(dataset.images.values())) if options.get("skip_duplicates", True) else None
@@ -363,7 +366,7 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
         for index, item in enumerate(items):
             if job:
                 job.progress(index, len(items))
-            _copy_item(dataset, item, mapping, label_mapping, fingerprints, planned, stats)
+            _copy_item(dataset, item, mapping, label_mapping, fingerprints, planned, stats, folders)
     finally:
         # also after a cancel: whatever was copied is part of the dataset now
         if job and not job.cancel_requested:
@@ -388,15 +391,15 @@ def _target_paths(dataset: Dataset, directory: Path, name: str, planned: set[Pat
         candidate = base.with_name(f"{base.stem}_{counter}{base.suffix}")
 
 
-def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict | None, fingerprints: _Fingerprints | None, planned: set[Path], stats: dict) -> None:
+def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict | None, fingerprints: _Fingerprints | None, planned: set[Path], stats: dict, folders: dict[str, Path]) -> None:
     if dataset.category == "classification":
         class_id = mapping.get(item["class"])
         if class_id is None:
             stats["dropped"] += 1
             return
-        directory = dataset._split_image_dirs[item["target"]] / dataset.names[class_id]
+        directory = folders[item["target"]] / dataset.names[class_id]
     else:
-        directory = dataset._split_image_dirs[item["target"]]
+        directory = folders[item["target"]]
     if fingerprints is not None and fingerprints.seen(item["image"]):
         stats["duplicates"] += 1
         return
@@ -422,7 +425,7 @@ def _log(dataset: Dataset, source: Path, options: dict, mapping: dict, stats: di
     entry = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": "browser upload" if options.get("staging_id") else str(source),
-        "options": {key: value for key, value in options.items() if key in {"split_mode", "split", "ratios", "seed", "skip_duplicates"}},
+        "options": {key: value for key, value in options.items() if key in {"split_mode", "split", "ratios", "seed", "skip_duplicates", "folders"}},
         "mapping": mapping,
         **stats,
     }

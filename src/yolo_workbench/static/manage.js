@@ -7,11 +7,13 @@ export function configureManage(dependencies) {
 }
 
 const SPLITS = ["train", "val", "test"];
+const NEW_FOLDER = "";  // folder paths are never empty, so "" marks the "New folder…" option
 const UPLOAD_EXTENSIONS = /\.(jpe?g|png|webp|bmp|tiff?|txt|ya?ml|json)$/i;
 const UPLOAD_CONCURRENCY = 4;
 const plural = (count, noun) => `${count.toLocaleString()} ${noun}${count === 1 ? "" : noun.endsWith("s") ? "es" : "s"}`;
 
 let classItems = [];
+let folderInfo = { items: [], editable: false };
 let removing = null;      // class being removed in the dialog
 let importSource = null;  // { path } or { staging_id }
 let importScan = null;
@@ -42,6 +44,10 @@ export function bindManage() {
     removing = null;
   });
   $("rescan").onclick = rescan;
+  $("split-overview").addEventListener("click", e => {
+    const add = e.target.closest("[data-add-folder]");
+    if (add) addFolder(add.dataset.addFolder);
+  });
 
   $("import-pick-files").onclick = () => $("import-files").click();
   $("import-pick-folder").onclick = () => $("import-folder").click();
@@ -67,8 +73,13 @@ export function bindManage() {
     if (e.target.closest("#import-commit")) commitImport();
     if (e.target.closest("#import-discard")) resetImport();
   });
-  $("import-review").addEventListener("change", e => {
+  $("import-review").addEventListener("change", async e => {
     if (e.target.name === "split-mode" || e.target.closest(".ratio-input")) updateImportSummary();
+    const folderSelect = e.target.closest("[data-folder-split]");
+    if (folderSelect && folderSelect.value === NEW_FOLDER) {
+      const path = await addFolder(folderSelect.dataset.folderSplit);
+      renderFolderSelects(path ? { [folderSelect.dataset.folderSplit]: path } : {});
+    }
   });
   $("import-review").addEventListener("input", e => { if (e.target.closest(".ratio-input")) updateImportSummary(); });
 }
@@ -85,8 +96,15 @@ export function renderManageMeta() {
   $("class-note").textContent = meta.category === "classification"
     ? "Classes are the folders inside each split; ids follow the folder names alphabetically."
     : "Removing or reordering renumbers class ids in every label file. Ctrl+Z undoes any class change.";
-  renderSplits();
+  loadFolders();
   if (!importJob) resumeImportJob();
+}
+
+async function loadFolders() {
+  try {
+    folderInfo = await api("/folders");
+  } catch { folderInfo = { items: [], editable: false }; }
+  renderSplits();
 }
 
 function renderSplits() {
@@ -94,14 +112,48 @@ function renderSplits() {
   const configured = meta.capabilities.splits;
   const splits = [...new Set([...SPLITS.filter(split => configured.includes(split) || meta.split_counts[split]), ...Object.keys(meta.split_counts)])];
   const total = Math.max(1, meta.image_count);
+  const editable = folderInfo.editable;
   $("split-overview").innerHTML = splits.map(split => {
     const count = meta.split_counts[split] || 0;
-    return `<div class="split-row"><span class="split-badge">${esc(split)}</span>
-      <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${count / total * 100}%"></span></span>
-      <span class="stats-bar-value">${count.toLocaleString()} · ${Math.round(count / total * 100)}%</span></div>`;
+    const folders = folderInfo.items.filter(item => item.split === split);
+    return `<div class="split-block">
+      <div class="split-row"><span class="split-badge">${esc(split)}</span>
+        <span class="stats-bar-track"><span class="stats-bar-fill" style="width:${count / total * 100}%"></span></span>
+        <span class="stats-bar-value">${count.toLocaleString()} · ${Math.round(count / total * 100)}%</span></div>
+      ${folders.map(folder => `<div class="folder-row" title="${esc(folder.path)}">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+        <code>${esc(folder.path)}</code><span class="muted">${folder.images.toLocaleString()}${folder.exists ? "" : " · missing on disk"}</span></div>`).join("")}
+      ${editable && SPLITS.includes(split) ? `<button class="link-btn" data-add-folder="${esc(split)}">＋ Add folder</button>` : ""}
+    </div>`;
   }).join("") + (meta.capabilities.image_ops
-    ? `<p class="panel-note">Select images in the Annotation tab to move them between splits.</p>`
+    ? `<p class="panel-note">A split can use several folders. Select images in the Annotation tab to move them between splits and folders.</p>`
     : `<p class="panel-note">This dataset's splits are file lists, not plain folders, so images cannot be moved or imported here.</p>`);
+}
+
+function suggestFolder(split) {
+  const taken = new Set(Object.values(state.meta.capabilities.folders || {}).flat());
+  const base = state.meta.category === "classification" ? split : `images/${split}`;
+  let index = 2;
+  while (taken.has(`${base}_${index}`)) index++;
+  return `${base}_${index}`;
+}
+
+// Ask for a folder path, create it for `split`, and return its path (or null when cancelled/failed).
+async function addFolder(split) {
+  const where = state.meta.category === "classification" ? "with one subfolder per class" : "labels go to the matching labels/ folder";
+  const path = prompt(`New image folder for the ${split} split, relative to the dataset root (${where}):`, suggestFolder(split));
+  if (!path || !path.trim()) return null;
+  try {
+    const result = await api("/folders", { method: "POST", body: JSON.stringify({ split, path: path.trim() }) });
+    state.canUndo = result.can_undo;
+    state.canRedo = result.can_redo;
+    deps.toast(`Added ${result.path} to ${split} — data.yaml updated`);
+    await deps.datasetChanged();
+    return result.path;
+  } catch (error) {
+    deps.toast(error.message, "error");
+    return null;
+  }
 }
 
 export async function loadClasses() {
@@ -326,6 +378,7 @@ function renderImportReview() {
         <label class="ratio-input">seed <input type="number" id="import-seed" value="0" step="1"></label></span></label>
       ${splitCounts.length ? `<label class="radio-row"><input type="radio" name="split-mode" value="source" checked><span>Keep the source splits (${splitCounts.map(([split, count]) => `${esc(split)} ${count}`).join(" · ")}; the rest go to the split chosen above)</span></label>` : ""}
     </fieldset>
+    <fieldset class="import-fieldset" id="import-folders"><legend>Destination folders</legend><div class="folder-targets"></div></fieldset>
     ${scan.classes.length ? `<fieldset class="import-fieldset"><legend>Classes</legend><table class="stats-table import-mapping">
       <thead><tr><th>Source</th><th>${classification ? "Images" : "Annotations"}</th><th>Becomes</th></tr></thead>
       <tbody>${scan.classes.map(item => `<tr>
@@ -336,7 +389,25 @@ function renderImportReview() {
       </tr>`).join("")}</tbody></table></fieldset>` : ""}
     <label class="toggle"><input type="checkbox" id="import-skip-duplicates" checked><span>Skip images that are already in the dataset (identical files)</span></label>
     <div class="modal-actions"><button id="import-discard" class="secondary" type="button">Cancel</button><button id="import-commit" type="button" class="primary-btn">Import</button></div>`;
+  renderFolderSelects();
   updateImportSummary();
+}
+
+// One folder picker per split; keeps the current choices unless `chosen` overrides them.
+function renderFolderSelects(chosen = {}) {
+  const container = $("import-review").querySelector(".folder-targets");
+  if (!container) return;
+  const previous = {};
+  container.querySelectorAll("[data-folder-split]").forEach(select => previous[select.dataset.folderSplit] = select.value);
+  const folders = state.meta.capabilities.folders || {};
+  const editable = state.meta.capabilities.folders_editable;
+  container.innerHTML = importScan.target_splits.map(split => {
+    const options = folders[split] || [];
+    const selected = chosen[split] ?? (options.includes(previous[split]) ? previous[split] : options[0]);
+    return `<label class="folder-target"><span class="split-badge">${esc(split)}</span>
+      <select data-folder-split="${esc(split)}">${options.map(path => `<option value="${esc(path)}" ${path === selected ? "selected" : ""}>${esc(path)}</option>`).join("")}
+      ${editable ? `<option value="${NEW_FOLDER}">＋ New folder…</option>` : ""}</select></label>`;
+  }).join("");
 }
 
 function updateImportSummary() {
@@ -361,6 +432,7 @@ async function commitImport() {
     ratios,
     seed: +$("import-seed").value || 0,
     mapping,
+    folders: Object.fromEntries([...review.querySelectorAll("[data-folder-split]")].map(select => [select.dataset.folderSplit, select.value])),
     skip_duplicates: $("import-skip-duplicates").checked,
   };
   try {

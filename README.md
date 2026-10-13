@@ -46,7 +46,8 @@ The projects page lists every project in the folder. Each project is one YOLO da
 - adopt existing dataset folders that are dropped into the projects folder;
 - add, rename, reorder, merge, and remove classes (all of these also work in single-dataset mode);
 - import images by browser upload or from a local folder, with a choice of target split or a seeded random split, and class names mapped from the source's `data.yaml`/`classes.txt`;
-- move images between splits, or delete them into the dataset trash.
+- use several folders per split (`train: [images/train, images/extra]`): add a folder from the Splits panel, and pick the destination folder for each split when importing or moving images;
+- select images in the Annotation grid with the checkboxes (Shift-click for a range) or by dragging a rectangle from the empty space between images (Shift/Ctrl adds to the selection, a click on empty space or Esc clears it), then move them between splits, or delete them into the dataset trash.
 
 Only one project is open at a time. Class changes, image moves, and image deletes are undoable with Ctrl+Z. Imports are logged to `.yolo-workbench/imports.jsonl`.
 

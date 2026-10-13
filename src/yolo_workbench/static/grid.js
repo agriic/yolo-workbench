@@ -169,6 +169,120 @@ export class VirtualGallery {
     this.renderRail(totalRows);
     if (!this.reloading) this.scheduleWindowLoad();
     this.evictDistant();
+    this.marqueePaint?.();
+  }
+
+  // Item indices whose cells intersect `rect` (grid-relative px). Uses the grid geometry rather than
+  // the DOM, so cells outside the rendered window (virtualized away) are hit too.
+  indicesInRect(rect) {
+    if (!this.total) return [];
+    const computed = getComputedStyle(this.grid);
+    const widths = computed.gridTemplateColumns.trim().split(/\s+/).map(parseFloat).filter(Number.isFinite);
+    const columnGap = parseFloat(computed.columnGap) || this.gap;
+    const columns = [];
+    let x = 0;
+    widths.forEach((width, column) => {
+      if (rect.left < x + width && rect.right > x) columns.push(column);
+      x += width + columnGap;
+    });
+    const stride = this.stride();
+    const totalRows = Math.ceil(this.total / this.columns);
+    const indices = [];
+    for (let row = Math.max(0, Math.floor(rect.top / stride)); row <= Math.min(totalRows - 1, Math.floor(rect.bottom / stride)); row++) {
+      const top = row * stride;
+      if (rect.top >= top + this.rowHeight || rect.bottom <= top) continue;  // only the gap below this row
+      for (const column of columns) {
+        const index = row * this.columns + column;
+        if (index < this.total) indices.push(index);
+      }
+    }
+    return indices;
+  }
+
+  // Rubber-band selection: dragging from empty space (gaps between cards, or below them) draws a
+  // rectangle; the gallery auto-scrolls near its edges. onSelect(indices, additive) gets every hit
+  // index; a click without a drag calls onClear(additive).
+  enableMarquee({ canStart = () => true, onSelect, onClear = () => {} }) {
+    const scroll = this.scroll;
+    scroll.style.position ||= "relative";
+    let drag = null;
+    const gridPoint = (clientX, clientY) => {
+      const rect = this.grid.getBoundingClientRect();
+      return { x: clientX - rect.left, y: clientY - rect.top };
+    };
+    const currentRect = () => {
+      const end = gridPoint(drag.clientX, drag.clientY);
+      return {
+        left: Math.min(drag.start.x, end.x), right: Math.max(drag.start.x, end.x),
+        top: Math.min(drag.start.y, end.y), bottom: Math.max(drag.start.y, end.y),
+      };
+    };
+    this.marqueePaint = () => {
+      if (!drag?.moved) return;
+      const rect = currentRect();
+      Object.assign(drag.box.style, {
+        left: `${this.grid.offsetLeft + rect.left}px`, top: `${this.grid.offsetTop + rect.top}px`,
+        width: `${rect.right - rect.left}px`, height: `${rect.bottom - rect.top}px`,
+      });
+      const hits = new Set(this.indicesInRect(rect));
+      for (const card of this.grid.querySelectorAll(":scope > [data-index]"))
+        card.classList.toggle("marquee-hit", hits.has(+card.dataset.index));
+    };
+    const autoScroll = () => {
+      if (!drag) return;
+      const bounds = scroll.getBoundingClientRect();
+      const edge = 48;
+      const speed = drag.clientY < bounds.top + edge ? -(bounds.top + edge - drag.clientY)
+        : drag.clientY > bounds.bottom - edge ? drag.clientY - (bounds.bottom - edge) : 0;
+      if (speed && drag.moved) {
+        scroll.scrollTop += Math.sign(speed) * Math.min(40, Math.abs(speed) / 2 + 4);
+        this.marqueePaint();
+      }
+      drag.frame = requestAnimationFrame(autoScroll);
+    };
+    const finish = e => {
+      if (!drag) return;
+      const cancelled = e.type === "pointercancel";
+      const indices = drag.moved && !cancelled ? this.indicesInRect(currentRect()) : [];
+      const { moved, additive, box, frame } = drag;
+      drag = null;
+      cancelAnimationFrame(frame);
+      box.remove();
+      scroll.classList.remove("marquee-active");
+      this.grid.querySelectorAll(".marquee-hit").forEach(card => card.classList.remove("marquee-hit"));
+      if (cancelled) return;
+      if (moved) onSelect(indices, additive);
+      else onClear(additive);
+    };
+    scroll.addEventListener("pointerdown", e => {
+      if (e.button !== 0 || !this.total || e.target.closest("[data-index], .virtual-placeholder, button, input, select, a") || !canStart()) return;
+      // the scrollbar belongs to the scroll element too; leave it alone
+      if (e.clientX - scroll.getBoundingClientRect().left > scroll.clientWidth) return;
+      e.preventDefault();
+      // preventDefault also skips the usual focus change; drop focus from e.g. the search box without
+      // focusing the gallery from script, which would draw its keyboard focus ring
+      if (document.activeElement !== scroll) document.activeElement?.blur?.();
+      try { scroll.setPointerCapture(e.pointerId); } catch { /* synthetic or already released pointer */ }
+      const box = document.createElement("div");
+      box.className = "marquee-box";
+      drag = { start: gridPoint(e.clientX, e.clientY), clientX: e.clientX, clientY: e.clientY, additive: e.shiftKey || e.ctrlKey || e.metaKey, moved: false, box };
+      drag.frame = requestAnimationFrame(autoScroll);
+    });
+    scroll.addEventListener("pointermove", e => {
+      if (!drag) return;
+      drag.clientX = e.clientX;
+      drag.clientY = e.clientY;
+      const point = gridPoint(e.clientX, e.clientY);
+      if (!drag.moved && Math.hypot(point.x - drag.start.x, point.y - drag.start.y) < 4) return;
+      if (!drag.moved) {
+        drag.moved = true;
+        scroll.classList.add("marquee-active");
+        scroll.append(drag.box);
+      }
+      this.marqueePaint();
+    });
+    scroll.addEventListener("pointerup", finish);
+    scroll.addEventListener("pointercancel", finish);
   }
 
   refreshMetrics() {
