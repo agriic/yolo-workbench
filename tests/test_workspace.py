@@ -316,3 +316,81 @@ def test_classification_split_with_several_folders(tmp_path):
     assert (root / "train_more" / "owl" / "1.jpg").exists()
     classes.rename_class(dataset, 2, "eagle")
     assert (root / "train_more" / "eagle" / "1.jpg").exists() and dataset.names == {0: "cat", 1: "dog", 2: "eagle"}
+
+
+def test_crop_box_center_and_region():
+    center = {"mode": "center", "unit": "px", "x": 0, "y": 0, "width": 40, "height": 30}
+    assert importer.crop_box(100, 50, center) == (30, 10, 70, 40)
+    assert importer.crop_box(20, 50, center) == (0, 10, 20, 40)  # narrower image: that side is kept whole
+    assert importer.crop_box(100, 50, {**center, "unit": "percent", "width": 50, "height": 50}) == (25, 12, 75, 37)
+    region = {"mode": "box", "unit": "px", "x": 80, "y": 10, "width": 40, "height": 20}
+    assert importer.crop_box(100, 50, region) == (80, 10, 100, 30)  # clipped to the image
+    assert importer.crop_box(60, 50, region) is None
+    with pytest.raises(DatasetError):
+        importer.crop_options({"mode": "center", "width": 0, "height": 10})
+    with pytest.raises(DatasetError):
+        importer.crop_options({"mode": "box", "unit": "percent", "width": 120, "height": 10})
+    assert importer.crop_options({"mode": "none"}) is None
+
+
+def test_crop_label_text_clips_boxes_and_polygons():
+    box = (50, 0, 100, 100)  # right half of a 100×100 image
+    text = (
+        "0 0.75 0.5 0.2 0.2\n"  # fully inside
+        "1 0.5 0.5 0.2 0.2\n"  # half inside: clipped
+        "2 0.2 0.2 0.1 0.1\n"  # outside: dropped
+        "3 0.48 0.5 0.1 0.1\n"  # 30% visible... kept; 1 px: dropped below
+        "4 0.455 0.5 0.1 0.1\n"  # 5% visible: dropped
+        "0 0.4 0.4 0.8 0.4 0.8 0.8 0.4 0.8\n"  # square polygon, right 3/4 inside
+        "bad line\n"
+    )
+    cropped, dropped = importer.crop_label_text(text, box, 100, 100)
+    lines = cropped.splitlines()
+    assert dropped == 2
+    assert lines[0] == "0 0.5 0.5 0.4 0.2"
+    assert lines[1] == "1 0.1 0.5 0.2 0.2"
+    assert lines[2] == "3 0.03 0.5 0.06 0.1"
+    assert lines[3].split()[0] == "0" and sorted(set(map(float, lines[3].split()[1::2]))) == [0.0, 0.6]
+    assert lines[4] == "bad line"
+
+
+def test_import_with_center_crop(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Crop", "detection", ["x"])
+    dataset = workspace.session("crop").dataset
+    source = tmp_path / "wide"
+    source.mkdir()
+    Image.new("RGB", (200, 100), "red").save(source / "a.jpg")
+    (source / "a.txt").write_text("0 0.5 0.5 0.1 0.2\n0 0.05 0.5 0.1 0.2\n")
+    Image.new("RGB", (100, 100), "blue").save(source / "b.png")
+    options = {"split_mode": "fixed", "split": "train", "crop": {"mode": "center", "unit": "px", "width": 100, "height": 100}}
+    result = importer.run_import(dataset, source, options)
+    assert result["imported"] == 2 and result["cropped"] == 1 and result["objects_cropped_out"] == 1
+    with Image.open(dataset.root / "images" / "train" / "a.jpg") as image:
+        assert image.size == (100, 100)
+    assert (dataset.root / "labels" / "train" / "a.txt").read_text() == "0 0.5 0.5 0.2 0.2\n"
+    # b.png already fits: copied unchanged
+    assert (dataset.root / "images" / "train" / "b.png").read_bytes() == (source / "b.png").read_bytes()
+    # the same crop again produces identical bytes, so it is caught as a duplicate
+    assert importer.run_import(dataset, source, options)["duplicates"] == 2
+    region = {**options, "crop": {"mode": "box", "unit": "px", "x": 150, "y": 0, "width": 40, "height": 40}}
+    assert importer.run_import(dataset, source, region)["crop_skipped"] == 1  # misses the 100×100 image
+
+
+def test_import_sample_preview(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Pets", "detection", ["cat"])
+    dataset = workspace.session("pets").dataset
+    source = make_source(tmp_path)
+    scanned = importer.scan(dataset, source)
+    assert scanned["samples"] == ["train/images/a.jpg", "train/images/b.jpg", "valid/images/c.jpg"]
+
+    async def run():
+        app = make_app(workspace, tmp_path)
+        async with client_for(app) as client:
+            response = await client.get("/api/v1/projects/pets/import/sample", params={"path": str(source), "file": "train/images/a.jpg"})
+            assert response.status_code == 200 and response.headers["x-image-size"] == "32x24"
+            bad = await client.get("/api/v1/projects/pets/import/sample", params={"path": str(source), "file": "../export/data.yaml"})
+            assert bad.status_code == 400
+
+    asyncio.run(run())

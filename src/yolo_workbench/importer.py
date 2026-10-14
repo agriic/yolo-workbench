@@ -2,13 +2,15 @@
 
 Browser uploads land in <dataset>/.yolo-workbench/staging/<id>/ first and are then
 imported exactly like a local folder. Files are always copied; labels are rewritten
-with the chosen class mapping. Imports are not on the undo stack (delete the images
+with the chosen class mapping. An optional crop (centered, or a region) re-encodes the
+images and clips the labels to it. Imports are not on the undo stack (delete the images
 to reverse one) but each is logged to .yolo-workbench/imports.jsonl.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import random
 import re
@@ -18,6 +20,7 @@ import time
 from pathlib import Path, PurePosixPath
 
 import yaml
+from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from . import classes
 from .dataset import IMAGE_EXTENSIONS, WORKBENCH_DIR, Dataset, DatasetError
@@ -27,6 +30,9 @@ SPLIT_ALIASES = {"train": "train", "training": "train", "val": "val", "valid": "
 UPLOAD_EXTENSIONS = IMAGE_EXTENSIONS | {".txt", ".yaml", ".yml", ".json"}
 STAGING_PATTERN = re.compile(r"^[a-f0-9]{16}$")
 UNASSIGNED = ""  # classification images that are not inside a class folder
+SAMPLE_COUNT = 24  # images offered for the crop preview, spread over the whole import
+MIN_VISIBLE = 0.1  # a cropped object keeping less of its area than this is dropped (Ultralytics' area_thr)
+ORIENTATION = 0x0112  # EXIF tag
 
 
 # ---------- staging (browser uploads) ----------
@@ -187,6 +193,7 @@ def scan(dataset: Dataset, source: Path) -> dict:
     """Summarize what an import from `source` would bring in, with a suggested class mapping."""
     items = _scan_items(source, dataset.category)
     by_name = {name.casefold(): class_id for class_id, name in dataset.names.items()}
+    sample_count = min(SAMPLE_COUNT, len(items))
     split_counts: dict[str, int] = {}
     for item in items:
         if item["split"]:
@@ -199,6 +206,7 @@ def scan(dataset: Dataset, source: Path) -> dict:
         "names_source": None,
         "labeled": 0,
         "classes": [],
+        "samples": [str(PurePosixPath(*items[index * len(items) // sample_count]["relative"].parts)) for index in range(sample_count)],
     }
     if dataset.category == "classification":
         counts: dict[str, int] = {}
@@ -228,6 +236,201 @@ def scan(dataset: Dataset, source: Path) -> dict:
             suggested = class_id
         result["classes"].append({"key": str(class_id), "name": name, "count": counts.get(class_id, 0), "named": name is not None, "suggested": suggested})
     return result
+
+
+# ---------- cropping ----------
+#
+# Crops work on the upright image (EXIF orientation applied, as Ultralytics loads it), and
+# the cropped file is written without an orientation tag, so pixels and labels agree everywhere.
+
+
+def crop_options(raw: dict | None) -> dict | None:
+    """Validate {mode: none|center|box, unit: px|percent, x, y, width, height}; None means no crop."""
+    if not raw or raw.get("mode", "none") == "none":
+        return None
+    mode, unit = raw.get("mode"), raw.get("unit", "px")
+    if mode not in ("center", "box"):
+        raise DatasetError("Crop mode must be none, center, or box")
+    if unit not in ("px", "percent"):
+        raise DatasetError("Crop unit must be px or percent")
+    try:
+        crop = {"mode": mode, "unit": unit, **{key: float(raw.get(key) or 0) for key in ("x", "y", "width", "height")}}
+    except (TypeError, ValueError) as exc:
+        raise DatasetError("Crop values must be numbers") from exc
+    if crop["width"] <= 0 or crop["height"] <= 0 or crop["x"] < 0 or crop["y"] < 0:
+        raise DatasetError("Crop width and height must be positive and the offset not negative")
+    if unit == "percent" and (crop["width"] > 100 or crop["height"] > 100 or crop["x"] >= 100 or crop["y"] >= 100):
+        raise DatasetError("Crop percentages must be within 0–100")
+    if mode == "center":
+        crop["x"] = crop["y"] = 0.0
+    return crop
+
+
+def crop_box(width: int, height: int, crop: dict) -> tuple[int, int, int, int] | None:
+    """The pixel box (left, top, right, bottom) `crop` cuts from a width×height image.
+
+    Center crops shrink to the image where it is smaller; a region is clipped to the image and
+    is None when it misses the image entirely. static/manage.js `cropBox` mirrors this.
+    """
+    scale_x, scale_y = (width / 100, height / 100) if crop["unit"] == "percent" else (1, 1)
+    crop_width, crop_height = int(crop["width"] * scale_x), int(crop["height"] * scale_y)
+    if crop["mode"] == "center":
+        crop_width, crop_height = max(1, min(width, crop_width)), max(1, min(height, crop_height))
+        left, top = (width - crop_width) // 2, (height - crop_height) // 2
+        return left, top, left + crop_width, top + crop_height
+    x, y = int(crop["x"] * scale_x), int(crop["y"] * scale_y)
+    left, top, right, bottom = max(0, x), max(0, y), min(width, x + crop_width), min(height, y + crop_height)
+    return (left, top, right, bottom) if right > left and bottom > top else None
+
+
+def _clip_polygon(points: list[tuple[float, float]], box: tuple[int, int, int, int]) -> list[tuple[float, float]]:
+    """Sutherland–Hodgman clipping of a polygon against an axis-aligned box."""
+    left, top, right, bottom = box
+    edges = [
+        (lambda p: p[0] >= left, lambda a, b: (left, a[1] + (b[1] - a[1]) * (left - a[0]) / (b[0] - a[0]))),
+        (lambda p: p[0] <= right, lambda a, b: (right, a[1] + (b[1] - a[1]) * (right - a[0]) / (b[0] - a[0]))),
+        (lambda p: p[1] >= top, lambda a, b: (a[0] + (b[0] - a[0]) * (top - a[1]) / (b[1] - a[1]), top)),
+        (lambda p: p[1] <= bottom, lambda a, b: (a[0] + (b[0] - a[0]) * (bottom - a[1]) / (b[1] - a[1]), bottom)),
+    ]
+    for inside, intersect in edges:
+        if not points:
+            break
+        clipped = []
+        for index, current in enumerate(points):
+            previous = points[index - 1]
+            if inside(current):
+                if not inside(previous):
+                    clipped.append(intersect(previous, current))
+                clipped.append(current)
+            elif inside(previous):
+                clipped.append(intersect(previous, current))
+        points = clipped
+    deduplicated = [point for index, point in enumerate(points) if point != points[index - 1]] if len(points) > 1 else points
+    return deduplicated
+
+
+def _area(points: list[tuple[float, float]]) -> float:
+    return abs(sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1]))) / 2
+
+
+def _crop_geometry(values: list[float], box: tuple[int, int, int, int], width: int, height: int) -> list[float] | None:
+    """Normalized geometry relative to the crop, or None when too little of the object is left."""
+    left, top, right, bottom = box
+    crop_width, crop_height = right - left, bottom - top
+    if len(values) == 4:
+        cx, cy, box_width, box_height = values
+        x1, x2 = sorted(((cx - box_width / 2) * width, (cx + box_width / 2) * width))
+        y1, y2 = sorted(((cy - box_height / 2) * height, (cy + box_height / 2) * height))
+        cx1, cy1, cx2, cy2 = max(x1, left), max(y1, top), min(x2, right), min(y2, bottom)
+        original, visible = (x2 - x1) * (y2 - y1), max(0.0, cx2 - cx1) * max(0.0, cy2 - cy1)
+        if visible <= 0 or visible < MIN_VISIBLE * original:
+            return None
+        return [((cx1 + cx2) / 2 - left) / crop_width, ((cy1 + cy2) / 2 - top) / crop_height, (cx2 - cx1) / crop_width, (cy2 - cy1) / crop_height]
+    points = [(x * width, y * height) for x, y in zip(values[::2], values[1::2])]
+    clipped = _clip_polygon(points, box)
+    original, visible = _area(points), _area(clipped) if len(clipped) >= 3 else 0.0
+    if visible <= 0 or visible < MIN_VISIBLE * original:
+        return None
+    return [min(1.0, max(0.0, value)) for x, y in clipped for value in ((x - left) / crop_width, (y - top) / crop_height)]
+
+
+def _number(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def crop_label_text(text: str, box: tuple[int, int, int, int], width: int, height: int) -> tuple[str, int]:
+    """Rewrite YOLO label lines for an image cropped to `box`; returns (text, objects dropped).
+
+    Boxes (4 values) are clipped, polygons (6+ even values) clipped with Sutherland–Hodgman.
+    Lines that are neither are kept as they are, so Validation still reports them.
+    """
+    lines, dropped = [], 0
+    for line in text.splitlines(keepends=True):
+        parts = line.split()
+        try:
+            values = [float(value) for value in parts[1:]]
+        except ValueError:
+            values = []
+        if not parts or not (len(values) == 4 or (len(values) >= 6 and len(values) % 2 == 0)):
+            lines.append(line)
+            continue
+        geometry = _crop_geometry(values, box, width, height)
+        if geometry is None:
+            dropped += 1
+            continue
+        lines.append(" ".join([parts[0], *map(_number, geometry)]) + "\n")
+    return "".join(lines), dropped
+
+
+def _encode(image: Image.Image, source: Image.Image, suffix: str) -> bytes:
+    """Encode a cropped image in the source's format, keeping its ICC profile and EXIF (minus orientation)."""
+    image_format = Image.registered_extensions().get(suffix.lower(), "PNG")
+    params: dict = {}
+    if image_format in ("JPEG", "WEBP"):
+        params["quality"] = 95
+    if image_format == "JPEG" and image.mode not in ("RGB", "L", "CMYK"):
+        image = image.convert("RGB")
+    if source.info.get("icc_profile"):
+        params["icc_profile"] = source.info["icc_profile"]
+    exif = source.getexif()
+    if exif and image_format in ("JPEG", "WEBP", "PNG", "TIFF"):
+        exif.pop(ORIENTATION, None)
+        params["exif"] = exif.tobytes()
+    output = io.BytesIO()
+    image.save(output, image_format, **params)
+    return output.getvalue()
+
+
+def crop_image(path: Path, crop: dict) -> dict | None:
+    """Crop one image: {"data": bytes or None (the box is the whole image: copy unchanged), "box", "size"}.
+
+    None when the region misses the image or the image cannot be read.
+    """
+    try:
+        with Image.open(path) as source:
+            upright = ImageOps.exif_transpose(source)
+            width, height = upright.size
+            box = crop_box(width, height, crop)
+            if box is None:
+                return None
+            if box == (0, 0, width, height):
+                return {"data": None, "box": box, "size": (width, height)}
+            return {"data": _encode(upright.crop(box), source, path.suffix), "box": box, "size": (width, height)}
+    except (OSError, UnidentifiedImageError, ValueError):
+        return None
+
+
+def sample_preview(source: Path, relative: str, category: str, size: int = 640) -> tuple[bytes, int, int]:
+    """A JPEG of one source image (upright, its labels drawn) for the crop preview, with its full size."""
+    image_path = source.joinpath(*safe_relative(relative).parts)
+    if image_path.suffix.lower() not in IMAGE_EXTENSIONS or not image_path.resolve().is_relative_to(source.resolve()) or not image_path.is_file():
+        raise DatasetError(f"Not an image in this import: {relative!r}")
+    label = None if category == "classification" else next((candidate for candidate in _label_candidates(image_path, source) if candidate.is_file()), None)
+    try:
+        with Image.open(image_path) as opened:
+            image = ImageOps.exif_transpose(opened).convert("RGB")
+    except (OSError, UnidentifiedImageError) as exc:
+        raise DatasetError(f"Cannot read {relative}: {exc}") from exc
+    width, height = image.size
+    image.thumbnail((size, size))
+    if label is not None:
+        draw = ImageDraw.Draw(image)
+        for line in label.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                values = [float(value) for value in line.split()[1:]]
+            except ValueError:
+                continue
+            if len(values) == 4:
+                cx, cy, box_width, box_height = values
+                xs = sorted(((cx - box_width / 2) * image.width, (cx + box_width / 2) * image.width))
+                ys = sorted(((cy - box_height / 2) * image.height, (cy + box_height / 2) * image.height))
+                draw.rectangle((xs[0], ys[0], xs[1], ys[1]), outline="#facc15", width=2)
+            elif len(values) >= 6 and len(values) % 2 == 0:
+                points = [(x * image.width, y * image.height) for x, y in zip(values[::2], values[1::2])]
+                draw.line(points + points[:1], fill="#facc15", width=2)
+    output = io.BytesIO()
+    image.save(output, "JPEG", quality=85)
+    return output.getvalue(), width, height
 
 
 # ---------- committing ----------
@@ -331,8 +534,11 @@ class _Fingerprints:
             self.hashes[path] = digest.hexdigest()
         return self.hashes[path]
 
-    def seen(self, path: Path) -> bool:
-        size = path.stat().st_size
+    def seen(self, path: Path, data: bytes | None = None) -> bool:
+        """Whether `path` (or `data`, the bytes about to be written for it) is already known."""
+        if data is not None:
+            self.hashes[path] = hashlib.sha1(data).hexdigest()
+        size = len(data) if data is not None else path.stat().st_size
         others = self.by_size.get(size, [])
         if others:
             digest = self._hash(path)
@@ -355,11 +561,12 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
     # each split may have several folders; the caller picks one per split (default: the first)
     chosen = options.get("folders") or {}
     folders = {split: dataset.resolve_folder(split, chosen.get(split)) for split in {item["target"] for item in items}}
+    crop = crop_options(options.get("crop"))
     mapping = _resolve_mapping(dataset, scanned, options.get("mapping"))
     label_mapping = {int(key): value for key, value in mapping.items()} if dataset.category != "classification" and scanned["names_source"] else None
     fingerprints = _Fingerprints(record.path for record in list(dataset.images.values())) if options.get("skip_duplicates", True) else None
     planned: set[Path] = set()
-    stats = {"imported": 0, "labels": 0, "duplicates": 0, "dropped": 0, "renamed": 0, "by_split": {}}
+    stats = {"imported": 0, "labels": 0, "duplicates": 0, "dropped": 0, "renamed": 0, "cropped": 0, "crop_skipped": 0, "objects_cropped_out": 0, "by_split": {}}
     rescan: dict = {}
     if job:
         job.progress(0, len(items), "Copying files…")
@@ -367,7 +574,7 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
         for index, item in enumerate(items):
             if job:
                 job.progress(index, len(items))
-            _copy_item(dataset, item, mapping, label_mapping, fingerprints, planned, stats, folders)
+            _copy_item(dataset, item, mapping, label_mapping, fingerprints, planned, stats, folders, crop)
     finally:
         # also after a cancel: whatever was copied is part of the dataset now
         if job and not job.cancel_requested:
@@ -392,7 +599,7 @@ def _target_paths(dataset: Dataset, directory: Path, name: str, planned: set[Pat
         candidate = base.with_name(f"{base.stem}_{counter}{base.suffix}")
 
 
-def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict | None, fingerprints: _Fingerprints | None, planned: set[Path], stats: dict, folders: dict[str, Path]) -> None:
+def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict | None, fingerprints: _Fingerprints | None, planned: set[Path], stats: dict, folders: dict[str, Path], crop: dict | None = None) -> None:
     if dataset.category == "classification":
         class_id = mapping.get(item["class"])
         if class_id is None:
@@ -401,7 +608,13 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
         directory = folders[item["target"]] / dataset.names[class_id]
     else:
         directory = folders[item["target"]]
-    if fingerprints is not None and fingerprints.seen(item["image"]):
+    cropped = crop_image(item["image"], crop) if crop else None
+    if crop and cropped is None:
+        stats["crop_skipped"] += 1
+        return
+    data = cropped["data"] if cropped else None
+    # a cropped image is compared by the bytes it will have, so re-importing with the same crop is still caught
+    if fingerprints is not None and fingerprints.seen(item["image"], data):
         stats["duplicates"] += 1
         return
     target, label_target = _target_paths(dataset, directory, item["image"].name, planned)
@@ -409,11 +622,18 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
         stats["renamed"] += 1
     planned.add(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(item["image"], target)
+    if data is not None:
+        target.write_bytes(data)
+        stats["cropped"] += 1
+    else:
+        shutil.copy2(item["image"], target)
     if label_target is not None and item["label"] is not None:
         text = item["label"].read_text(encoding="utf-8")
         if label_mapping is not None:
             text = classes.remap_label_text(text, label_mapping)
+        if data is not None:
+            text, removed = crop_label_text(text, cropped["box"], *cropped["size"])
+            stats["objects_cropped_out"] += removed
         planned.add(label_target)
         label_target.parent.mkdir(parents=True, exist_ok=True)
         label_target.write_text(text, encoding="utf-8")
@@ -426,7 +646,7 @@ def _log(dataset: Dataset, source: Path, options: dict, mapping: dict, stats: di
     entry = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": "browser upload" if options.get("staging_id") else str(source),
-        "options": {key: value for key, value in options.items() if key in {"split_mode", "split", "ratios", "seed", "skip_duplicates", "folders"}},
+        "options": {key: value for key, value in options.items() if key in {"split_mode", "split", "ratios", "seed", "skip_duplicates", "folders", "crop"}},
         "mapping": mapping,
         **stats,
     }

@@ -1,4 +1,4 @@
-import { $, api, esc, classColor } from "./api.js";
+import { $, api, apiUrl, esc, classColor } from "./api.js";
 import { state } from "./state.js";
 let deps;
 
@@ -19,6 +19,7 @@ let importSource = null;  // { path } or { staging_id }
 let importScan = null;
 let importJob = null;
 let uploadAbort = null;
+let cropSample = null;    // crop preview: { index, file, width, height, url, controller }
 
 export function bindManage() {
   $("class-add-form").onsubmit = e => { e.preventDefault(); addClasses(); };
@@ -72,16 +73,22 @@ export function bindManage() {
   $("import-review").addEventListener("click", e => {
     if (e.target.closest("#import-commit")) commitImport();
     if (e.target.closest("#import-discard")) resetImport();
+    const step = e.target.closest("[data-sample-step]");
+    if (step) loadCropSample((cropSample?.index ?? 0) + +step.dataset.sampleStep);
   });
   $("import-review").addEventListener("change", async e => {
     if (e.target.name === "split-mode" || e.target.closest(".ratio-input")) updateImportSummary();
+    if (e.target.name === "crop-mode" || e.target.closest("[data-crop]")) updateCropPreview();
     const folderSelect = e.target.closest("[data-folder-split]");
     if (folderSelect && folderSelect.value === NEW_FOLDER) {
       const path = await addFolder(folderSelect.dataset.folderSplit);
       renderFolderSelects(path ? { [folderSelect.dataset.folderSplit]: path } : {});
     }
   });
-  $("import-review").addEventListener("input", e => { if (e.target.closest(".ratio-input")) updateImportSummary(); });
+  $("import-review").addEventListener("input", e => {
+    if (e.target.closest(".ratio-input")) updateImportSummary();
+    if (e.target.closest("[data-crop]")) updateCropPreview();
+  });
 }
 
 /* ---------- dataset tab ---------- */
@@ -364,6 +371,7 @@ function renderImportReview() {
   const splitCounts = Object.entries(scan.splits);
   const targetSplits = scan.target_splits;
   const nameSource = classification ? null : scan.names_source;
+  clearCropSample();
   $("import-progress").hidden = true;
   $("import-start").hidden = true;
   $("import-review").hidden = false;
@@ -379,6 +387,7 @@ function renderImportReview() {
       ${splitCounts.length ? `<label class="radio-row"><input type="radio" name="split-mode" value="source" checked><span>Keep the source splits (${splitCounts.map(([split, count]) => `${esc(split)} ${count}`).join(" · ")}; the rest go to the split chosen above)</span></label>` : ""}
     </fieldset>
     <fieldset class="import-fieldset" id="import-folders"><legend>Destination folders</legend><div class="folder-targets"></div></fieldset>
+    ${cropFieldset(classification)}
     ${scan.classes.length ? `<fieldset class="import-fieldset"><legend>Classes</legend><table class="stats-table import-mapping">
       <thead><tr><th>Source</th><th>${classification ? "Images" : "Annotations"}</th><th>Becomes</th></tr></thead>
       <tbody>${scan.classes.map(item => `<tr>
@@ -391,6 +400,110 @@ function renderImportReview() {
     <div class="modal-actions"><button id="import-discard" class="secondary" type="button">Cancel</button><button id="import-commit" type="button" class="primary-btn">Import</button></div>`;
   renderFolderSelects();
   updateImportSummary();
+  updateCropPreview();
+}
+
+const cropNumber = (key, label, value, max = "") => `<label class="crop-input">${label} <input type="number" min="0" ${max && `max="${max}"`} step="1" data-crop="${key}" value="${value}"></label>`;
+const cropUnit = mode => `<select data-crop="${mode}.unit" aria-label="Unit"><option value="px">px</option><option value="percent">%</option></select>`;
+
+function cropFieldset(classification) {
+  return `<fieldset class="import-fieldset" id="import-crop"><legend>Crop</legend>
+    <label class="radio-row"><input type="radio" name="crop-mode" value="none" checked><span>Keep images as they are</span></label>
+    <label class="radio-row"><input type="radio" name="crop-mode" value="center"><span>Center crop <span class="muted">— from the middle out to the sides</span>
+      <span class="crop-fields">${cropNumber("center.width", "width", 640)}${cropNumber("center.height", "height", 640)}${cropUnit("center")}</span></span></label>
+    <label class="radio-row"><input type="radio" name="crop-mode" value="box"><span>Region <span class="muted">— from the top-left corner x, y</span>
+      <span class="crop-fields">${cropNumber("box.x", "x", 0)}${cropNumber("box.y", "y", 0)}${cropNumber("box.width", "width", 640)}${cropNumber("box.height", "height", 640)}${cropUnit("box")}</span></span></label>
+    <div class="crop-preview-wrap" hidden>
+      <div class="crop-preview"><img alt="Crop preview"><div class="crop-rect"></div></div>
+      <div class="crop-preview-bar">
+        <button type="button" class="secondary icon-btn" data-sample-step="-1" aria-label="Previous sample">‹</button>
+        <span class="crop-caption muted"></span>
+        <button type="button" class="secondary icon-btn" data-sample-step="1" aria-label="Next sample">›</button>
+      </div>
+      <p class="panel-note">${classification ? "" : "Labels are clipped to the crop; objects keeping less than 10% of their area are dropped. "}Images already within the crop are copied unchanged; images the region misses are skipped. Cropped images are re-encoded upright (EXIF orientation applied).</p>
+    </div>
+  </fieldset>`;
+}
+
+function readCrop() {
+  const review = $("import-review");
+  const mode = review.querySelector('[name="crop-mode"]:checked')?.value || "none";
+  if (mode === "none") return { mode };
+  const value = key => Math.max(0, +review.querySelector(`[data-crop="${mode}.${key}"]`)?.value || 0);
+  return { mode, unit: review.querySelector(`[data-crop="${mode}.unit"]`).value, x: value("x"), y: value("y"), width: value("width"), height: value("height") };
+}
+
+// Mirrors importer.crop_box: the pixel box (left, top, right, bottom), or null when a region misses the image.
+function cropBox(width, height, crop) {
+  const [scaleX, scaleY] = crop.unit === "percent" ? [width / 100, height / 100] : [1, 1];
+  let cropWidth = Math.trunc(crop.width * scaleX), cropHeight = Math.trunc(crop.height * scaleY);
+  if (crop.mode === "center") {
+    cropWidth = Math.max(1, Math.min(width, cropWidth));
+    cropHeight = Math.max(1, Math.min(height, cropHeight));
+    const left = Math.floor((width - cropWidth) / 2), top = Math.floor((height - cropHeight) / 2);
+    return [left, top, left + cropWidth, top + cropHeight];
+  }
+  const x = Math.trunc(crop.x * scaleX), y = Math.trunc(crop.y * scaleY);
+  const box = [Math.max(0, x), Math.max(0, y), Math.min(width, x + cropWidth), Math.min(height, y + cropHeight)];
+  return box[2] > box[0] && box[3] > box[1] ? box : null;
+}
+
+function updateCropPreview() {
+  const review = $("import-review");
+  const crop = readCrop();
+  review.querySelectorAll("[data-crop]").forEach(input => input.disabled = !input.dataset.crop.startsWith(`${crop.mode}.`));
+  review.querySelectorAll("[data-crop$='.unit']").forEach(select => {
+    review.querySelectorAll(`[data-crop^="${select.dataset.crop.split(".")[0]}."]:not(select)`).forEach(input => input.max = select.value === "percent" ? 100 : "");
+  });
+  const wrap = review.querySelector(".crop-preview-wrap");
+  if (!wrap) return;
+  wrap.hidden = crop.mode === "none" || !importScan.samples?.length;
+  if (wrap.hidden) return;
+  if (!cropSample) return loadCropSample(0);
+  const rect = wrap.querySelector(".crop-rect");
+  const caption = wrap.querySelector(".crop-caption");
+  const position = `${cropSample.index + 1}/${importScan.samples.length} · ${esc(cropSample.file)}`;
+  if (!cropSample.width) { rect.hidden = true; caption.innerHTML = position; return; }
+  const { width, height } = cropSample;
+  const box = cropBox(width, height, crop);
+  rect.hidden = !box;
+  if (!box) {
+    caption.innerHTML = `${position} · ${width}×${height} · <span class="warn-text">the region misses this image: it would be skipped</span>`;
+    return;
+  }
+  Object.assign(rect.style, { left: `${box[0] / width * 100}%`, top: `${box[1] / height * 100}%`, width: `${(box[2] - box[0]) / width * 100}%`, height: `${(box[3] - box[1]) / height * 100}%` });
+  const whole = box[0] === 0 && box[1] === 0 && box[2] === width && box[3] === height;
+  caption.innerHTML = `${position} · ${width}×${height} → ${whole ? "unchanged" : `${box[2] - box[0]}×${box[3] - box[1]}`}`;
+}
+
+async function loadCropSample(index) {
+  const samples = importScan?.samples || [];
+  if (!samples.length || !importSource) return;
+  index = (index + samples.length) % samples.length;
+  cropSample?.controller.abort();
+  if (cropSample?.url) URL.revokeObjectURL(cropSample.url);
+  const controller = new AbortController();
+  cropSample = { index, file: samples[index], width: 0, height: 0, url: null, controller };
+  updateCropPreview();
+  const query = new URLSearchParams({ ...importSource, file: samples[index] });
+  try {
+    const response = await fetch(apiUrl(`/import/sample?${query}`), { signal: controller.signal });
+    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || response.statusText);
+    const [width, height] = (response.headers.get("X-Image-Size") || "0x0").split("x").map(Number);
+    const url = URL.createObjectURL(await response.blob());
+    if (cropSample?.controller !== controller) return URL.revokeObjectURL(url);
+    Object.assign(cropSample, { width, height, url });
+    $("import-review").querySelector(".crop-preview img").src = url;
+    updateCropPreview();
+  } catch (error) {
+    if (error.name !== "AbortError") deps.toast(`Preview failed: ${error.message}`, "error");
+  }
+}
+
+function clearCropSample() {
+  cropSample?.controller.abort();
+  if (cropSample?.url) URL.revokeObjectURL(cropSample.url);
+  cropSample = null;
 }
 
 // One folder picker per split; keeps the current choices unless `chosen` overrides them.
@@ -434,6 +547,7 @@ async function commitImport() {
     mapping,
     folders: Object.fromEntries([...review.querySelectorAll("[data-folder-split]")].map(select => [select.dataset.folderSplit, select.value])),
     skip_duplicates: $("import-skip-duplicates").checked,
+    crop: readCrop(),
   };
   try {
     const job = await api("/import/commit", { method: "POST", body: JSON.stringify(body) });
@@ -456,7 +570,11 @@ function trackJob(job, schema) {
   resetImport(false);
   const result = job.result;
   if (job.state === "done" && result) {
-    const extra = [result.duplicates && `${result.duplicates} duplicates skipped`, result.renamed && `${result.renamed} renamed`, result.dropped && `${result.dropped} skipped`].filter(Boolean);
+    const extra = [
+      result.cropped && `${result.cropped} cropped`, result.duplicates && `${result.duplicates} duplicates skipped`, result.renamed && `${result.renamed} renamed`,
+      result.dropped && `${result.dropped} skipped`, result.crop_skipped && `${result.crop_skipped} outside the crop region`,
+      result.objects_cropped_out && `${plural(result.objects_cropped_out, "object")} cropped out`,
+    ].filter(Boolean);
     deps.toast(`Imported ${plural(result.imported, "image")}${result.labels ? ` and ${plural(result.labels, "label")}` : ""}${extra.length ? ` · ${extra.join(", ")}` : ""}`);
   } else if (job.state === "cancelled") {
     deps.toast("Import cancelled — files copied so far were kept", "error");
@@ -486,6 +604,7 @@ function resetImport(discard = true) {
   if (discard && importSource?.staging_id) api(`/import/staging/${importSource.staging_id}`, { method: "DELETE" }).catch(() => {});
   importSource = null;
   importScan = null;
+  clearCropSample();
   $("import-review").hidden = true;
   $("import-review").innerHTML = "";
   $("import-progress").hidden = true;

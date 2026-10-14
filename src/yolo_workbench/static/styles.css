@@ -971,6 +971,17 @@ body:not(.image-ops) #image-bulk { display: none !important; }
 .radio-row select, .import-fieldset select { border: 1px solid var(--line); border-radius: 5px; background: var(--surface); padding: 2px 6px; }
 .ratio-input { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; color: var(--text-2); white-space: nowrap; }
 .ratio-input input { width: 58px; border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; background: var(--surface); }
+.crop-fields { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 2px; }
+.crop-input { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); white-space: nowrap; }
+.crop-input input { width: 64px; border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; background: var(--surface); }
+.crop-input input:disabled, #import-crop select:disabled { opacity: .5; }
+.crop-preview-wrap { display: grid; gap: 6px; justify-items: center; padding-top: 8px; }
+.crop-preview { position: relative; overflow: hidden; border-radius: var(--radius); line-height: 0; background: var(--line); min-width: 120px; min-height: 80px; }
+.crop-preview img { display: block; max-width: 100%; max-height: 320px; }
+.crop-rect { position: absolute; outline: 2px solid var(--accent); box-shadow: 0 0 0 9999px rgb(0 0 0 / .55); pointer-events: none; }
+.crop-preview-bar { display: flex; align-items: center; gap: 8px; font-size: 12px; max-width: 100%; }
+.crop-caption { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.crop-preview-wrap .panel-note { margin: 0; justify-self: stretch; }
 
 dialog.modal { border: 1px solid var(--line); border-radius: 10px; padding: 0; background: var(--surface); color: var(--text); box-shadow: var(--shadow-2); width: min(480px, calc(100vw - 32px)); }
 dialog.modal::backdrop { background: rgb(10 16 14 / 45%); }

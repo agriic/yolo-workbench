@@ -132,6 +132,15 @@ class ImportSourcePayload(BaseModel):
     staging_id: str | None = None
 
 
+class ImportCropPayload(BaseModel):
+    mode: Literal["none", "center", "box"] = "none"  # center: width×height around the middle; box: the region at x, y
+    unit: Literal["px", "percent"] = "px"
+    x: float = Field(0, ge=0)
+    y: float = Field(0, ge=0)
+    width: float = Field(0, ge=0)
+    height: float = Field(0, ge=0)
+
+
 class ImportCommitPayload(ImportSourcePayload):
     split_mode: Literal["fixed", "auto", "source"] = "fixed"
     split: Literal["train", "val", "test"] = "train"
@@ -140,6 +149,7 @@ class ImportCommitPayload(ImportSourcePayload):
     mapping: dict[str, int | Literal["new"] | None] | None = None
     folders: dict[str, str] | None = None  # split -> target folder (as listed by GET /folders)
     skip_duplicates: bool = True
+    crop: ImportCropPayload | None = None
 
 
 class ProjectCreatePayload(BaseModel):
@@ -370,12 +380,22 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         require_import(session)
         return importer.scan(session.dataset, importer.resolve_source(session.dataset, payload.path, payload.staging_id))
 
+    @router.get("/import/sample")
+    def import_sample(file: str, path: str | None = None, staging_id: str | None = None, size: int = Query(640, ge=64, le=1280), session: DatasetSession = current):
+        """One image of a scanned import (labels drawn) for the crop preview; X-Image-Size is its full upright size."""
+        source = importer.resolve_source(session.dataset, path, staging_id)
+        content, width, height = importer.sample_preview(source, file, session.dataset.category, size)
+        response = jpeg_response(content)
+        response.headers["X-Image-Size"] = f"{width}x{height}"
+        return response
+
     @router.post("/import/commit")
     def import_commit(payload: ImportCommitPayload, session: DatasetSession = current):
         require_import(session)
         dataset = session.dataset
         dataset.check_writable()
         source = importer.resolve_source(dataset, payload.path, payload.staging_id)
+        importer.crop_options(payload.crop.model_dump() if payload.crop else None)  # reject a bad crop before the job starts
         if jobs.running(session.slug):
             raise DatasetError("Another import is still running")
         options = payload.model_dump()
