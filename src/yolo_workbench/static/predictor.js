@@ -32,7 +32,7 @@ export function renderModelMenu() {
   const items = state.pred.models || [];
   $("model-menu").innerHTML = items.map(item => `
     <button type="button" class="model-option ${item.path === state.pred.modelPath ? "active" : ""}" data-path="${esc(item.path)}" title="${esc(item.path)}">
-      <span class="model-option-name">${esc(item.name)}${item.source === "recent" ? ' <span class="model-recent">recent</span>' : ""}${item.path === state.pred.modelPath ? ' <span class="model-recent">loaded</span>' : ""}</span>
+      <span class="model-option-name">${esc(item.name)}${item.source === "recent" ? ' <span class="model-recent">recent</span>' : ""}${item.trained ? ' <span class="model-recent">trained here</span>' : ""}${item.path === state.pred.modelPath ? ' <span class="model-recent">loaded</span>' : ""}</span>
       <span class="model-option-meta">${esc(shortDir(item.path))} · ${formatSize(item.size)}</span>
     </button>`).join("") || `<p class="empty-note">No .pt files found near the dataset — type a path instead.</p>`;
 }

@@ -36,6 +36,32 @@ async function load() {
   renderProjects();
   renderUnmanaged(data.unmanaged);
   renderTrash(trash.items);
+  pollTraining();
+}
+
+// training badges on the cards: the active run and queued runs (one queue for all projects)
+let trainingTimer = null;
+async function pollTraining() {
+  clearTimeout(trainingTimer);
+  try {
+    const queue = await api("/api/v1/training/queue");
+    const badges = new Map();
+    if (queue.active) badges.set(queue.active.project, { text: `Training ${queue.active.name} · ${queue.active.epoch ?? 0}/${queue.active.epochs ?? "?"}`, run: queue.active, queued: false });
+    queue.queued.forEach((item, index) => {
+      if (!badges.has(item.project)) badges.set(item.project, { text: `Queued #${index + 1}`, run: item, queued: true });
+    });
+    document.querySelectorAll("[data-training-flag]").forEach(flag => {
+      const badge = badges.get(flag.dataset.trainingFlag);
+      flag.hidden = !badge;
+      if (!badge) return;
+      flag.classList.toggle("queued", badge.queued);
+      flag.innerHTML = `${badge.queued ? "" : '<span class="live-dot" aria-hidden="true"></span>'}${esc(badge.text)}`;
+      flag.title = `${badge.run.name}: ${badge.queued ? "waiting in the training queue" : "training"}`;
+    });
+    trainingTimer = setTimeout(pollTraining, queue.active ? 5000 : 15000);
+  } catch {
+    trainingTimer = setTimeout(pollTraining, 15000);
+  }
 }
 
 function renderProjects() {
@@ -47,6 +73,7 @@ function renderProjects() {
         ${project.has_cover ? `<img src="/api/v1/projects/${encodeURIComponent(project.slug)}/cover?v=${encodeURIComponent(project.updated || "")}" alt="" loading="lazy">`
           : `<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>`}
         ${project.active ? `<span class="pred-flag" title="Currently open">open</span>` : ""}
+        <span class="training-flag" data-training-flag="${esc(project.slug)}" hidden></span>
       </a>
       <div class="card-body">
         <div class="project-card-head">

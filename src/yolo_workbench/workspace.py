@@ -7,7 +7,9 @@
     data.yaml                    always written; Ultralytics-compatible (no `path:` key)
     images/, labels/             detection / segmentation
     train/, val/, test/          classification (<split>/<class>/<images>)
-    models/, runs/               reserved for training
+    models/                      reserved for trained/exported models
+    runs/                        training runs (see training.py)
+  .training/queue.json           the training queue shared by all projects
     .yolo-workbench/             backups, size index, trash, staging, imports.jsonl, cover.jpg
 
 Only one project is open at a time; opening another closes the current one when it is idle.
@@ -30,6 +32,7 @@ from PIL import Image
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError, WriteConflict
 from .jobs import JobManager
 from .session import DatasetSession
+from .training import TrainingManager, TrainingTarget
 
 PROJECT_FILE = "project.json"
 TRASH_DIR = ".trash"
@@ -40,7 +43,7 @@ COVER_SIZE = 480
 
 
 class Workspace:
-    def __init__(self, root: Path, jobs: JobManager | None = None, background_probe: bool = True, session_factory=None):
+    def __init__(self, root: Path, jobs: JobManager | None = None, background_probe: bool = True, session_factory=None, training_options: dict | None = None):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs = jobs or JobManager()
@@ -48,6 +51,8 @@ class Workspace:
         self._session_factory = session_factory or self._default_session
         self._lock = threading.RLock()
         self.active: DatasetSession | None = None
+        # one queue for all projects (one GPU); runs outlive project switches, so it is not per session
+        self.training = TrainingManager(self.root / ".training", self.training_target, jobs=self.jobs, **(training_options or {}))
 
     # ---------- paths ----------
 
@@ -271,6 +276,9 @@ class Workspace:
         with self._lock:
             directory = self.project_dir(slug)
             data = self._read_project(directory)
+            reason = self.training.project_busy(slug)
+            if reason:
+                raise WriteConflict(f"Project '{data.get('name', slug)}' cannot be deleted: {reason}")
             if self.active is not None and self.active.slug == slug:
                 self.close_active()
             self.trash_root.mkdir(exist_ok=True)
@@ -350,11 +358,28 @@ class Workspace:
                 self.close_active()
             _clean_staging(directory)
             session = self._session_factory(slug, directory, data)
+            self.training.attach(session.dataset)  # read-only from the start if one of its runs is training
             session.project = self._card(slug, directory, data)
             self.active = session
             session.project["active"] = True
             self.refresh_summary(session)
             return session
+
+    def training_target(self, slug: str | None) -> TrainingTarget:
+        """Where a project's runs live. Never takes the workspace lock (the training manager calls it under its own)."""
+        if slug is None:
+            raise KeyError("Project not found")
+        directory = self.project_dir(slug)
+        data = self._read_project(directory)
+        yaml_path = (directory / data.get("yaml", "data.yaml")).resolve()
+
+        def dataset() -> Dataset:
+            active = self.active
+            if active is not None and active.slug == slug:
+                return active.dataset
+            return Dataset(yaml_path, data["category"], background_probe=True, allow_empty=True)
+
+        return TrainingTarget(slug, data.get("name") or slug, data["category"], yaml_path, directory / "runs", dataset)
 
     def close_active(self) -> None:
         with self._lock:

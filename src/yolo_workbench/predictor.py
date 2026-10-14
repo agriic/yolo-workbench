@@ -227,10 +227,29 @@ class PredictorManager:
         except OSError:
             pass  # recents are a convenience; failing to persist them must never break loading
 
+    def _trained_models(self) -> dict[Path, str]:
+        """best.pt of the dataset's training runs (newest first) -> "<run name> · best.pt"."""
+        from .training import runs_root_for
+
+        root = runs_root_for(self.dataset.yaml_path)
+        found: list[tuple[float, Path, str]] = []
+        if root.is_dir():
+            # workbench runs sit directly in runs/; `yolo train` runs one level deeper (runs/detect/train2)
+            for weights in [*root.glob("*/weights/best.pt"), *root.glob("*/*/weights/best.pt")]:
+                run_dir = weights.parent.parent
+                try:
+                    name = json.loads((run_dir / "workbench" / "run.json").read_text(encoding="utf-8")).get("name") or run_dir.name
+                    mtime = weights.stat().st_mtime
+                except (OSError, ValueError, AttributeError):
+                    name, mtime = run_dir.name, 0.0
+                found.append((mtime, weights.resolve(), f"{name} · best.pt"))
+        return {path: label for _, path, label in sorted(found, key=lambda item: item[0], reverse=True)}
+
     def discover_models(self) -> dict:
-        """Recently used models first, then .pt files found near the dataset, cwd, and recents' directories."""
+        """Recently used models first, then this dataset's trained runs, then .pt files found near the dataset, cwd, and recents' directories."""
         items: list[dict] = []
         seen: set[Path] = set()
+        trained = self._trained_models()
 
         def add(path: Path, source: str) -> None:
             resolved = path.resolve()
@@ -241,11 +260,13 @@ class PredictorManager:
             except OSError:
                 return
             seen.add(resolved)
-            items.append({"path": str(resolved), "name": resolved.name, "size": stat.st_size, "mtime": int(stat.st_mtime), "source": source})
+            items.append({"path": str(resolved), "name": trained.get(resolved, resolved.name), "size": stat.st_size, "mtime": int(stat.st_mtime), "source": source, "trained": resolved in trained})
 
         recents = self._recent_models()
         for recent in recents:
             add(Path(recent), "recent")
+        for path in trained:
+            add(path, "run")
         # also scan the directories models were previously loaded from
         roots = {self.dataset.root, Path.cwd()} | {Path(recent).parent for recent in recents}
         found: list[Path] = []

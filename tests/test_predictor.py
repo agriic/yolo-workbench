@@ -1,3 +1,4 @@
+import json
 import asyncio
 import threading
 
@@ -406,6 +407,21 @@ def test_discover_scans_directories_of_recent_models(tmp_path, tmp_path_factory)
     found = manager.discover_models()["items"]
     assert found[0]["path"] == str(loaded.resolve())
     assert any(item["path"] == str((outside / "sibling.pt").resolve()) for item in found)
+
+
+def test_discover_lists_trained_runs_by_name(tmp_path):
+    dataset, _, manager, _ = make_predictor(tmp_path)
+    runs = tmp_path / "runs"
+    for run, name in (("exp-1", "Baseline"), ("detect/train2", None)):
+        (runs / run / "weights").mkdir(parents=True)
+        (runs / run / "weights" / "best.pt").write_bytes(b"fake")
+        if name:
+            (runs / run / "workbench").mkdir()
+            (runs / run / "workbench" / "run.json").write_text(json.dumps({"name": name}))
+    found = {item["path"]: item for item in manager.discover_models()["items"]}
+    baseline = found[str((runs / "exp-1" / "weights" / "best.pt").resolve())]
+    assert baseline["name"] == "Baseline · best.pt" and baseline["source"] == "run" and baseline["trained"]
+    assert found[str((runs / "detect" / "train2" / "weights" / "best.pt").resolve())]["name"] == "train2 · best.pt"
 
 
 def test_recent_models_skip_deleted_files(tmp_path):

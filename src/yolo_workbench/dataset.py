@@ -28,6 +28,10 @@ class WriteConflict(RuntimeError):
     pass
 
 
+class DatasetLocked(WriteConflict):
+    """A write was refused because the dataset is read-only right now (a training run uses it)."""
+
+
 @dataclass
 class HistoryEntry:
     label_path: Path
@@ -121,6 +125,10 @@ class Dataset:
         # managed projects start with no images and no classes; external datasets must have both
         self.allow_empty = allow_empty
         self.background_probe = background_probe
+        # returns why the dataset is read-only right now (a training run), or None; see check_writable()
+        self.write_guard = None
+        # training runs live in <dataset dir>/runs/; never index their plots or treat files there as labels
+        self._excluded_roots = {(self.yaml_path if self.yaml_path.is_dir() else self.yaml_path.parent) / "runs"}
         self.names: dict[int, str] = {}
         self.names_style = "dict"  # how data.yaml spells names ("list" or "dict"); preserved on rewrite
         self.images: dict[str, ImageRecord] = {}
@@ -522,7 +530,7 @@ class Dataset:
             source = (self.root / source).resolve() if not source.is_absolute() else source.resolve()
             if source.is_dir():
                 self._label_scan_roots.add(self._label_root_for(source))
-                found.extend(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(source).parts)
+                found.extend(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(source).parts and not self._excluded(path))
             elif source.suffix.lower() == ".txt" and source.exists():
                 for line in source.read_text(encoding="utf-8").splitlines():
                     if line.strip():
@@ -630,6 +638,9 @@ class Dataset:
     def _issue(self, kind, severity, message, record, annotation_id=None, fixable=False):
         return {"id": hashlib.sha1(f"{record.id}:{kind}:{annotation_id}:{message}".encode()).hexdigest()[:16], "kind": kind, "severity": severity, "message": message, "image_id": record.id, "image_name": record.path.name, "split": record.split, "annotation_id": annotation_id, "fixable": fixable}
 
+    def _excluded(self, path: Path) -> bool:
+        return any(path.is_relative_to(root) for root in self._excluded_roots)
+
     def _find_orphans(self) -> None:
         if self.category == "classification":
             self.orphan_labels = []
@@ -639,7 +650,7 @@ class Dataset:
         roots = self._label_scan_roots | {record.label_path.parent for record in self.images.values()}
         for root in roots:
             if root.exists():
-                candidates.update(path.resolve() for path in root.rglob("*.txt") if WORKBENCH_DIR not in path.parts)
+                candidates.update(path.resolve() for path in root.rglob("*.txt") if WORKBENCH_DIR not in path.parts and not self._excluded(path))
         self.orphan_labels = sorted(candidates - expected)
 
     def _rebuild_indexes(self) -> None:
@@ -1108,9 +1119,16 @@ class Dataset:
     def _number(self, value: float) -> str:
         return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
+    def check_writable(self) -> None:
+        """Raise DatasetLocked while the dataset is read-only (callers hold no partial writes yet)."""
+        reason = self.write_guard() if self.write_guard is not None else None
+        if reason:
+            raise DatasetLocked(f"The dataset is read-only while {reason}")
+
     def _commit_many(self, changes: list[PreparedChange], history=True) -> None:
         """Write all changes as one transaction: every mtime is checked before any file is touched."""
         with self._lock:
+            self.check_writable()
             for change in changes:
                 record = change.record
                 current_mtime = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
@@ -1211,6 +1229,7 @@ class Dataset:
         inside the same transaction is in place before labels are interpreted.
         """
         with self._lock:
+            self.check_writable()
             ordered = list(reversed(entries)) if direction == "undo" else list(entries)
             records_by_label = {record.label_path: record for record in self.images.values()}
             for entry in ordered:

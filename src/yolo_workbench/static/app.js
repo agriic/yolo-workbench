@@ -20,6 +20,7 @@ import {
   renderEmbeddings, renderEmbedSelection, resetEmbedView, setEmbedMode,
 } from "./embeddings.js";
 import { bindManage, configureManage, loadClasses, renderManageMeta } from "./manage.js";
+import { bindTraining, configureTraining, hideTraining, showTraining } from "./training.js";
 
 export let imageGallery = null;
 let objectGallery = null;
@@ -66,10 +67,13 @@ async function init() {
   setupVirtualGalleries();
   bind();
   bindManage();
+  bindTraining();
   updateHistoryButtons();
   watchIndexing();
   if (state.mode === "projects") renderProjectSwitch();
-  if (!state.meta.image_count && state.meta.capabilities.image_ops) showTab("dataset");
+  const params = new URLSearchParams(location.search);
+  if (params.get("tab") === "training") showTab("training", params.get("run"));
+  else if (!state.meta.image_count && state.meta.capabilities.image_ops) showTab("dataset");
   await Promise.all([loadImages(), loadObjects(), loadIssues(), refreshPredictor()]);
 }
 
@@ -155,10 +159,20 @@ export async function datasetChanged({ schema = false } = {}) {
   await Promise.all(tasks.map(task => Promise.resolve(task).catch(error => toast(error.message, "error"))));
 }
 
-function showTab(tab) {
+function showTab(tab, runId = null) {
+  const leaving = document.querySelector(".view.active")?.id;
   document.querySelectorAll(".tab,.view").forEach(el => el.classList.remove("active"));
   document.querySelector(`.tab[data-tab="${tab}"]`).classList.add("active");
   $(tab).classList.add("active");
+  document.body.classList.toggle("on-training", tab === "training");
+  if (leaving === "training" && tab !== "training") {
+    hideTraining();
+    const url = new URL(location.href);
+    url.searchParams.delete("tab");
+    url.searchParams.delete("run");
+    history.replaceState(null, "", url);
+  }
+  if (tab === "training") showTraining(runId);
   if (tab === "annotation") imageGallery?.refreshLayout();
   if (tab === "exploration") objectGallery?.refreshLayout();
   if (tab === "embeddings") refreshEmbeddings();
@@ -953,5 +967,15 @@ configurePredictor({
 });
 configureEmbeddings({ classOptions, editObject, toast });
 configureManage({ datasetChanged, toast });
+configureTraining({
+  toast,
+  showTab,
+  // "Use for labeling": a run's weights become the prediction model of the Annotation tab
+  useModel: async path => {
+    $("model-path").value = path;
+    showTab("annotation");
+    await loadModel();
+  },
+});
 
 init().catch(error => toast(error.message, "error"));

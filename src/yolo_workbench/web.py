@@ -20,6 +20,7 @@ from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 from .predictor import PredictorManager
 from .session import DatasetSession
+from .training import TrainingManager
 from .workspace import Workspace
 
 # Keep in sync with PALETTE in static/api.js so server-rendered overlays match the editor.
@@ -156,11 +157,35 @@ class ProjectAdoptPayload(BaseModel):
     name: str | None = None
 
 
+class TrainingArgsPayload(BaseModel):
+    yaml: str = ""
+
+
+class TrainingStartPayload(BaseModel):
+    name: str = ""
+    notes: str = ""
+    yaml: str
+    confirm: bool = False  # start despite preflight warnings
+
+
+class TrainingRunUpdatePayload(BaseModel):
+    name: str | None = None
+    notes: str | None = None
+
+
+class TrainingStopPayload(BaseModel):
+    mode: Literal["pause", "finish", "kill"]
+
+
+class TrainingReorderPayload(BaseModel):
+    order: list[str]
+
+
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 CSRF_HEADER = "x-workbench"
 
 
-def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRouter:
+def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager) -> APIRouter:
     """Every per-dataset endpoint; mounted at /api/v1 (single mode) or /api/v1/projects/{slug}."""
     router = APIRouter()
     current = Depends(get_session)
@@ -186,6 +211,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRoute
     @router.get("/dataset")
     def metadata(session: DatasetSession = current):
         meta = session.dataset.metadata()
+        meta["training_lock"] = training.lock_info(session.dataset)
         if session.slug is not None:
             meta["project"] = session.project
         return meta
@@ -346,6 +372,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRoute
     def import_commit(payload: ImportCommitPayload, session: DatasetSession = current):
         require_import(session)
         dataset = session.dataset
+        dataset.check_writable()
         source = importer.resolve_source(dataset, payload.path, payload.staging_id)
         if jobs.running(session.slug):
             raise DatasetError("Another import is still running")
@@ -426,6 +453,71 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager) -> APIRoute
     def embeddings_compute(session: DatasetSession = current):
         return session.embeddings.start()
 
+    # ---------- training ----------
+
+    def found(call):
+        try:
+            return call()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc.args[0]) if exc.args else "Not found") from exc
+
+    @router.get("/training/options")
+    def training_options(session: DatasetSession = current):
+        return training.options(session.slug, session.dataset)
+
+    @router.post("/training/args/validate")
+    def training_validate(payload: TrainingArgsPayload, session: DatasetSession = current):
+        return training.validate(session.slug, payload.yaml)
+
+    @router.post("/training/preflight")
+    def training_preflight(payload: TrainingArgsPayload, session: DatasetSession = current):
+        return training.preflight(session.slug, session.dataset, training.validate(session.slug, payload.yaml)["args"])
+
+    @router.get("/training/runs")
+    def training_runs(session: DatasetSession = current):
+        return training.list_runs(session.slug)
+
+    @router.post("/training/runs")
+    def training_start(payload: TrainingStartPayload, session: DatasetSession = current):
+        return training.enqueue(session.slug, session.dataset, payload.name, payload.notes, payload.yaml, payload.confirm)
+
+    @router.get("/training/runs/{run_id}")
+    def training_run(run_id: str, session: DatasetSession = current):
+        return found(lambda: training.run_detail(session.slug, run_id))
+
+    @router.patch("/training/runs/{run_id}")
+    def training_run_update(run_id: str, payload: TrainingRunUpdatePayload, session: DatasetSession = current):
+        return found(lambda: training.update_run(session.slug, run_id, payload.name, payload.notes))
+
+    @router.get("/training/runs/{run_id}/epochs")
+    def training_epochs(run_id: str, since: int = Query(0, ge=0), session: DatasetSession = current):
+        return found(lambda: training.epochs(session.slug, run_id, since))
+
+    @router.get("/training/runs/{run_id}/log")
+    def training_log(run_id: str, offset: int | None = Query(None, ge=0), session: DatasetSession = current):
+        return found(lambda: training.log(session.slug, run_id, offset))
+
+    @router.get("/training/runs/{run_id}/args")
+    def training_args(run_id: str, session: DatasetSession = current):
+        return found(lambda: training.copy_args(session.slug, run_id))
+
+    @router.get("/training/runs/{run_id}/files/{name:path}")
+    def training_file(run_id: str, name: str, session: DatasetSession = current):
+        path = found(lambda: training.run_file(session.slug, run_id, name))
+        return FileResponse(path, headers={"Cache-Control": "no-cache"})
+
+    @router.post("/training/runs/{run_id}/stop")
+    def training_stop(run_id: str, payload: TrainingStopPayload, session: DatasetSession = current):
+        return found(lambda: training.stop(session.slug, run_id, payload.mode))
+
+    @router.post("/training/runs/{run_id}/resume")
+    def training_resume(run_id: str, session: DatasetSession = current):
+        return found(lambda: training.resume(session.slug, run_id))
+
+    @router.post("/training/runs/{run_id}/cancel")
+    def training_cancel(run_id: str, session: DatasetSession = current):
+        return found(lambda: training.cancel(session.slug, run_id))
+
     @router.post("/history/{direction}")
     def history(direction: str, session: DatasetSession = current):
         if direction not in {"undo", "redo"}:
@@ -492,15 +584,31 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
     return app
 
 
+def _training_routes(app: FastAPI, training: TrainingManager) -> None:
+    """The queue is shared by every dataset of the app (one GPU)."""
+    app.state.training = training
+
+    @app.get("/api/v1/training/queue")
+    def training_queue():
+        return training.queue()
+
+    @app.post("/api/v1/training/queue/reorder")
+    def training_reorder(payload: TrainingReorderPayload):
+        return training.reorder(payload.order)
+
+
 def _mount_static(app: FastAPI) -> None:
     static = Path(__file__).parent / "static"
     app.mount("/", StaticFiles(directory=static, html=True), name="static")
 
 
-def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None) -> FastAPI:
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None) -> FastAPI:
     """Single-dataset mode: the dataset API lives directly under /api/v1."""
     jobs = jobs or JobManager()
     app = _base_app("single", jobs, allowed_hosts, require_header)
+    training = training or TrainingManager.for_dataset(dataset, jobs=jobs)
+    training.attach(dataset)
+    _training_routes(app, training)
     session = DatasetSession.open(dataset, predictor)
     app.state.dataset = dataset
     app.state.session = session
@@ -508,7 +616,7 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     app.state.embeddings = session.embeddings
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
-    app.include_router(dataset_router(lambda: session, cache, jobs), prefix="/api/v1")
+    app.include_router(dataset_router(lambda: session, cache, jobs, training), prefix="/api/v1")
     _mount_static(app)
     return app
 
@@ -517,6 +625,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     """Projects mode: workspace endpoints plus the dataset API under /api/v1/projects/{slug}."""
     app = _base_app("projects", workspace.jobs, allowed_hosts, require_header)
     app.state.workspace = workspace
+    _training_routes(app, workspace.training)
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
 
@@ -569,7 +678,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     def trash_purge(entry: str):
         return not_found(lambda: workspace.purge(entry))
 
-    app.include_router(dataset_router(project_session, cache, workspace.jobs), prefix="/api/v1/projects/{slug}")
+    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training), prefix="/api/v1/projects/{slug}")
     _mount_static(app)
     return app
 

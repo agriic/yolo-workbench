@@ -1,0 +1,1135 @@
+"""Ultralytics training runs: run history, a persistent single-GPU queue, and the dataset lock.
+
+A run is a directory under the dataset's runs root (`<project>/runs/` or `<dataset dir>/runs/`):
+Ultralytics' own output plus `workbench/` (see train_runner.py for the files the subprocess writes).
+Runs made outside the app (e.g. `yolo train`) are listed too, from their args.yaml/results.csv.
+
+`TrainingManager` owns the queue (`queue.json` under its state dir): one active run, launched as a
+detached subprocess (own session, so it survives server restarts and Ctrl+C), the rest FIFO.
+`tick()` advances it: it notices when the active process is gone, releases the dataset lock,
+and launches the next entry. It runs on API reads and from a supervisor thread (CLI only).
+
+While a run is active its dataset is read-only: `attach(dataset)` installs a write guard that
+makes every write path raise `DatasetLocked` (HTTP 409).
+"""
+
+from __future__ import annotations
+
+import csv
+import difflib
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+import yaml
+
+from .dataset import Dataset, DatasetError, DatasetLocked  # noqa: F401  (DatasetLocked is part of this module's API)
+from .jobs import JobManager
+
+META_DIR = "workbench"
+MANAGED_KEYS = ("data", "project", "name", "exist_ok", "resume", "mode", "task", "save_dir")
+ACTIVE_STATES = {"starting", "preparing", "training", "validating", "testing"}
+TERMINAL_STATES = {"completed", "paused", "failed", "stopped", "interrupted"}
+RESUMABLE_STATES = {"paused", "failed", "stopped", "interrupted"}
+TASKS = {"detection": "detect", "segmentation": "segment", "classification": "classify"}
+MODEL_SUFFIX = {"detection": "", "segmentation": "-seg", "classification": "-cls"}
+PRETRAINED_FAMILIES = (("yolo26", "YOLO26"), ("yolo11", "YOLO11"), ("yolov8", "YOLOv8"))
+PRETRAINED_SIZES = "nsmlx"
+PRETRAINED_PATTERN = re.compile(r"^(yolo(?:v8|11|26))([nsmlx])(-seg|-cls|-pose|-obb)?\.(pt|yaml)$")
+PLOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+LOG_TAIL = 64 * 1024
+SCAN_DEPTH = 3
+KILL_GRACE = 30.0  # SIGTERM lets the runner finish a checkpoint write; then the whole group is killed
+
+
+@dataclass
+class TrainingTarget:
+    """Where one dataset's runs live and how to get at the dataset itself."""
+
+    project: str | None  # project slug; None in single-dataset mode
+    name: str
+    category: str
+    yaml_path: Path  # dataset YAML (classification: the root directory when there is no YAML)
+    runs_root: Path
+    dataset: Callable[[], Dataset]  # the open Dataset, or a freshly loaded one
+    extra_roots: list[Path] = field(default_factory=list)  # also scanned, keeping only runs of this dataset
+
+    @property
+    def dataset_root(self) -> Path:
+        return self.yaml_path if self.yaml_path.is_dir() else self.yaml_path.parent
+
+
+def runs_root_for(yaml_path: Path) -> Path:
+    """`<dataset dir>/runs`: next to data.yaml, or inside the classification root."""
+    yaml_path = yaml_path.resolve()
+    return (yaml_path if yaml_path.is_dir() else yaml_path.parent) / "runs"
+
+
+# ---------- small file helpers ----------
+
+
+def _read_json(path: Path):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _read_yaml(path: Path):
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def read_results_csv(path: Path) -> list[dict]:
+    """Ultralytics' results.csv as rows of floats (older versions pad the header with spaces)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    rows = []
+    for raw in csv.DictReader(text.splitlines()):
+        row = {}
+        for key, value in raw.items():
+            if key is None:
+                continue
+            number = _number(value)
+            if number is not None:
+                row[key.strip()] = number
+        if "epoch" in row:
+            row["epoch"] = int(row["epoch"])
+            rows.append(row)
+    return rows
+
+
+def read_epochs_jsonl(path: Path) -> list[dict]:
+    """The runner's epoch rows; a resumed run may repeat an epoch, the last row wins."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    by_epoch: dict[int, dict] = {}
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue  # a line being written right now
+        if isinstance(row, dict) and isinstance(row.get("epoch"), int):
+            by_epoch[row["epoch"]] = row
+    return [by_epoch[epoch] for epoch in sorted(by_epoch)]
+
+
+def fitness(row: dict, category: str) -> float | None:
+    """Ultralytics 8.4's fitness per task (used for runs without the runner's own fitness column)."""
+    if category == "classification":
+        top1, top5 = row.get("metrics/accuracy_top1"), row.get("metrics/accuracy_top5")
+        return None if top1 is None or top5 is None else (top1 + top5) / 2
+    box = row.get("metrics/mAP50-95(B)")
+    if category == "segmentation":
+        mask = row.get("metrics/mAP50-95(M)")
+        return None if box is None or mask is None else box + mask
+    return box
+
+
+def best_epoch(rows: list[dict], category: str) -> dict | None:
+    """The epoch best.pt holds: Ultralytics rewrites best.pt whenever fitness ties the best, so the last tie wins."""
+    best, best_value = None, None
+    for row in rows:
+        value = row.get("fitness") if row.get("fitness") is not None else fitness(row, category)
+        if value is not None and (best_value is None or value >= best_value):
+            best, best_value = row, value
+    return best
+
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def collapse_progress(text: str) -> str:
+    """Plain text of a console log: ANSI colors dropped, only the last carriage-return segment of each line (tqdm redraws)."""
+    text = ANSI_ESCAPE.sub("", text)
+    return "\n".join(line.rsplit("\r", 1)[-1] if "\r" in line.rstrip("\r") else line.rstrip("\r") for line in text.split("\n"))
+
+
+# ---------- Ultralytics argument defaults ----------
+
+_defaults_cache: tuple[dict, dict] | None = None
+
+
+def ultralytics_defaults() -> tuple[dict, dict]:
+    """(defaults, help) from Ultralytics' cfg/default.yaml, read without importing ultralytics (or torch)."""
+    global _defaults_cache
+    if _defaults_cache is None:
+        spec = importlib.util.find_spec("ultralytics")
+        if spec is None or not spec.origin:
+            raise DatasetError("ultralytics is not installed")
+        path = Path(spec.origin).parent / "cfg" / "default.yaml"
+        text = path.read_text(encoding="utf-8")
+        defaults = yaml.safe_load(text) or {}
+        help_text = {}
+        for line in text.splitlines():
+            match = re.match(r"^([a-z_0-9]+):[^#]*#\s*(.*)$", line)
+            if match:
+                help_text[match.group(1)] = match.group(2).strip()
+        _defaults_cache = (defaults, help_text)
+    return _defaults_cache
+
+
+def _key_line(text: str, key: str) -> int | None:
+    for number, line in enumerate(text.splitlines(), 1):
+        if re.match(rf"^\s*{re.escape(key)}\s*:", line):
+            return number
+    return None
+
+
+def _check_value(key: str, value) -> str | None:
+    """Ultralytics' own type/range check for one argument (imported lazily; ~1 s once per process)."""
+    try:
+        from ultralytics.cfg import check_cfg
+    except Exception:  # ultralytics unavailable or broken: the runner reports problems instead
+        return None
+    try:
+        check_cfg({key: value}, hard=True)
+    except (TypeError, ValueError) as exc:
+        return str(exc).strip()
+    return None
+
+
+def validate_args(category: str, text: str) -> dict:
+    """Parse raw YAML training arguments: {args, errors: [{line, message}], warnings}."""
+    errors: list[dict] = []
+    warnings: list[dict] = []
+    try:
+        data = yaml.safe_load(text) if text.strip() else {}
+    except yaml.YAMLError as exc:
+        mark = getattr(exc, "problem_mark", None)
+        return {"args": {}, "errors": [{"line": mark.line + 1 if mark else None, "message": f"Invalid YAML: {getattr(exc, 'problem', None) or exc}"}], "warnings": []}
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return {"args": {}, "errors": [{"line": 1, "message": "Arguments must be `key: value` lines"}], "warnings": []}
+    defaults, _ = ultralytics_defaults()
+    args: dict = {}
+    for key, value in data.items():
+        key = str(key)
+        line = _key_line(text, key)
+        if key in MANAGED_KEYS:
+            errors.append({"line": line, "message": f"`{key}` is set by the workbench and cannot be changed"})
+            continue
+        if key not in defaults:
+            close = difflib.get_close_matches(key, list(defaults), n=1)
+            errors.append({"line": line, "message": f"Unknown argument `{key}`" + (f" (did you mean `{close[0]}`?)" if close else "")})
+            continue
+        problem = _check_value(key, value)
+        if problem:
+            errors.append({"line": line, "message": problem})
+            continue
+        args[key] = value
+    cache = args.get("cache")
+    if isinstance(cache, str) and cache.lower() == "disk":
+        errors.append({"line": _key_line(text, "cache"), "message": "cache: disk writes .npy files next to every image in the dataset; use `ram` or `false`"})
+    device = args.get("device")
+    if isinstance(device, list) and len(device) > 1 or isinstance(device, str) and "," in device:
+        errors.append({"line": _key_line(text, "device"), "message": "Multi-GPU training is not supported here (no live progress with DDP); pick one device"})
+    model = args.get("model")
+    if not model:
+        errors.append({"line": _key_line(text, "model") or 1, "message": "`model` is required (a pretrained name such as yolo11n.pt, or a previous run's weights)"})
+    else:
+        model = str(model)
+        args["model"] = model
+        match = PRETRAINED_PATTERN.match(model)
+        if match:
+            suffix = match.group(3) or ""
+            if suffix != MODEL_SUFFIX[category]:
+                errors.append({"line": _key_line(text, "model"), "message": f"{model} is not a {category} model; use a name like {match.group(1)}{match.group(2)}{MODEL_SUFFIX[category]}.pt"})
+        elif "/" in model or os.sep in model:
+            if not Path(model).expanduser().is_file():
+                errors.append({"line": _key_line(text, "model"), "message": f"Model file not found: {model}"})
+        elif not model.endswith((".pt", ".yaml", ".yml")):
+            errors.append({"line": _key_line(text, "model"), "message": "`model` must be a .pt weights file or a model .yaml"})
+    if args.get("time"):
+        warnings.append({"line": _key_line(text, "time"), "message": "`time` overrides `epochs`: the epoch count changes while training"})
+    ordered = {"model": args.pop("model")} if "model" in args else {}
+    ordered.update(args)
+    return {"args": ordered, "errors": errors, "warnings": warnings}
+
+
+def args_to_yaml(args: dict) -> str:
+    """One `key: value` line per argument (lists inline, like args.yaml)."""
+    lines = []
+    for key, value in args.items():
+        if isinstance(value, list) and all(not isinstance(item, (list, dict)) for item in value):
+            lines.append(f"{key}: {json.dumps(value)}\n")
+        else:
+            lines.append(yaml.safe_dump({key: value}, sort_keys=False, default_flow_style=False, allow_unicode=True))
+    return "".join(lines)
+
+
+# ---------- processes ----------
+
+
+class SubprocessHandle:
+    def __init__(self, process: subprocess.Popen):
+        self.process = process
+        self.pid = process.pid
+
+    def poll(self):
+        return self.process.poll()
+
+    def signal(self, signum: int, group: bool = False) -> None:
+        # start_new_session: the runner leads its own process group (its dataloader workers are in it)
+        if group:
+            os.killpg(self.pid, signum)
+        else:
+            os.kill(self.pid, signum)
+
+
+def launch_subprocess(spec_path: Path, run_dir: Path, cwd: Path) -> SubprocessHandle:
+    cwd.mkdir(parents=True, exist_ok=True)
+    log = (spec_path.parent / "train.log").open("ab")
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "yolo_workbench.train_runner", str(spec_path)],
+            cwd=cwd,  # Ultralytics downloads weights (and its AMP-check model) into the cwd
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+    finally:
+        log.close()
+    return SubprocessHandle(process)
+
+
+def _process_create_time(pid: int) -> float | None:
+    try:
+        import psutil
+
+        return psutil.Process(pid).create_time()
+    except Exception:
+        return None
+
+
+def _process_alive(info: dict | None) -> bool:
+    """Is the recorded runner process still running (and not a different process reusing its PID)?"""
+    if not info or not isinstance(info.get("pid"), int):
+        return False
+    try:
+        import psutil
+
+        process = psutil.Process(info["pid"])
+        if process.status() == psutil.STATUS_ZOMBIE:
+            return False
+        if info.get("create_time") is not None and abs(process.create_time() - info["create_time"]) > 1:
+            return False
+        return any("train_runner" in part for part in process.cmdline())
+    except Exception:
+        return False
+
+
+# ---------- the manager ----------
+
+
+class TrainingManager:
+    def __init__(self, state_dir: Path, resolve: Callable[[str | None], TrainingTarget], jobs: JobManager | None = None, launcher=None, weights_dir: Path | None = None):
+        self.state_dir = state_dir
+        self.resolve = resolve
+        self.jobs = jobs or JobManager()
+        self.launcher = launcher or launch_subprocess
+        self.weights_dir = weights_dir or Path.home() / ".cache" / "yolo-workbench" / "weights"
+        self._lock = threading.RLock()
+        self._handle = None  # process handle of a run this server launched (None after a restart)
+        self._locked: dict[Path, dict] = {}  # dataset yaml -> lock info; replaced whole, read without the lock
+        self._file_cache: dict[tuple, object] = {}
+        self._devices: tuple[float, list] | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._queue = self._load_queue()
+        self.tick()
+
+    @classmethod
+    def for_dataset(cls, dataset: Dataset, **kwargs) -> "TrainingManager":
+        """Single-dataset mode: one target, state under the dataset's .yolo-workbench/."""
+        yaml_path = dataset.yaml_path
+        runs_root = runs_root_for(yaml_path)
+        cwd_runs = (Path.cwd() / "runs").resolve()
+        target = TrainingTarget(None, dataset.root.name, dataset.category, yaml_path, runs_root, lambda: dataset, [cwd_runs] if cwd_runs != runs_root else [])
+
+        def resolve(project):
+            if project is not None:
+                raise KeyError("Project not found")
+            return target
+
+        return cls(dataset.root / ".yolo-workbench" / "training", resolve, **kwargs)
+
+    # ---------- supervisor ----------
+
+    def start(self, interval: float = 2.0) -> None:
+        if self._thread is not None:
+            return
+
+        def loop():
+            while not self._stop.wait(interval):
+                try:
+                    self.tick()
+                except Exception as exc:  # the supervisor must keep going
+                    print(f"training supervisor: {exc}", file=sys.stderr)
+
+        self._thread = threading.Thread(target=loop, daemon=True, name="training-supervisor")
+        self._thread.start()
+
+    def shutdown(self) -> None:
+        self._stop.set()
+
+    # ---------- queue file ----------
+
+    @property
+    def _queue_path(self) -> Path:
+        return self.state_dir / "queue.json"
+
+    def _load_queue(self) -> dict:
+        data = _read_json(self._queue_path) or {}
+        queue = [entry for entry in data.get("queue", []) if isinstance(entry, dict) and entry.get("dir")]
+        active = data.get("active") if isinstance(data.get("active"), dict) else None
+        return {"active": active, "queue": queue}
+
+    def _save_queue(self) -> None:
+        if self._queue["active"] is None and not self._queue["queue"] and not self._queue_path.exists():
+            return
+        _write_json(self._queue_path, {"version": 1, **self._queue})
+
+    @staticmethod
+    def _key(entry: dict) -> str:
+        return f"{entry.get('project') or ''}/{entry['dir']}"
+
+    def _entry_dir(self, entry: dict) -> tuple[TrainingTarget, Path]:
+        target = self.resolve(entry.get("project"))
+        return target, target.runs_root / entry["dir"]
+
+    # ---------- dataset lock ----------
+
+    def attach(self, dataset: Dataset) -> None:
+        dataset.write_guard = lambda: self.lock_reason(dataset)
+
+    def lock_info(self, dataset: Dataset) -> dict | None:
+        return self._locked.get(dataset.yaml_path)
+
+    def lock_reason(self, dataset: Dataset) -> str | None:
+        info = self._locked.get(dataset.yaml_path)
+        return info["reason"] if info else None
+
+    def _refresh_lock(self) -> None:
+        active = self._queue["active"]
+        locked = {}
+        if active is not None:
+            try:
+                target, run_dir = self._entry_dir(active)
+                meta = _read_json(run_dir / META_DIR / "run.json") or {}
+                locked[target.yaml_path.resolve()] = {"reason": f"training run '{meta.get('name', active['dir'])}' is in progress", "run_id": self.run_id(run_dir), "run": meta.get("name", active["dir"])}
+            except KeyError:
+                pass
+        self._locked = locked
+
+    def project_busy(self, project: str | None) -> str | None:
+        """Why a project cannot be moved away right now (it has an active or queued run)."""
+        with self._lock:
+            if self._queue["active"] and self._queue["active"].get("project") == project:
+                return "a training run is in progress"
+            if any(entry.get("project") == project for entry in self._queue["queue"]):
+                return "it has queued training runs"
+        return None
+
+    # ---------- lifecycle ----------
+
+    def tick(self) -> None:
+        """Reap a finished active run and launch the next queued one."""
+        with self._lock:
+            active = self._queue["active"]
+            if active is not None and not self._active_alive(active):
+                self._finish_active(active)
+            while self._queue["active"] is None and self._queue["queue"]:
+                entry = self._queue["queue"][0]
+                try:
+                    target, run_dir = self._entry_dir(entry)
+                except KeyError:
+                    self._queue["queue"].pop(0)  # the project is gone
+                    self._save_queue()
+                    continue
+                if not (run_dir / META_DIR / "spec.json").is_file():
+                    self._queue["queue"].pop(0)  # the run folder was deleted by hand
+                    self._save_queue()
+                    continue
+                if self.jobs.running(entry.get("project")):
+                    self._write_state(run_dir, status="queued", waiting="an import into this dataset is running")
+                    break
+                self._launch(entry, target, run_dir)
+            self._refresh_lock()
+
+    def _active_alive(self, active: dict) -> bool:
+        if self._handle is not None:
+            return self._handle.poll() is None
+        try:
+            _, run_dir = self._entry_dir(active)
+        except KeyError:
+            return False
+        return _process_alive(_read_json(run_dir / META_DIR / "process.json"))
+
+    def _write_state(self, run_dir: Path, replace: bool = False, **changes) -> dict:
+        path = run_dir / META_DIR / "state.json"
+        state = {} if replace else (_read_json(path) or {})
+        state.update(changes)
+        state["updated"] = time.time()
+        _write_json(path, state)
+        return state
+
+    def _finish_active(self, active: dict) -> None:
+        self._handle = None
+        try:
+            _, run_dir = self._entry_dir(active)
+        except KeyError:
+            run_dir = None
+        if run_dir is not None and (run_dir / META_DIR).is_dir():
+            workdir = run_dir / META_DIR
+            state = _read_json(workdir / "state.json") or {}
+            control = _read_json(workdir / "control.json") or {}
+            if state.get("status") not in TERMINAL_STATES:
+                killed = control.get("action") == "kill"
+                self._write_state(
+                    run_dir,
+                    status="stopped" if killed else "interrupted",
+                    phase="stopped" if killed else "interrupted",
+                    finished=time.time(),
+                    eta=None,
+                    error=state.get("error") or ("Stopped by user" if killed else "The training process exited unexpectedly; see the log"),
+                )
+            (workdir / "control.json").unlink(missing_ok=True)
+        self._queue["active"] = None
+        self._save_queue()
+
+    def _launch(self, entry: dict, target: TrainingTarget, run_dir: Path) -> None:
+        workdir = run_dir / META_DIR
+        spec = _read_json(workdir / "spec.json") or {}
+        try:
+            dataset = target.dataset()
+            with dataset._lock:  # in-flight writes finish before the guard flips
+                plan = self._data_plan(target, dataset)
+                if plan["errors"]:
+                    raise DatasetError("; ".join(plan["errors"]))
+                data = self._write_data(target, plan, workdir)
+                spec["args"] = {**spec.get("args", {}), "data": data["data"], "project": str(target.runs_root), "name": run_dir.name, "exist_ok": True}
+                spec["test_eval"] = {"data": data["data"]} if plan["has_test"] else None
+                spec["cache_files"] = plan["cache_files"]
+                _write_json(workdir / "spec.json", spec)
+                meta = _read_json(workdir / "run.json") or {}
+                meta["dataset"] = {"fingerprint": plan["fingerprint"], "splits": plan["counts"], "names": plan["names"], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                _write_json(workdir / "run.json", meta)
+                (workdir / "control.json").unlink(missing_ok=True)
+                self._write_state(run_dir, replace=True, status="starting", phase="starting", resumed=bool(spec.get("resume")), queued_at=None)
+                self._queue["queue"].pop(0)
+                self._queue["active"] = entry
+                self._refresh_lock()
+                self._handle = self.launcher(workdir / "spec.json", run_dir, self.weights_dir)
+            _write_json(workdir / "process.json", {"pid": self._handle.pid, "create_time": _process_create_time(self._handle.pid), "started": time.time()})
+            self._save_queue()
+        except Exception as exc:
+            if self._queue["active"] is entry:
+                self._queue["active"] = None
+            elif self._queue["queue"] and self._queue["queue"][0] is entry:
+                self._queue["queue"].pop(0)
+            self._handle = None
+            self._write_state(run_dir, status="failed", phase="failed", error=f"Could not start: {exc}", finished=time.time())
+            self._save_queue()
+            self._refresh_lock()
+
+    # ---------- dataset → Ultralytics data ----------
+
+    def _data_plan(self, target: TrainingTarget, dataset: Dataset) -> dict:
+        """What Ultralytics will train on, plus blocking errors and confirmable warnings."""
+        errors: list[str] = []
+        warnings: list[str] = []
+        notes: list[str] = []
+        names = dataset.names
+        records = list(dataset.images.values())
+        splits = {split: sorted((record for record in records if record.split == split), key=lambda record: str(record.path)) for split in ("train", "val", "test")}
+        counts = {split: len(items) for split, items in splits.items()}
+        if not names:
+            errors.append("The dataset has no classes")
+        elif sorted(names) != list(range(len(names))):
+            errors.append("Class IDs must be contiguous from 0 (Ultralytics requirement); reorder or remove classes first")
+        if not counts["train"]:
+            errors.append("The train split has no images")
+        if target.category == "classification":
+            root = dataset.root
+            folders = dataset._split_folders
+            for split in ("train", "val", "test"):
+                listed = folders.get(split, [])
+                if listed and listed != [root / split]:
+                    errors.append(f"Classification training needs the {split} images in {root / split} (one folder per split)")
+            if not counts["val"] and not counts["test"]:
+                errors.append("Classification training needs a val (or test) split with images")
+            has_test = bool(counts["test"]) and bool(counts["val"])
+        else:
+            if not counts["val"]:
+                errors.append("The val split has no images; Ultralytics validates on it every epoch")
+            has_test = bool(counts["test"])
+            mismatched = 0
+            for record in records:
+                expected = Path(_ultralytics_label_path(str(record.path)))
+                if expected != record.label_path:
+                    mismatched += 1
+            if mismatched:
+                errors.append(f"Ultralytics would not find the labels of {mismatched} image(s): their labels are next to the images inside an images/ folder; move them to the parallel labels/ folder")
+        if not has_test:
+            notes.append("No test split: the run is evaluated on val only")
+        issue_errors = sum(1 for issue in dataset.issues() if issue.get("severity") == "error")
+        if issue_errors:
+            warnings.append(f"{issue_errors} validation error(s) in the dataset (Ultralytics skips or repairs broken labels; see the Validation tab)")
+        if target.category == "classification":
+            present = {record.annotations[0].class_id for record in splits["train"] if record.annotations}
+        else:
+            present = {annotation.class_id for record in splits["train"] for annotation in record.annotations}
+        missing = [names[class_id] for class_id in sorted(names) if class_id not in present]
+        if missing and counts["train"]:
+            warnings.append(f"No training examples for: {', '.join(missing[:8])}{' …' if len(missing) > 8 else ''}")
+        digest = hashlib.sha1()
+        for split in ("train", "val", "test"):
+            for record in splits[split]:
+                digest.update(f"{split}\0{record.path}\0{dataset._mtimes.get(record.label_path)}\n".encode())
+        cache_files = sorted({str(record.label_path.parent.with_suffix(".cache")) for record in records}) if target.category != "classification" else []
+        return {
+            "errors": errors,
+            "warnings": warnings,
+            "notes": notes,
+            "splits": {split: [str(record.path) for record in items] for split, items in splits.items()},
+            "counts": counts,
+            "names": [names[class_id] for class_id in sorted(names)],
+            "has_test": has_test,
+            "fingerprint": digest.hexdigest()[:12],
+            "cache_files": cache_files,
+            "root": str(dataset.root),
+        }
+
+    def _write_data(self, target: TrainingTarget, plan: dict, workdir: Path) -> dict:
+        if target.category == "classification":
+            return {"data": plan["root"]}
+        config: dict = {"path": str(workdir)}
+        for split in ("train", "val", "test"):
+            if plan["splits"][split]:
+                list_path = workdir / f"{split}.txt"
+                list_path.write_text("".join(f"{path}\n" for path in plan["splits"][split]), encoding="utf-8")
+                config[split] = str(list_path)
+        config["names"] = dict(enumerate(plan["names"]))
+        data_path = workdir / "data.yaml"
+        header = "# Generated by YOLO Workbench for this run: the dataset's images per split, as absolute file lists.\n"
+        data_path.write_text(header + yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        return {"data": str(data_path)}
+
+    # ---------- runs ----------
+
+    @staticmethod
+    def run_id(run_dir: Path) -> str:
+        return hashlib.sha1(str(run_dir.resolve()).encode()).hexdigest()[:12]
+
+    def _scan(self, target: TrainingTarget) -> list[Path]:
+        found: list[Path] = []
+
+        def walk(directory: Path, depth: int, keep) -> None:
+            if (directory / META_DIR / "run.json").is_file() or (directory / "args.yaml").is_file():
+                if keep(directory):
+                    found.append(directory)
+                return
+            if depth >= SCAN_DEPTH:
+                return
+            try:
+                children = sorted(child for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".") and child.name != "weights")
+            except OSError:
+                return
+            for child in children:
+                walk(child, depth + 1, keep)
+
+        if target.runs_root.is_dir():
+            walk(target.runs_root, 0, lambda _: True)
+        dataset_paths = {target.yaml_path.resolve(), target.dataset_root.resolve()}
+
+        def belongs(directory: Path) -> bool:
+            data = (_read_yaml(directory / "args.yaml") or {}).get("data")
+            if not data:
+                return False
+            path = Path(str(data))
+            return (path if path.is_absolute() else (directory / path)).resolve() in dataset_paths or path.resolve() in dataset_paths
+
+        for extra in target.extra_roots:
+            if extra.is_dir():
+                walk(extra, 0, belongs)
+        return found
+
+    def _runs(self, target: TrainingTarget) -> dict[str, Path]:
+        return {self.run_id(path): path for path in self._scan(target)}
+
+    def _require_run(self, target: TrainingTarget, run_id: str) -> Path:
+        run_dir = self._runs(target).get(run_id)
+        if run_dir is None:
+            raise KeyError("Run not found")
+        return run_dir
+
+    def _cached(self, path: Path, loader):
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = (str(path), stat.st_mtime_ns, stat.st_size)
+        if key not in self._file_cache:
+            if len(self._file_cache) > 512:
+                self._file_cache.clear()
+            self._file_cache[key] = loader(path)
+        return self._file_cache[key]
+
+    def _epochs(self, run_dir: Path, category: str) -> list[dict]:
+        rows = self._cached(run_dir / META_DIR / "epochs.jsonl", read_epochs_jsonl)
+        if not rows:
+            rows = self._cached(run_dir / "results.csv", read_results_csv) or []
+        for row in rows:
+            if row.get("fitness") is None:
+                row["fitness"] = fitness(row, category)
+        return rows
+
+    def _queue_position(self, target: TrainingTarget, run_dir: Path) -> int | None:
+        for position, entry in enumerate(self._queue["queue"], 1):
+            if entry.get("project") == target.project and entry["dir"] == run_dir.name and target.runs_root / entry["dir"] == run_dir:
+                return position
+        return None
+
+    def _is_active(self, target: TrainingTarget, run_dir: Path) -> bool:
+        active = self._queue["active"]
+        return active is not None and active.get("project") == target.project and target.runs_root / active["dir"] == run_dir
+
+    def _summary(self, target: TrainingTarget, run_dir: Path) -> dict:
+        workdir = run_dir / META_DIR
+        meta = _read_json(workdir / "run.json") or {}
+        source = meta.get("source") or ("workbench" if (workdir / "spec.json").is_file() else "external")
+        state = _read_json(workdir / "state.json") or {}
+        spec = _read_json(workdir / "spec.json") or {}
+        args = self._cached(run_dir / "args.yaml", _read_yaml) or spec.get("args") or {}
+        rows = self._epochs(run_dir, target.category)
+        best = best_epoch(rows, target.category)
+        status = state.get("status")
+        active = self._is_active(target, run_dir)
+        position = self._queue_position(target, run_dir)
+        if source == "external":
+            status = "external"
+        elif status in ACTIVE_STATES and not active:
+            status = "interrupted"  # a run the queue no longer tracks (e.g. a crash while the server was down)
+        elif status == "queued" and position is None:
+            status = "interrupted"
+        test = _read_json(workdir / "test.json")
+        val = _read_json(workdir / "val.json")
+        epochs = state.get("epochs") or args.get("epochs")
+        created = meta.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_dir.stat().st_mtime))
+        return {
+            "id": self.run_id(run_dir),
+            "dir": str(run_dir.relative_to(target.runs_root)) if run_dir.is_relative_to(target.runs_root) else str(run_dir),
+            "path": str(run_dir),
+            "name": meta.get("name") or run_dir.name,
+            "notes": meta.get("notes", ""),
+            "source": source,
+            "status": status,
+            "phase": state.get("phase"),
+            "active": active,
+            "queue_position": position,
+            "waiting": state.get("waiting") if status == "queued" else None,
+            "created": created,
+            # a resume rewrites args.yaml's model to the run's own last.pt; show what the run started from
+            "model": meta.get("base_model") or args.get("model"),
+            "imgsz": args.get("imgsz"),
+            "batch": args.get("batch"),
+            "epochs": epochs,
+            "epochs_done": rows[-1]["epoch"] if rows else 0,
+            "epoch": state.get("epoch") if active else (rows[-1]["epoch"] if rows else 0),
+            "best_epoch": best["epoch"] if best else None,
+            "best_metrics": {key: value for key, value in best.items() if key.startswith("metrics/")} if best else {},
+            "best_fitness": best.get("fitness") if best else None,
+            "val_metrics": (val or {}).get("metrics") or None,
+            "test_metrics": (test or {}).get("metrics") or None,
+            "stopped_early": bool(state.get("stopped_early")),
+            "error": state.get("error"),
+            "test_error": state.get("test_error"),
+            "resumable": self._resumable(source, status, state, run_dir, rows, active, position),
+            "has_weights": {"best": (run_dir / "weights" / "best.pt").is_file(), "last": (run_dir / "weights" / "last.pt").is_file()},
+            "dataset": meta.get("dataset"),
+        }
+
+    @staticmethod
+    def _resumable(source, status, state, run_dir, rows, active, position) -> bool:
+        # final_eval() strips the optimizer from last.pt, after which Ultralytics refuses to resume
+        return (
+            source == "workbench"
+            and status in RESUMABLE_STATES
+            and not active
+            and position is None
+            and not state.get("final_eval")
+            and bool(rows)
+            and (run_dir / "weights" / "last.pt").is_file()
+        )
+
+    def list_runs(self, project: str | None) -> dict:
+        self.tick()
+        target = self.resolve(project)
+        with self._lock:
+            items = []
+            for run_dir in self._scan(target):
+                try:
+                    items.append(self._summary(target, run_dir))
+                except OSError:
+                    continue  # deleted while listing
+        items.sort(key=lambda item: item["created"] or "", reverse=True)
+        return {"items": items, "category": target.category, "runs_root": str(target.runs_root)}
+
+    def run_detail(self, project: str | None, run_id: str) -> dict:
+        self.tick()
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            summary = self._summary(target, run_dir)
+        workdir = run_dir / META_DIR
+        args = _read_yaml(run_dir / "args.yaml") or (_read_json(workdir / "spec.json") or {}).get("args") or {}
+        plots = []
+        for directory, prefix in ((run_dir, ""), (run_dir / "test", "test/")):
+            if directory.is_dir():
+                plots.extend(f"{prefix}{path.name}" for path in sorted(directory.iterdir()) if path.suffix.lower() in PLOT_EXTENSIONS and path.is_file())
+        return {
+            **summary,
+            "args": args,
+            "state": _read_json(workdir / "state.json") or {},
+            "val": _read_json(workdir / "val.json"),
+            "test": _read_json(workdir / "test.json"),
+            "plots": plots,
+        }
+
+    def epochs(self, project: str | None, run_id: str, since: int = 0) -> dict:
+        target = self.resolve(project)
+        run_dir = self._require_run(target, run_id)
+        rows = self._epochs(run_dir, target.category)
+        best = best_epoch(rows, target.category)
+        state = _read_json(run_dir / META_DIR / "state.json") or {}
+        return {"items": [row for row in rows if row["epoch"] > since], "best_epoch": best["epoch"] if best else None, "state": state if self._is_active(target, run_dir) else None}
+
+    def log(self, project: str | None, run_id: str, offset: int | None = None) -> dict:
+        target = self.resolve(project)
+        path = self._require_run(target, run_id) / META_DIR / "train.log"
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return {"text": "", "offset": 0, "size": 0}
+        start = max(size - LOG_TAIL, 0) if offset is None or offset > size else offset
+        with path.open("rb") as stream:
+            stream.seek(start)
+            data = stream.read(4 * LOG_TAIL)
+        end = start + len(data)
+        cut = data.rfind(b"\n")
+        if cut >= 0 and not data.endswith(b"\n"):
+            data, end = data[: cut + 1], start + cut + 1  # a partial last line waits for the next poll
+        return {"text": collapse_progress(data.decode("utf-8", "replace")), "offset": end, "size": size, "truncated": start > 0 and offset is None}
+
+    def run_file(self, project: str | None, run_id: str, name: str) -> Path:
+        target = self.resolve(project)
+        run_dir = self._require_run(target, run_id).resolve()
+        path = (run_dir / name).resolve()
+        if not path.is_relative_to(run_dir) or path.suffix.lower() not in PLOT_EXTENSIONS or not path.is_file():
+            raise KeyError("File not found")
+        return path
+
+    def update_run(self, project: str | None, run_id: str, name: str | None = None, notes: str | None = None) -> dict:
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            path = run_dir / META_DIR / "run.json"
+            meta = _read_json(path) or {"version": 1, "source": "external", "created": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_dir.stat().st_mtime))}
+            if name is not None:
+                if not name.strip():
+                    raise DatasetError("Run name cannot be empty")
+                meta["name"] = name.strip()
+            if notes is not None:
+                meta["notes"] = notes
+            _write_json(path, meta)
+            self._refresh_lock()
+            return self._summary(target, run_dir)
+
+    def copy_args(self, project: str | None, run_id: str) -> dict:
+        """A run's arguments for a new run: managed keys and Ultralytics defaults stripped."""
+        target = self.resolve(project)
+        run_dir = self._require_run(target, run_id)
+        args = _read_yaml(run_dir / "args.yaml") or (_read_json(run_dir / META_DIR / "spec.json") or {}).get("args") or {}
+        defaults, _ = ultralytics_defaults()
+        kept = {key: value for key, value in args.items() if key not in MANAGED_KEYS and (key == "model" or key not in defaults or (defaults[key] != value and not (defaults[key] is None and value == "")))}
+        kept = {key: value for key, value in kept.items() if key in defaults}  # keys from other Ultralytics versions
+        ordered = {"model": kept.pop("model")} if "model" in kept else {}
+        ordered.update(kept)
+        return {"args": ordered, "yaml": args_to_yaml(ordered), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
+
+    # ---------- options and validation ----------
+
+    def options(self, project: str | None, dataset: Dataset) -> dict:
+        target = self.resolve(project)
+        defaults, help_text = ultralytics_defaults()
+        suffix = MODEL_SUFFIX[target.category]
+        pretrained = []
+        for family, label in PRETRAINED_FAMILIES:
+            for size in PRETRAINED_SIZES:
+                name = f"{family}{size}{suffix}.pt"
+                pretrained.append({"name": name, "family": label, "size": size, "cached": (self.weights_dir / name).is_file()})
+        names = [dataset.names[class_id] for class_id in sorted(dataset.names)]
+        previous = []
+        for summary in self.list_runs(project)["items"]:
+            weights = {kind: str(Path(summary["path"]) / "weights" / f"{kind}.pt") for kind, present in summary["has_weights"].items() if present}
+            if weights:
+                run_names = (summary.get("dataset") or {}).get("names")
+                previous.append({"id": summary["id"], "name": summary["name"], "weights": weights, "best_metrics": summary["best_metrics"], "names_match": None if run_names is None else run_names == names})
+        return {
+            "category": target.category,
+            "task": TASKS[target.category],
+            "defaults": {key: value for key, value in defaults.items() if key not in MANAGED_KEYS},
+            "help": help_text,
+            "managed": list(MANAGED_KEYS),
+            "pretrained": pretrained,
+            "runs": previous,
+            "devices": self.devices(),
+            "weights_dir": str(self.weights_dir),
+            "next_name": _next_name(None, {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set()),
+        }
+
+    def devices(self) -> list[dict]:
+        """GPUs from nvidia-smi (cached); the server never initializes CUDA itself."""
+        now = time.time()
+        if self._devices is not None and now - self._devices[0] < 30:
+            return self._devices[1]
+        items = []
+        try:
+            output = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3, check=True).stdout
+            for line in output.strip().splitlines():
+                index, name, total, used = (part.strip() for part in line.split(","))
+                items.append({"id": index, "name": name, "memory_total": int(float(total)), "memory_used": int(float(used))})
+        except (OSError, subprocess.SubprocessError, ValueError):
+            items = []
+        self._devices = (now, items)
+        return items
+
+    def validate(self, project: str | None, text: str) -> dict:
+        target = self.resolve(project)
+        result = validate_args(target.category, text)
+        result["yaml"] = args_to_yaml(result["args"]) if not result["errors"] else text
+        return result
+
+    def preflight(self, project: str | None, dataset: Dataset, args: dict | None = None) -> dict:
+        target = self.resolve(project)
+        with dataset._lock:
+            plan = self._data_plan(target, dataset)
+        warnings = list(plan["warnings"])
+        model = str((args or {}).get("model") or "")
+        if model:
+            for run_dir in self._scan(target):
+                if model.startswith(str(run_dir / "weights")):
+                    run_names = ((_read_json(run_dir / META_DIR / "run.json") or {}).get("dataset") or {}).get("names")
+                    if run_names is not None and run_names != plan["names"]:
+                        warnings.append("The base run was trained with different classes; its class head is re-initialized")
+        return {"errors": plan["errors"], "warnings": warnings, "notes": plan["notes"], "splits": plan["counts"]}
+
+    # ---------- queue operations ----------
+
+    def enqueue(self, project: str | None, dataset: Dataset, name: str, notes: str, text: str, confirm: bool = False) -> dict:
+        target = self.resolve(project)
+        parsed = validate_args(target.category, text)
+        if parsed["errors"]:
+            raise DatasetError("; ".join(f"line {error['line']}: {error['message']}" if error.get("line") else error["message"] for error in parsed["errors"]))
+        check = self.preflight(project, dataset, parsed["args"])
+        if check["errors"]:
+            raise DatasetError("; ".join(check["errors"]))
+        if check["warnings"] and not confirm:
+            return {"queued": False, "warnings": check["warnings"], "notes": check["notes"]}
+        with self._lock:
+            target.runs_root.mkdir(parents=True, exist_ok=True)
+            existing = {path.name for path in target.runs_root.iterdir()}
+            display = (name or "").strip() or _next_name(None, existing)
+            directory = _unique_dir(display, existing)
+            run_dir = target.runs_root / directory
+            workdir = run_dir / META_DIR
+            workdir.mkdir(parents=True)
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            _write_json(workdir / "run.json", {"version": 1, "name": display, "notes": notes or "", "created": now, "source": "workbench", "category": target.category, "task": TASKS[target.category], "base_model": parsed["args"]["model"]})
+            _write_json(workdir / "spec.json", {"version": 1, "args": parsed["args"], "resume": False})
+            self._write_state(run_dir, replace=True, status="queued", phase="queued", queued_at=time.time())
+            self._queue["queue"].append({"project": project, "dir": directory})
+            self._save_queue()
+        self.tick()
+        with self._lock:
+            return {"queued": True, "run": self._summary(target, run_dir), "warnings": check["warnings"], "notes": check["notes"]}
+
+    def resume(self, project: str | None, run_id: str) -> dict:
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            summary = self._summary(target, run_dir)
+            if not summary["resumable"]:
+                raise DatasetError("This run cannot be resumed (it finished, is queued or running, or has no resumable last.pt)")
+            workdir = run_dir / META_DIR
+            spec = _read_json(workdir / "spec.json") or {}
+            spec["resume"] = True
+            _write_json(workdir / "spec.json", spec)
+            (workdir / "control.json").unlink(missing_ok=True)
+            self._write_state(run_dir, replace=True, status="queued", phase="queued", resumed=True, queued_at=time.time())
+            self._queue["queue"].append({"project": project, "dir": run_dir.name})
+            self._save_queue()
+        self.tick()
+        with self._lock:
+            return self._summary(target, run_dir)
+
+    def stop(self, project: str | None, run_id: str, mode: str) -> dict:
+        if mode not in {"pause", "finish", "kill"}:
+            raise DatasetError("Stop mode must be pause, finish, or kill")
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            if not self._is_active(target, run_dir):
+                raise DatasetError("This run is not running")
+            workdir = run_dir / META_DIR
+            _write_json(workdir / "control.json", {"action": mode, "at": time.time()})
+            if mode == "kill":
+                self._signal(signal.SIGTERM, run_dir, group=False)  # the runner defers it past checkpoint writes
+                # the force-kill targets this process, not the run: a quick Resume starts a new one in the same folder
+                process = _read_json(workdir / "process.json") or {}
+                timer = threading.Timer(KILL_GRACE, self._force_kill, args=(run_dir, process.get("pid"), process.get("create_time")))
+                timer.daemon = True
+                timer.start()
+            return self._summary(target, run_dir)
+
+    def _signal(self, signum: int, run_dir: Path, group: bool) -> None:
+        if self._handle is not None:
+            try:
+                self._handle.signal(signum, group)
+            except ProcessLookupError:
+                pass
+            return
+        info = _read_json(run_dir / META_DIR / "process.json")
+        if _process_alive(info):
+            try:
+                (os.killpg if group else os.kill)(info["pid"], signum)
+            except ProcessLookupError:
+                pass
+
+    def _force_kill(self, run_dir: Path, pid: int | None, create_time: float | None) -> None:
+        with self._lock:
+            active = self._queue["active"]
+            if active is None or not self._active_alive(active):
+                return
+            try:
+                _, active_dir = self._entry_dir(active)
+            except KeyError:
+                return
+            current = _read_json(run_dir / META_DIR / "process.json") or {}
+            if active_dir == run_dir and pid is not None and current.get("pid") == pid and current.get("create_time") == create_time:
+                self._signal(signal.SIGKILL, run_dir, group=True)
+
+    def cancel(self, project: str | None, run_id: str) -> dict:
+        """Remove a queued run; its folder only holds the workbench files written at enqueue."""
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            position = self._queue_position(target, run_dir)
+            if position is None:
+                raise DatasetError("Only queued runs can be cancelled; stop a running one instead")
+            self._queue["queue"].pop(position - 1)
+            self._save_queue()
+            state = _read_json(run_dir / META_DIR / "state.json") or {}
+            if state.get("resumed"):
+                self._write_state(run_dir, status="paused", phase="paused", resumed=False)  # back to resumable
+                spec = _read_json(run_dir / META_DIR / "spec.json") or {}
+                spec["resume"] = False
+                _write_json(run_dir / META_DIR / "spec.json", spec)
+            elif [child.name for child in run_dir.iterdir()] == [META_DIR]:
+                shutil.rmtree(run_dir)
+            return {"cancelled": run_id}
+
+    def queue(self) -> dict:
+        """The whole queue (all projects): the active run and the waiting ones."""
+        self.tick()
+        with self._lock:
+            def describe(entry: dict) -> dict | None:
+                try:
+                    target, run_dir = self._entry_dir(entry)
+                    return {"key": self._key(entry), "project": entry.get("project"), "project_name": target.name, **self._summary(target, run_dir)}
+                except (KeyError, OSError):
+                    return None
+
+            active = describe(self._queue["active"]) if self._queue["active"] else None
+            queued = [item for item in map(describe, self._queue["queue"]) if item is not None]
+            return {"active": active, "queued": queued}
+
+    def reorder(self, keys: list[str]) -> dict:
+        with self._lock:
+            by_key = {self._key(entry): entry for entry in self._queue["queue"]}
+            if sorted(keys) != sorted(by_key):
+                raise DatasetError("The order must list every queued run exactly once")
+            self._queue["queue"] = [by_key[key] for key in keys]
+            self._save_queue()
+        return self.queue()
+
+    def active_summary(self) -> dict | None:
+        return self.queue()["active"]
+
+
+def _ultralytics_label_path(image_path: str) -> str:
+    """Ultralytics' img2label_paths for one image (the last /images/ becomes /labels/)."""
+    marker, replacement = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"
+    return replacement.join(image_path.rsplit(marker, 1)).rsplit(".", 1)[0] + ".txt"
+
+
+def _slugify(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")[:64] or "run"
+
+
+def _unique_dir(name: str, existing: set[str]) -> str:
+    base = _slugify(name)
+    candidate, counter = base, 2
+    while candidate in existing:
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
+def _next_name(previous: str | None, existing: set[str]) -> str:
+    """exp-3 -> exp-4 (skipping taken folder names); a fresh dataset starts at exp-1."""
+    match = re.match(r"^(.*?)(\d+)$", previous or "")
+    base, number = (match.group(1), int(match.group(2)) + 1) if match else ((previous + "-") if previous else "exp-", 2 if previous else 1)
+    if not previous:
+        numbers = [int(m.group(1)) for m in (re.match(r"^exp-(\d+)$", name) for name in existing) if m]
+        number = max(numbers, default=0) + 1
+    while _slugify(f"{base}{number}") in existing:
+        number += 1
+    return f"{base}{number}"

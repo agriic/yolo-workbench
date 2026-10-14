@@ -64,6 +64,7 @@ def main(
                 typer.echo(f"Loaded model {model}")
             except DatasetError as exc:
                 typer.echo(f"Warning: {exc}", err=True)
+    app_instance.state.training.start()  # advances the training queue; runs themselves are separate processes
     if not no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     uvicorn.run(app_instance, host=host, port=port)

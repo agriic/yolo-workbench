@@ -23,6 +23,7 @@
       </div>
       <span id="indexing-status" class="indexing-status" hidden></span>
     </div>
+    <button id="training-chip" class="training-chip" type="button" hidden></button>
     <nav aria-label="Workspace">
       <button class="tab active" data-tab="annotation">Annotation</button>
       <button class="tab" data-tab="exploration">Exploration</button>
@@ -30,6 +31,7 @@
       <button class="tab" data-tab="embeddings">Embeddings</button>
       <button class="tab" data-tab="validation">Validation <span id="issue-count" class="badge"></span></button>
       <button class="tab" data-tab="dataset">Dataset</button>
+      <button class="tab" data-tab="training">Training</button>
     </nav>
     <button id="theme-toggle" class="icon-btn" title="Toggle dark mode" aria-label="Toggle dark mode">
       <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
@@ -38,6 +40,7 @@
   </header>
 
   <main>
+    <div id="training-lock-banner" class="banner lock-banner" role="status" hidden></div>
     <section id="annotation" class="view active">
       <div class="filters annotation-toolbar">
         <div class="toolbar-group filter-controls">
@@ -207,7 +210,38 @@
         </div>
       </div>
     </section>
+
+    <section id="training" class="view">
+      <div class="training-layout">
+        <aside class="stats-panel training-sidebar">
+          <div class="panel-head"><h2>Runs <span id="run-count" class="muted"></span></h2><span class="row-actions"><button id="refresh-runs" class="secondary mini" type="button" title="Reload the runs list">Refresh</button><button id="new-run" class="primary-btn mini" type="button">New run</button></span></div>
+          <p class="panel-note runs-root"><code id="runs-root"></code></p>
+          <div id="queue-panel" class="queue-panel" hidden></div>
+          <div id="run-list" class="run-list"></div>
+          <div id="compare-bar" class="compare-bar" hidden></div>
+        </aside>
+        <div id="run-detail" class="run-detail"><div class="empty">Loading runs…</div></div>
+      </div>
+    </section>
   </main>
+
+  <dialog id="run-edit-dialog" class="modal">
+    <form method="dialog">
+      <h2>Run name and notes</h2>
+      <label class="field">Name<input id="run-edit-name" type="text" maxlength="80" required></label>
+      <label class="field">Notes<textarea id="run-edit-notes" rows="4" placeholder="What this experiment tried, what you learned"></textarea></label>
+      <p class="modal-text muted">Renaming changes the name shown here, not the run folder.</p>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button value="save" class="primary-btn">Save</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="plot-dialog" class="modal plot-dialog">
+    <div class="plot-dialog-head">
+      <strong id="plot-dialog-title"></strong>
+      <span><a id="plot-dialog-open" class="button-link" target="_blank" rel="noopener">Open in new tab</a> <button type="button" class="icon-btn" data-close title="Close" aria-label="Close"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></span>
+    </div>
+    <img id="plot-dialog-image" alt="">
+  </dialog>
 
   <dialog id="class-remove-dialog" class="modal">
     <form method="dialog" id="class-remove-form">

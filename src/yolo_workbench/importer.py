@@ -343,6 +343,7 @@ class _Fingerprints:
 
 
 def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = None) -> dict:
+    dataset.check_writable()
     allowed = dataset.capabilities()["splits"]
     if not allowed:
         raise DatasetError("This dataset's splits are not plain image folders, so images cannot be imported into it")
