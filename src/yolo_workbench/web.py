@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import json
 import math
 from pathlib import Path
+from urllib.parse import quote
 from typing import Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -13,14 +15,14 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import classes, importer
+from . import augment_preview, classes, importer
 from .dataset import Dataset, DatasetError, WriteConflict
 from .jobs import JobManager
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 from .predictor import PredictorManager
 from .session import DatasetSession
-from .training import TrainingManager
+from .training import TrainingManager, ultralytics_defaults
 from .workspace import Workspace
 
 # Keep in sync with PALETTE in static/api.js so server-rendered overlays match the editor.
@@ -473,6 +475,20 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def training_preflight(payload: TrainingArgsPayload, session: DatasetSession = current):
         return training.preflight(session.slug, session.dataset, training.validate(session.slug, payload.yaml)["args"])
 
+    @router.get("/training/augment/original")
+    def augment_original(sample: int = Query(0, ge=0), imgsz: int = Query(640, ge=32, le=4096), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
+        return augment_response(lambda: augment_preview.render_original(session.dataset, sample, imgsz, size, labels, class_color))
+
+    @router.get("/training/augment/preview")
+    def augment_preview_image(key: str, side: Literal["min", "max"], args: str = "{}", sample: int = Query(0, ge=0), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
+        values, imgsz = augment_args(args)
+        return augment_response(lambda: augment_preview.render_augmentation(session.dataset, key, side, values, ultralytics_defaults()[0], sample, imgsz, size, labels, class_color))
+
+    @router.get("/training/augment/sample")
+    def augment_sample(args: str = "{}", sample: int = Query(0, ge=0), seed: int = Query(0, ge=0), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
+        values, imgsz = augment_args(args)
+        return augment_response(lambda: augment_preview.render_pipeline(session.dataset, values, ultralytics_defaults()[0], sample, seed, imgsz, size, labels, class_color))
+
     @router.get("/training/runs")
     def training_runs(session: DatasetSession = current):
         return training.list_runs(session.slug)
@@ -760,6 +776,29 @@ def render_crop(record, annotation, category: str, padding: float) -> bytes:
         output = io.BytesIO()
         crop.save(output, "JPEG", quality=88)
         return output.getvalue()
+
+
+def augment_args(text: str) -> tuple[dict, int]:
+    """Training arguments for an augmentation preview (a JSON object in the query) and the image size they train at."""
+    try:
+        values = json.loads(text)
+    except ValueError as exc:
+        raise HTTPException(400, "args must be a JSON object") from exc
+    if not isinstance(values, dict) or any(not (value is None or isinstance(value, (str, int, float))) or isinstance(value, float) and not math.isfinite(value) for value in values.values()):
+        raise HTTPException(400, "args must map argument names to numbers or strings")
+    imgsz = values.get("imgsz", ultralytics_defaults()[0].get("imgsz", 640))
+    if isinstance(imgsz, bool) or not isinstance(imgsz, (int, float)) or not 32 <= imgsz <= 4096:
+        raise HTTPException(400, "imgsz must be a number between 32 and 4096")
+    return values, int(imgsz)
+
+
+def augment_response(render) -> Response:
+    try:
+        preview = render()
+    except (AssertionError, TypeError, ValueError) as exc:  # Ultralytics/torchvision reject out-of-range arguments this way
+        raise HTTPException(400, f"Cannot preview these values: {exc}") from exc
+    # rendered from the current images and labels: kept briefly, never shared
+    return Response(preview.jpeg, media_type="image/jpeg", headers={"Cache-Control": "private, max-age=300", "X-Preview-Note": quote(preview.note)})
 
 
 def jpeg_response(content: bytes, etag: str | None = None) -> Response:

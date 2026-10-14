@@ -255,6 +255,9 @@ def validate_args(category: str, text: str) -> dict:
     cache = args.get("cache")
     if isinstance(cache, str) and cache.lower() == "disk":
         errors.append({"line": _key_line(text, "cache"), "message": "cache: disk writes .npy files next to every image in the dataset; use `ram` or `false`"})
+    hue = args.get("hsv_h")
+    if category == "classification" and isinstance(hue, (int, float)) and hue > 0.5:
+        errors.append({"line": _key_line(text, "hsv_h"), "message": "hsv_h must be at most 0.5 for classification (torchvision's ColorJitter hue range)"})
     device = args.get("device")
     if isinstance(device, list) and len(device) > 1 or isinstance(device, str) and "," in device:
         errors.append({"line": _key_line(text, "device"), "message": "Multi-GPU training is not supported here (no live progress with DDP); pick one device"})

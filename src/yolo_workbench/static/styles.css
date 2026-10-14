@@ -1219,3 +1219,66 @@ dialog.plot-dialog { width: min(1200px, calc(100vw - 32px)); }
 .training-flag { position: absolute; top: 8px; left: 8px; display: inline-flex; align-items: center; gap: 6px; background: var(--surface); color: var(--accent-strong); border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent); font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; box-shadow: var(--shadow-1); }
 .training-flag.queued { color: var(--text-2); border-color: var(--line); }
 
+
+/* augmentation previews (augments.js) */
+.aug-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-bottom: 12px; }
+.aug-sample { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.aug-sample-thumb { padding: 0; width: 52px; height: 52px; border-radius: 6px; overflow: hidden; background: var(--thumb-bg); flex: none; cursor: zoom-in; }
+.aug-sample-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.aug-sample-text { display: grid; gap: 1px; min-width: 0; font-size: 13px; }
+.aug-sample-text .muted { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.aug-sample-nav { display: flex; gap: 4px; }
+.aug-toolbar-note { margin-left: auto; font-size: 12px; }
+.aug-samples-panel { border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 12px; background: var(--bg); }
+.aug-samples-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 8px; }
+.aug-samples-head h3 { margin: 0; font-size: 13px; }
+.aug-samples-head .muted { font-size: 12px; }
+.aug-samples-head button { margin-left: auto; }
+.aug-samples { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 8px; }
+.aug-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 330px), 1fr)); gap: 12px; }
+.aug-card { display: grid; gap: 8px; align-content: start; padding: 10px 12px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); min-width: 0; }
+.aug-card.changed { border-color: color-mix(in srgb, var(--accent) 60%, var(--line)); box-shadow: inset 3px 0 0 var(--accent); }
+.aug-head { display: flex; align-items: center; gap: 8px; min-height: 24px; }
+.aug-title { font-weight: 600; font-size: 13px; }
+.aug-card.changed .aug-title { color: var(--accent-strong); }
+.aug-key { font-size: 11px; color: var(--text-3); }
+.aug-reset { margin-left: auto; }
+.aug-desc { margin: 0; font-size: 12px; line-height: 1.45; color: var(--text-2); }
+.aug-control { display: grid; grid-template-columns: minmax(0, 1fr) 92px; gap: 10px; align-items: center; }
+.aug-control.single { grid-template-columns: minmax(0, 220px); }
+.aug-control input[type="range"] { width: 100%; margin: 0; accent-color: var(--accent); }
+.aug-control input[type="number"], .aug-control select { height: 30px; min-width: 0; width: 100%; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); padding: 0 8px; color: var(--text); }
+.aug-control input[type="number"]::placeholder { color: var(--text-3); }
+.aug-card.changed .aug-control input[type="number"] { border-color: var(--accent); }
+.aug-mode { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.aug-mode .segmented span { padding: 3px 10px; font-size: 12px; }
+.aug-inactive { font-size: 12px; color: var(--warn); font-weight: 500; }
+.aug-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.aug-tile { margin: 0; display: grid; gap: 4px; align-content: start; min-width: 0; }
+.aug-tile figcaption { display: grid; gap: 1px; font-size: 11px; line-height: 1.3; color: var(--text-2); text-align: center; font-variant-numeric: tabular-nums; }
+.tile-note { color: var(--warn); font-size: 10.5px; }
+.tile-note:empty { display: none; }
+.aug-img { position: relative; display: block; width: 100%; padding: 0; aspect-ratio: 1; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--thumb-bg); cursor: zoom-in; }
+.aug-img:hover:not(:disabled) { border-color: var(--accent); background: var(--thumb-bg); }
+.aug-img img { display: block; width: 100%; height: 100%; object-fit: contain; transition: opacity .15s; }
+.aug-img img:not([src]) { visibility: hidden; }
+.aug-img.loading img, .aug-sample-thumb.loading img { opacity: .55; }
+.aug-img.loading::after, .aug-sample-thumb.loading::after { content: ""; position: absolute; top: 6px; right: 6px; width: 12px; height: 12px; border: 2px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%; animation: aug-spin .8s linear infinite; }
+.aug-img.failed { border-color: var(--danger); }
+@keyframes aug-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .aug-img.loading::after, .aug-sample-thumb.loading::after { animation: none; } }
+.aug-card.is-off .aug-tile:not(:has([data-aug-tile="original"])) .aug-img,
+.aug-card.is-inactive .aug-tile .aug-img { opacity: .4; }
+.aug-odds { display: grid; place-items: center; align-content: center; gap: 6px; text-align: center; aspect-ratio: 1; }
+.aug-odds .muted { font-size: 11px; }
+.aug-ring { --size: min(86px, 100%); width: var(--size); aspect-ratio: 1; border-radius: 50%; display: grid; place-items: center;
+  background: conic-gradient(var(--accent) calc(var(--odds, 0) * 360deg), var(--line) 0); }
+.aug-ring span { width: 72%; aspect-ratio: 1; border-radius: 50%; background: var(--surface); display: grid; place-items: center; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+dialog.aug-zoom { width: min(1400px, calc(100vw - 32px)); }
+.aug-zoom-body { display: grid; grid-template-columns: repeat(var(--zoom-count, 1), minmax(0, 1fr)); gap: 12px; padding: 14px; max-width: calc((100dvh - 150px) * var(--zoom-count, 1)); margin: 0 auto; }
+.aug-zoom-body .aug-img { cursor: default; }
+.aug-zoom-body figcaption { font-size: 13px; }
+@media (max-width: 700px) {
+  .aug-zoom-body { grid-template-columns: 1fr; max-width: none; }
+  .aug-toolbar-note { margin-left: 0; }
+}

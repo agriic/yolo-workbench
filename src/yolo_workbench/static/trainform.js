@@ -3,6 +3,7 @@
 // raw YAML mode round-trips through the server's validator (POST /training/args/validate).
 import { $, api, esc, debounce } from "./api.js";
 import { state } from "./state.js";
+import { augmentationArgChanged, augmentationHtml, mountAugmentations } from "./augments.js";
 
 let deps;
 export function configureRunForm(dependencies) {
@@ -22,7 +23,8 @@ const GROUPS = [
   { id: "augmentation", title: "Augmentation" },
   { id: "advanced", title: "Advanced" },
 ];
-// `cats` limits a field to dataset categories; everything else is reachable in raw YAML
+// `cats` limits a field to dataset categories; everything else is reachable in raw YAML.
+// The augmentation group renders as preview cards (augments.js); its entries here keep counts and raw YAML in step.
 const FIELDS = [
   { group: "basics", key: "epochs", label: "Epochs", type: "int", min: 1 },
   { group: "basics", key: "imgsz", label: "Image size", type: "int", min: 32, step: 32 },
@@ -52,12 +54,14 @@ const FIELDS = [
   { group: "augmentation", key: "perspective", label: "Perspective", type: "float", min: 0, max: 0.001, cats: DET_SEG },
   { group: "augmentation", key: "flipud", label: "Flip up-down", type: "float", min: 0, max: 1 },
   { group: "augmentation", key: "fliplr", label: "Flip left-right", type: "float", min: 0, max: 1 },
+  { group: "augmentation", key: "bgr", label: "BGR swap", type: "float", min: 0, max: 1, cats: DET_SEG },
   { group: "augmentation", key: "mosaic", label: "Mosaic", type: "float", min: 0, max: 1, cats: DET_SEG },
   { group: "augmentation", key: "mixup", label: "MixUp", type: "float", min: 0, max: 1, cats: DET_SEG },
   { group: "augmentation", key: "cutmix", label: "CutMix", type: "float", min: 0, max: 1, cats: DET_SEG },
   { group: "augmentation", key: "copy_paste", label: "Copy-paste", type: "float", min: 0, max: 1, cats: ["segmentation"] },
+  { group: "augmentation", key: "copy_paste_mode", label: "Copy-paste mode", type: "select", options: [["flip", "flip"], ["mixup", "mixup"]], cats: ["segmentation"] },
   { group: "augmentation", key: "erasing", label: "Random erasing", type: "float", min: 0, max: 1, cats: CLS },
-  { group: "augmentation", key: "auto_augment", label: "Auto augment", type: "select", options: [["randaugment", "RandAugment"], ["autoaugment", "AutoAugment"], ["augmix", "AugMix"]], cats: CLS },
+  { group: "augmentation", key: "auto_augment", label: "Auto augment", type: "select", options: [["randaugment", "RandAugment"], ["autoaugment", "AutoAugment"], ["augmix", "AugMix"], [null, "Off"]], cats: CLS },
 
   { group: "advanced", key: "workers", label: "Dataloader workers", type: "int", min: 0 },
   { group: "advanced", key: "fraction", label: "Dataset fraction", type: "float", min: 0, max: 1 },
@@ -215,10 +219,21 @@ function renderGui() {
     ${GROUPS.map(group => `
       <details class="stats-panel form-panel form-group" data-group="${group.id}" ${group.open || changed(group.id) ? "open" : ""}>
         <summary><h2>${esc(group.title)}</h2><span class="changed-count" data-changed="${group.id}">${changed(group.id) ? `${changed(group.id)} changed` : ""}</span></summary>
-        <div class="form-grid">${fields().filter(field => field.group === group.id).map(fieldHtml).join("")}</div>
+        ${group.id === "augmentation" ? augmentationHtml(augmentationContext()) : `<div class="form-grid">${fields().filter(field => field.group === group.id).map(fieldHtml).join("")}</div>`}
       </details>`).join("")}
     ${extrasHtml()}`;
+  mountAugmentations($("form-gui").querySelector('[data-group="augmentation"]'));
 }
+
+const augmentationContext = () => ({
+  category: category(),
+  defaults: options.defaults,
+  help: options.help,
+  fields: fields(),
+  args: () => args,
+  setArg,
+  changed: () => { updateChangedCounts(); scheduleCheck(); },
+});
 
 function modelHtml() {
   const model = args.model || "";
@@ -320,6 +335,7 @@ function onInput(e) {
     setArg(input.dataset.key, input.dataset.type === "int" ? Math.trunc(number) : number);
   }
   input.closest(".field").classList.toggle("changed", input.dataset.key in args);
+  augmentationArgChanged(input.dataset.key);
   updateChangedCounts();
   scheduleCheck();
 }
@@ -355,6 +371,7 @@ async function onChange(e) {
     setArg(target.dataset.key, target.value === "" ? undefined : JSON.parse(target.value));
     target.closest(".field").classList.toggle("changed", target.dataset.key in args);
   } else return;
+  augmentationArgChanged(target.dataset.key);
   updateChangedCounts();
   scheduleCheck();
 }
