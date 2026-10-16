@@ -872,6 +872,7 @@ class TrainingManager:
                 plots.extend(f"{prefix}{path.name}" for path in sorted(directory.iterdir()) if path.suffix.lower() in PLOT_EXTENSIONS and path.is_file())
         return {
             **summary,
+            "bytes": _tree_size(run_dir),
             "args": args,
             "state": _read_json(workdir / "state.json") or {},
             "val": _read_json(workdir / "val.json"),
@@ -945,6 +946,49 @@ class TrainingManager:
             _write_json(path, meta)
             self._refresh_lock()
             return self._summary(target, run_dir)
+
+    def delete_run(self, project: str | None, run_id: str) -> dict:
+        """Delete a run's folder for good: weights, plots, logs. Not while it runs or waits in the queue,
+        nor while an active or queued run is to start from its weights."""
+        self.tick()
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            if self._is_active(target, run_dir):
+                raise DatasetError("This run is in progress; stop it before deleting it")
+            if self._queue_position(target, run_dir) is not None:
+                raise DatasetError("This run is queued; remove it from the queue before deleting it")
+            user = self._started_from(run_dir)
+            if user:
+                raise DatasetError(f"Run '{user}' starts from this run's weights; delete this run once '{user}' has finished or left the queue")
+            size = _tree_size(run_dir)
+            # out of sight first (_scan skips dot folders): on Windows a file open elsewhere fails the
+            # rename, before anything is lost
+            doomed = run_dir.with_name(f".deleting-{run_dir.name}-{time.time_ns()}")
+            try:
+                replace(run_dir, doomed)
+            except OSError as exc:
+                raise DatasetError(f"Could not delete the run folder ({exc.strerror or exc}); is one of its files open in another program?") from exc
+        try:
+            shutil.rmtree(doomed)
+        except OSError as exc:
+            raise DatasetError(f"The run is gone from the list, but some of its files could not be deleted: {doomed.as_posix()} ({exc.strerror or exc})") from exc
+        return {"deleted": run_id, "bytes": size}
+
+    def _started_from(self, run_dir: Path) -> str | None:
+        """The name of the active or a queued run whose model is this run's weights (a resume loads its own last.pt)."""
+        weights = (run_dir / "weights").resolve()
+        entries = ([self._queue["active"]] if self._queue["active"] else []) + self._queue["queue"]
+        for entry in entries:
+            try:
+                _, other = self._entry_dir(entry)
+            except KeyError:
+                continue
+            spec = _read_json(other / META_DIR / "spec.json") or {}
+            model = str((spec.get("args") or {}).get("model") or "")
+            if model and not spec.get("resume") and Path(model).expanduser().resolve().parent == weights:
+                return (_read_json(other / META_DIR / "run.json") or {}).get("name") or other.name
+        return None
 
     def copy_args(self, project: str | None, run_id: str) -> dict:
         """A run's arguments for a new run: managed keys and Ultralytics defaults stripped."""
@@ -1169,6 +1213,17 @@ def _ultralytics_label_path(image_path: str) -> str:
     """Ultralytics' img2label_paths for one image (the last /images/ becomes /labels/)."""
     marker, replacement = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"
     return replacement.join(image_path.rsplit(marker, 1)).rsplit(".", 1)[0] + ".txt"
+
+
+def _tree_size(directory: Path) -> int:
+    total = 0
+    for path in directory.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            pass  # written or removed meanwhile
+    return total
 
 
 def _slugify(name: str) -> str:

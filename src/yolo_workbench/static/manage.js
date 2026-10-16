@@ -1,4 +1,4 @@
-import { $, api, apiUrl, esc, classColor } from "./api.js";
+import { $, api, apiUrl, esc, classColor, formatBytes } from "./api.js";
 import { state } from "./state.js";
 let deps;
 
@@ -286,9 +286,6 @@ async function rescan() {
 }
 
 /* ---------- trash & backups ---------- */
-
-const formatBytes = bytes => bytes >= 1 << 30 ? `${(bytes / (1 << 30)).toFixed(1)} GB`
-  : bytes >= 1 << 20 ? `${(bytes / (1 << 20)).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} B`;
 
 export async function loadStorage() {
   try {

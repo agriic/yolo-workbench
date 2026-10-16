@@ -665,6 +665,10 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def training_run_update(run_id: str, payload: TrainingRunUpdatePayload, session: DatasetSession = current):
         return found(lambda: training.update_run(session.slug, run_id, payload.name, payload.notes))
 
+    @router.delete("/training/runs/{run_id}")
+    def training_run_delete(run_id: str, session: DatasetSession = current):
+        return found(lambda: training.delete_run(session.slug, run_id))
+
     @router.get("/training/runs/{run_id}/epochs")
     def training_epochs(run_id: str, since: int = Query(0, ge=0), session: DatasetSession = current):
         return found(lambda: training.epochs(session.slug, run_id, since))

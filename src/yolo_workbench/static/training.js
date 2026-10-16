@@ -1,7 +1,7 @@
 // Training tab: run history, the live view of the active run, the header chip, and the
 // read-only banner while this dataset is training. The queue itself lives on the server
 // (training.py); this module only polls it.
-import { $, api, apiUrl, esc } from "./api.js";
+import { $, api, apiUrl, esc, formatBytes } from "./api.js";
 import { state } from "./state.js";
 import { LineChart, formatValue } from "./charts.js";
 import { configureRunForm, loadTrainingOptions, openRunForm, trainingOptions } from "./trainform.js";
@@ -504,6 +504,7 @@ function renderActions() {
   buttons.push(`<button class="secondary" data-duplicate title="Start a new run with the same arguments">Duplicate</button>`);
   buttons.push(`<button class="icon-btn" data-edit-run title="Rename / notes" aria-label="Rename or add notes"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>`);
   if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-finetune title="Start a new run from this run's ${run.has_weights.best ? "best" : "last"}.pt">Fine-tune</button>`);
+  if (!run.active && run.status !== "queued") buttons.push(`<button class="icon-btn danger-btn" data-delete-run title="Delete run" aria-label="Delete this run"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg></button>`);
   $("run-actions").innerHTML = buttons.join("");
 }
 
@@ -513,6 +514,7 @@ async function onDetailClick(e) {
   const id = detail.id;
   const stop = e.target.closest("[data-stop]");
   const plot = e.target.closest("[data-plot]");
+  const remove = e.target.closest("[data-delete-run]");
   try {
     if (stop) {
       const mode = stop.dataset.stop;
@@ -530,6 +532,14 @@ async function onDetailClick(e) {
       deps.toast("Removed from the queue");
       selectedId = null;
       detail = null;
+      await loadRuns();
+    } else if (remove) {
+      const name = detail.name;
+      if (!confirm(`Delete run "${name}" for good?\n\nIts folder is removed from disk with the weights, plots and log (${formatBytes(detail.bytes ?? 0)}):\n${detail.path}`)) return;
+      remove.disabled = true;
+      const result = await api(`/training/runs/${encodeURIComponent(id)}`, { method: "DELETE" });
+      deps.toast(`Deleted "${name}" (${formatBytes(result.bytes)} freed)`);
+      if (selectedId === id) { selectedId = null; detail = null; }
       await loadRuns();
     } else if (e.target.closest("[data-edit-run]")) {
       openEditDialog();
@@ -553,6 +563,7 @@ async function onDetailClick(e) {
   } catch (error) {
     deps.toast(error.message, "error");
     if (stop) stop.disabled = false;
+    if (remove) { remove.disabled = false; loadRuns(); }  // a partly failed delete still takes the run off the list
   }
 }
 

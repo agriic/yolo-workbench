@@ -1092,7 +1092,7 @@ body.training-locked .editor-status::before { content: "Read-only while training
 .run-title { min-width: 0; }
 .run-title h1 { font-size: 19px; margin: 6px 0 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; overflow-wrap: anywhere; }
 .run-title .section-subtitle { margin: 0 0 4px; overflow-wrap: anywhere; }
-.run-actions { display: flex; gap: 8px; padding-top: 6px; }
+.run-actions { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 6px; }
 .run-notes { margin: 6px 0 0; font-size: 13px; color: var(--text-2); white-space: pre-wrap; }
 #run-alerts .banner { margin: 10px 0 0; }
 .run-error { border-color: var(--danger); }

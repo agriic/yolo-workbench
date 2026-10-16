@@ -388,6 +388,51 @@ def test_deleted_run_folders_disappear_and_queued_ones_are_dropped(tmp_path):
     assert manager.queue() == {"active": None, "queued": []} and len(launcher.launches) == 1
 
 
+def test_delete_run_removes_the_folder_but_not_while_running_queued_or_a_base(tmp_path):
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+    first = manager.enqueue(None, dataset, "", "", ARGS)["run"]
+    with pytest.raises(DatasetError, match="in progress"):
+        manager.delete_run(None, first["id"])
+    runner_finishes(Path(first["path"]))
+    (Path(first["path"]) / "results.png").write_bytes(b"png")
+    launcher.handle.code = 0
+
+    # a run fine-tuning from first's weights keeps them until it ends
+    finetune = f"model: {Path(first['path']).as_posix()}/weights/best.pt\nepochs: 5\nimgsz: 64\n"
+    second = manager.enqueue(None, dataset, "", "", finetune)["run"]
+    third = manager.enqueue(None, dataset, "", "", finetune)["run"]
+    assert second["active"] and third["queue_position"] == 1
+    with pytest.raises(DatasetError, match="queued"):
+        manager.delete_run(None, third["id"])
+    manager.cancel(None, third["id"])
+    with pytest.raises(DatasetError, match="'exp-2' starts from this run's weights"):
+        manager.delete_run(None, first["id"])
+    runner_finishes(Path(second["path"]))
+    launcher.handle.code = 0
+
+    size =manager.run_detail(None, first["id"])["bytes"]
+    assert size == sum(path.stat().st_size for path in Path(first["path"]).rglob("*") if path.is_file())
+    assert manager.delete_run(None, first["id"]) == {"deleted": first["id"], "bytes": size}
+    assert not Path(first["path"]).exists() and [path.name for path in (dataset.root / "runs").iterdir()] == ["exp-2"]
+    assert [item["id"] for item in manager.list_runs(None)["items"]] == [second["id"]]
+    with pytest.raises(KeyError):
+        manager.delete_run(None, first["id"])
+
+
+def test_delete_external_run(tmp_path):
+    dataset = make_dataset(tmp_path)
+    external = dataset.root / "runs" / "detect" / "train"
+    (external / "weights").mkdir(parents=True)
+    (external / "args.yaml").write_text(yaml.safe_dump({"model": "yolo11n.pt", "data": str(dataset.yaml_path)}))
+    (external / "weights" / "best.pt").write_bytes(b"x")
+    manager = make_manager(dataset, tmp_path)
+    run = manager.list_runs(None)["items"][0]
+    manager.delete_run(None, run["id"])
+    assert not external.exists() and manager.list_runs(None)["items"] == []
+
+
 def test_preflight_errors_warnings_and_confirmation(tmp_path):
     dataset = make_dataset(tmp_path, splits=("train",))
     manager = make_manager(dataset, tmp_path)
@@ -747,6 +792,10 @@ def test_single_mode_training_api(tmp_path):
             assert response.json()["notes"] == "good"
             assert (await client.get(f"/api/v1/training/runs/{run['id']}/args")).json()["args"] == {"model": "yolo11n.pt", "epochs": 5, "imgsz": 64}
             assert (await client.get("/api/v1/dataset")).json()["training_lock"] is None
+            response = await client.delete(f"/api/v1/training/runs/{run['id']}")
+            assert response.status_code == 200 and response.json()["deleted"] == run["id"] and not Path(run["path"]).exists()
+            assert (await client.get(f"/api/v1/training/runs/{run['id']}")).status_code == 404
+            assert (await client.delete(f"/api/v1/training/runs/{run['id']}")).status_code == 404
 
     asyncio.run(run())
 
