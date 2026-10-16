@@ -7,10 +7,12 @@ label makes its finding disappear without re-running the model:
 
 - missing_label    a confident prediction no label matches (likely an object nobody labelled)
 - wrong_class      a label and a confident prediction overlap well but disagree on the class
-- box_mismatch     a confident prediction of the label's class overlaps it only loosely
+- box_mismatch     a confident prediction of the label's class whose box differs by more than the
+                   tolerance (a few pixels, or a small fraction of the object's size)
 - unmatched_label  a label nothing the model predicted overlaps (likely spurious or mislabelled)
 
-Matching is greedy by box IoU (segmentation polygons use their bounding boxes), same class first.
+Pairing is greedy by confidence × box IoU (segmentation polygons use their bounding boxes); see
+compute_findings. The tolerance is chosen per listing, so changing it needs no new analysis.
 Applying a finding's fix goes through Dataset.replace_annotations, so backups, undo, conflict
 detection, and the training lock apply. Dismissing one ("the label is right") is remembered.
 """
@@ -33,8 +35,11 @@ from .models import Annotation, ImageRecord
 from .predictor import PredictorManager, _bbox, _bbox_iou
 
 QA_CONF = 0.05        # predictions are kept down to this confidence, so "the model saw nothing here" means something
-MATCH_IOU = 0.5       # a label and a prediction are the same object
-LOOSE_IOU = 0.1       # below MATCH_IOU but above this, a same-class prediction says the box is drawn differently
+MATCH_IOU = 0.5       # a prediction of another class must overlap a label this well to be about the same object
+LOOSE_IOU = 0.1       # a prediction of the label's class overlapping it this much is about the same object
+CLOSE_IOU = 0.85      # without pixel sizes, a same-class pair overlapping this well counts as the same box
+DEFAULT_TOLERANCE_PX = 3.0  # box edges this many pixels apart are the same box
+TOLERANCE_FRACTION = 0.05   # ... or this fraction of the object's longer side, when that is more
 DEFAULT_MIN_CONF = 0.5
 KINDS = ("missing_label", "wrong_class", "box_mismatch", "unmatched_label")
 SAVE_INTERVAL = 20.0  # seconds between saves while analyzing
@@ -50,7 +55,7 @@ class LabelQAManager:
         self._cancel = threading.Event()
         self.job: dict = {"state": "idle", "done": 0, "total": 0, "failed": 0, "error": None}
         self.result: dict | None = None  # the stored analysis (see _new_result)
-        self._cache: dict[str, tuple] = {}  # image key -> (inputs, findings)
+        self._cache: dict[tuple, tuple] = {}  # (image key, tolerance) -> (inputs, findings)
         self._load()
         dataset.add_schema_listener(self._schema_changed)
 
@@ -203,7 +208,6 @@ class LabelQAManager:
                 predictions = [[int(item["class_id"]), round(float(item["confidence"]), 4), *(round(float(value), 6) for value in item["points"])] for item in raw]
                 with self._lock:
                     self.result["images"][self._key(record.path)] = {"id": record.id, "mtime": mtime, "predictions": predictions}
-                    self._cache.pop(self._key(record.path), None)
                     self.job["done"] += 1
                 if time.monotonic() - last_save > SAVE_INTERVAL:
                     self._save()
@@ -240,8 +244,12 @@ class LabelQAManager:
             return record
         return next((candidate for candidate in self.dataset.images.values() if self._key(candidate.path) == key), None)
 
-    def _image_findings(self, key: str, entry: dict, record: ImageRecord) -> list[dict] | None:
-        """Every finding of one image at any confidence (None when the image changed since it was analyzed)."""
+    def _image_findings(self, key: str, entry: dict, record: ImageRecord, tolerance: float = 0.0) -> list[dict] | None:
+        """Every finding of one image at any confidence (None when the image changed since it was analyzed).
+
+        tolerance 0 reports every box difference: a superset of what any listing shows, which is
+        what looking a finding up by its key needs.
+        """
         try:
             mtime = record.path.stat().st_mtime_ns
         except OSError:
@@ -249,14 +257,15 @@ class LabelQAManager:
         if mtime != entry["mtime"]:
             return None
         dismissed = tuple(self.result["dismissed"].get(key, ()))
-        inputs = (self.dataset._revisions.get(record.label_path), dismissed, self.dataset.schema_generation)
-        cached = self._cache.get(key)
+        inputs = (id(entry), self.dataset._revisions.get(record.label_path), dismissed, self.dataset.schema_generation, record.width, record.height)
+        cached = self._cache.get((key, tolerance))
         if cached and cached[0] == inputs:
             return cached[1]
-        findings = [finding for finding in compute_findings(self.dataset.category, record.annotations, self._predictions(entry), self.dataset.names) if finding["key"] not in dismissed]
+        found = compute_findings(self.dataset.category, record.annotations, self._predictions(entry), self.dataset.names, (record.width, record.height), tolerance)
+        findings = [finding for finding in found if finding["key"] not in dismissed]
         for finding in findings:
             finding.update(image_id=record.id, image_name=record.path.name, split=record.split)
-        self._cache[key] = (inputs, findings)
+        self._cache[(key, tolerance)] = (inputs, findings)
         return findings
 
     def _predictions(self, entry: dict) -> list[dict]:
@@ -268,7 +277,7 @@ class LabelQAManager:
                 predictions.append({"class_id": target, "model_class_id": model_class, "model_class_name": names.get(model_class, str(model_class)), "confidence": confidence, "points": points})
         return predictions
 
-    def findings(self, kind: str | None = None, split: str | None = None, min_conf: float = DEFAULT_MIN_CONF, offset: int = 0, limit: int = 60) -> dict:
+    def findings(self, kind: str | None = None, split: str | None = None, min_conf: float = DEFAULT_MIN_CONF, offset: int = 0, limit: int = 60, tolerance: float = DEFAULT_TOLERANCE_PX) -> dict:
         """Findings across the analyzed images, most suspicious first."""
         if kind is not None and kind not in KINDS:
             raise DatasetError(f"Unknown finding kind {kind}")
@@ -282,7 +291,7 @@ class LabelQAManager:
                     continue
                 if split not in (None, "all") and record.split != split:
                     continue
-                found = self._image_findings(key, entry, record)
+                found = self._image_findings(key, entry, record, tolerance)
                 if found is None:
                     stale += 1
                     continue
@@ -369,30 +378,37 @@ def _signature(kind: str, label: Annotation | None, prediction: dict | None, cat
     return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
 
 
-def compute_findings(category: str, annotations: list[Annotation], predictions: list[dict], names: dict) -> list[dict]:
-    """Match labels and predictions and report every disagreement (confidence filtering happens later)."""
+def compute_findings(category: str, annotations: list[Annotation], predictions: list[dict], names: dict, image_size: tuple[int, int] = (0, 0), tolerance: float = DEFAULT_TOLERANCE_PX) -> list[dict]:
+    """Pair labels with predictions and report every disagreement (confidence filtering happens later).
+
+    Pairing is one greedy pass over candidate pairs, best first by confidence × IoU: a prediction of
+    the label's class that overlaps it at all (IoU >= LOOSE_IOU), or one of another class that overlaps
+    it well (IoU >= MATCH_IOU). So a confident box of the right class a few pixels off is not outbid by
+    a weak guess of another class that happens to overlap a little better, and a confident other-class
+    box still beats a stray same-class one. A same-class pair is a finding only when the boxes differ by
+    more than the tolerance (see _box_deviation). Unpaired predictions that overlap a label well are other
+    guesses at an object that has a label, not missing labels.
+    """
     labels = [annotation for annotation in annotations if annotation.class_id in names and annotation.points]
     label_boxes = [_bbox(category, label.points) for label in labels]
     prediction_boxes = [_bbox(category, prediction["points"]) for prediction in predictions]
-    pairs = sorted(
-        ((iou, li, pi) for li, label_box in enumerate(label_boxes) for pi, prediction_box in enumerate(prediction_boxes) if (iou := _bbox_iou(label_box, prediction_box)) > 0),
+    iou_of = {(li, pi): iou for li, label_box in enumerate(label_boxes) for pi, prediction_box in enumerate(prediction_boxes) if (iou := _bbox_iou(label_box, prediction_box)) > 0}
+
+    def same(li: int, pi: int) -> bool:
+        return labels[li].class_id == predictions[pi]["class_id"]
+
+    candidates = sorted(
+        ((predictions[pi]["confidence"] * iou, same(li, pi), iou, li, pi) for (li, pi), iou in iou_of.items() if iou >= (LOOSE_IOU if same(li, pi) else MATCH_IOU)),
         reverse=True,
     )
     label_match: dict[int, int] = {}
     prediction_match: dict[int, int] = {}
-    for same_class in (True, False):  # a same-class match wins over a better-overlapping other class
-        for iou, li, pi in pairs:
-            if iou < MATCH_IOU:
-                break
-            if li in label_match or pi in prediction_match:
-                continue
-            if same_class and labels[li].class_id != predictions[pi]["class_id"]:
-                continue
+    for _, _, _, li, pi in candidates:
+        if li not in label_match and pi not in prediction_match:
             label_match[li], prediction_match[pi] = pi, li
-    iou_of = {(li, pi): iou for iou, li, pi in pairs}
     findings: list[dict] = []
 
-    def add(kind: str, score: float, li: int | None, pi: int | None) -> None:
+    def add(kind: str, score: float, li: int | None, pi: int | None, **extra) -> None:
         label = labels[li] if li is not None else None
         prediction = predictions[pi] if pi is not None else None
         findings.append({
@@ -402,30 +418,48 @@ def compute_findings(category: str, annotations: list[Annotation], predictions: 
             "iou": round(iou_of.get((li, pi), 0.0), 3) if li is not None and pi is not None else None,
             "label": {"annotation_id": label.id, "class_id": label.class_id, "points": list(label.points)} if label else None,
             "prediction": dict(prediction) if prediction else None,
+            **extra,
         })
 
     for li, pi in label_match.items():
-        if labels[li].class_id != predictions[pi]["class_id"]:
-            add("wrong_class", predictions[pi]["confidence"], li, pi)
-    explained: set[int] = set()
-    for pi, prediction in enumerate(predictions):
-        if pi in prediction_match:
+        iou, confidence = iou_of[(li, pi)], predictions[pi]["confidence"]
+        if not same(li, pi):
+            add("wrong_class", confidence, li, pi)
             continue
-        loose = [(iou, li) for (li, other), iou in iou_of.items() if other == pi and li not in label_match and li not in explained and labels[li].class_id == prediction["class_id"] and iou >= LOOSE_IOU]
-        if loose:
-            iou, li = max(loose)
-            explained.add(li)
-            add("box_mismatch", prediction["confidence"] * (1 - iou), li, pi)
-        else:
-            add("missing_label", prediction["confidence"], None, pi)
+        deviation, allowed = _box_deviation(label_boxes[li], prediction_boxes[pi], image_size, tolerance)
+        if deviation is None:
+            # no pixel size known (not probed yet): fall back to overlap alone
+            if iou < CLOSE_IOU:
+                add("box_mismatch", confidence * (1 - iou), li, pi)
+        elif deviation > allowed:
+            add("box_mismatch", confidence * (1 - iou), li, pi, deviation_px=round(deviation, 1))
+    for pi, prediction in enumerate(predictions):
+        if pi in prediction_match or any(iou_of.get((li, pi), 0.0) >= MATCH_IOU for li in range(len(labels))):
+            continue
+        add("missing_label", prediction["confidence"], None, pi)
     for li in range(len(labels)):
-        if li in label_match or li in explained:
+        if li in label_match:
             continue
         support = max((predictions[pi]["confidence"] for (other, pi), iou in iou_of.items() if other == li and iou >= LOOSE_IOU), default=0.0)
         # weighted below a confident miss: a weak model also fails to find objects that are labelled right
         add("unmatched_label", 0.9 * (1 - support), li, None)
     # many low-confidence predictions are noise; keep the strongest few per image
     return sorted(findings, key=lambda finding: -finding["score"])[:50]
+
+
+def _box_deviation(label_box, prediction_box, image_size: tuple[int, int], tolerance: float) -> tuple[float | None, float]:
+    """How far apart (pixels) the furthest pair of edges is, and how far is still "the same box".
+
+    The allowance is the tolerance in pixels, or TOLERANCE_FRACTION of the label's longer side when
+    that is more, so large objects are not flagged for a few pixels either.
+    """
+    width, height = image_size
+    if width <= 0 or height <= 0:
+        return None, 0.0
+    deviation = max(abs(label_box[0] - prediction_box[0]) * width, abs(label_box[2] - prediction_box[2]) * width,
+                    abs(label_box[1] - prediction_box[1]) * height, abs(label_box[3] - prediction_box[3]) * height)
+    longer_side = max((label_box[2] - label_box[0]) * width, (label_box[3] - label_box[1]) * height)
+    return deviation, max(tolerance, TOLERANCE_FRACTION * longer_side)
 
 
 def render_finding(path: Path, category: str, finding: dict, color) -> bytes:

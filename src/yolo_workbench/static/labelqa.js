@@ -31,6 +31,10 @@ export function bindLabelQA() {
     $("qa-conf-value").textContent = `${Math.round($("qa-conf").value * 100)}%`;
     reloadFindingsSoon();
   };
+  $("qa-tolerance").oninput = () => {
+    $("qa-tolerance-value").textContent = `${$("qa-tolerance").value} px`;
+    reloadFindingsSoon();
+  };
   $("qa-filter-split").onchange = () => loadFindings();
   $("qa-kinds").addEventListener("click", e => {
     const chip = e.target.closest("[data-qa-kind]");
@@ -192,7 +196,7 @@ async function loadFindings({ append = false, keep = false } = {}) {
   const request = ++qa.request;
   const offset = append ? qa.items.length : 0;
   const limit = keep ? Math.max(PAGE, qa.items.length) : PAGE;
-  const params = new URLSearchParams({ split: $("qa-filter-split").value, min_conf: $("qa-conf").value, offset: String(offset), limit: String(limit) });
+  const params = new URLSearchParams({ split: $("qa-filter-split").value, min_conf: $("qa-conf").value, tolerance: $("qa-tolerance").value, offset: String(offset), limit: String(limit) });
   if (qa.kind) params.set("kind", qa.kind);
   try {
     const data = await api(`/qa/findings?${params}`);
@@ -218,7 +222,9 @@ function describe(item) {
   switch (item.kind) {
     case "missing_label": return `Model sees <strong>${esc(className(prediction.class_id))}</strong> ${percent(prediction.confidence)} where nothing is labelled`;
     case "wrong_class": return `Labelled <strong>${esc(className(label.class_id))}</strong>, model says <strong>${esc(className(prediction.class_id))}</strong> ${percent(prediction.confidence)}`;
-    case "box_mismatch": return `<strong>${esc(className(label.class_id))}</strong> box overlaps the model's ${percent(item.iou)} (model ${percent(prediction.confidence)})`;
+    case "box_mismatch": return item.deviation_px != null
+      ? `<strong>${esc(className(label.class_id))}</strong> box edge ${Math.round(item.deviation_px)} px from the model's (model ${percent(prediction.confidence)})`
+      : `<strong>${esc(className(label.class_id))}</strong> box overlaps the model's ${percent(item.iou)} (model ${percent(prediction.confidence)})`;
     default: return `<strong>${esc(className(label.class_id))}</strong> label the model does not find`;
   }
 }

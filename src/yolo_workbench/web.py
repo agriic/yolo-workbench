@@ -579,8 +579,9 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         return labelqa(session).clear()
 
     @router.get("/qa/findings")
-    def qa_findings(kind: Literal["missing_label", "wrong_class", "box_mismatch", "unmatched_label"] | None = None, split: str = "all", min_conf: float = Query(0.5, ge=0, le=1), offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=500), session: DatasetSession = current):
-        return labelqa(session).findings(kind, split, min_conf, offset, limit)
+    def qa_findings(kind: Literal["missing_label", "wrong_class", "box_mismatch", "unmatched_label"] | None = None, split: str = "all", min_conf: float = Query(0.5, ge=0, le=1), tolerance: float = Query(3, ge=0, le=500), offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=500), session: DatasetSession = current):
+        # tolerance: box edges this many pixels apart (or 5% of the object's size) count as the same box
+        return labelqa(session).findings(kind, split, min_conf, offset, limit, tolerance)
 
     @router.get("/qa/images/{image_id}/findings/{key}/crop")
     def qa_crop(request: Request, image_id: str, key: str, session: DatasetSession = current):
