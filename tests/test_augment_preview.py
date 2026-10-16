@@ -119,7 +119,9 @@ def test_augment_preview_api(tmp_path):
             response = await client.get("/api/v1/training/augment/preview", params={"key": "degrees", "side": "min", "args": args, "size": 64})
             assert response.status_code == 200 and response.headers["content-type"] == "image/jpeg"
             response = await client.get("/api/v1/training/augment/original", params={"sample": 3, "imgsz": 64})
-            assert response.status_code == 200 and response.headers["x-preview-note"] == "train1.png%20%C2%B7%202%20of%202"
+            # samples are ordered by record id, a hash of the (temporary) path: either train image can be second
+            expected = augment_preview.sample_pool(dataset, 3)[0][0].path.name
+            assert response.status_code == 200 and response.headers["x-preview-note"] == f"{expected}%20%C2%B7%202%20of%202"
             response = await client.get("/api/v1/training/augment/sample", params={"args": args, "seed": 2})
             assert response.status_code == 200
             assert (await client.get("/api/v1/training/augment/preview", params={"key": "erasing", "side": "min"})).status_code == 400

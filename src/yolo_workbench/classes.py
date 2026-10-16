@@ -24,6 +24,7 @@ from .dataset import (
     RecordMoveEntry,
     SchemaEntry,
 )
+from .fsutil import occupied
 from .yamledit import write_key
 
 MAX_NAME_LENGTH = 100
@@ -255,7 +256,7 @@ def _classification_rename(dataset: Dataset, old: str, new: str) -> dict:
     entries: list = []
     for directory in dataset._all_folders():
         if (directory / old).is_dir():
-            if (directory / new).exists():
+            if occupied(directory / new, directory / old):
                 raise DatasetError(f"Folder {new}/ already exists in {directory.name}/")
             entries.append(DirMoveEntry(directory / old, directory / new))
     names = [new if name == old else name for name in dataset.names.values()]

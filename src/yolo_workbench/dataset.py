@@ -14,6 +14,7 @@ from pathlib import Path
 import yaml
 from PIL import Image, UnidentifiedImageError
 
+from .fsutil import occupied, replace
 from .models import Annotation, Category, ImageRecord
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -1085,7 +1086,7 @@ class Dataset:
     @staticmethod
     def _move_file(src: Path, dst: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(src, dst)
+        replace(src, dst)
 
     def _prepare(self, record: ImageRecord, raw_annotations: list[dict], expected_revision: int | None = None) -> PreparedChange:
         """Validate raw annotations and capture the label state this change is based on."""
@@ -1170,18 +1171,18 @@ class Dataset:
             relative = Path(label_path.name)
         backup = self.root / ".yolo-workbench" / "backups" / self.session_id / relative
         backup.parent.mkdir(parents=True, exist_ok=True)
-        backup.write_text(content, encoding="utf-8")
+        backup.write_text(content, encoding="utf-8", newline="\n")
         self._backed_up.add(label_path)
 
     def _atomic_write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent, text=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:  # LF on Windows too
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
+            replace(temporary, path)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -1307,7 +1308,7 @@ class Dataset:
             src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
             if not src.is_dir():
                 raise WriteConflict(f"Folder {src.name}/ changed outside this application; cannot {direction}")
-            if dst.exists():
+            if occupied(dst, src):
                 raise WriteConflict(f"Cannot {direction}: folder {dst.name}/ already exists")
 
     def _apply_entry(self, entry, direction: str, records_by_label: dict, touched: dict) -> bool:
@@ -1364,7 +1365,7 @@ class Dataset:
         if isinstance(entry, DirMoveEntry):
             src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(src, dst)
+            replace(src, dst)
             for record in list(self.images.values()):
                 if record.path.is_relative_to(src):
                     moved = dst / record.path.relative_to(src)

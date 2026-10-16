@@ -636,7 +636,7 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
             stats["objects_cropped_out"] += removed
         planned.add(label_target)
         label_target.parent.mkdir(parents=True, exist_ok=True)
-        label_target.write_text(text, encoding="utf-8")
+        label_target.write_text(text, encoding="utf-8", newline="\n")
         stats["labels"] += 1
     stats["imported"] += 1
     stats["by_split"][item["target"]] = stats["by_split"].get(item["target"], 0) + 1

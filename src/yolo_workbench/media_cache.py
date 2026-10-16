@@ -6,6 +6,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
+from .fsutil import replace
+
 # Bump when PALETTE or the rendering style changes so stale cached media self-invalidates.
 PALETTE_VERSION = 1
 
@@ -43,12 +45,15 @@ class MediaCache:
 
     def put(self, key: str, content: bytes) -> None:
         path = self.directory / f"{key}.jpg"
+        temporary = None
         try:
             fd, temporary = tempfile.mkstemp(prefix=f".{key}.", dir=self.directory)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(content)
-            os.replace(temporary, path)
+            replace(temporary, path)
         except OSError:
+            if temporary is not None:
+                Path(temporary).unlink(missing_ok=True)
             return  # a cache write failure must never break serving
         self._puts += 1
         if self._puts % self.prune_every == 0:

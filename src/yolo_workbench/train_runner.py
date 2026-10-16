@@ -6,7 +6,11 @@ server polls; nothing here talks to the server directly, so a run survives serve
   state.json    rewritten atomically (≤1/s): status, phase, epoch/batch progress, best epoch, error
   epochs.jsonl  one row per completed epoch (the results.csv columns plus fitness/is_best/timing)
   val.json      final validation of best.pt; test.json the same on the test split
-  control.json  written by the server: {"action": "pause" | "finish"}
+  control.json  written by the server: {"action": "pause" | "finish" | "kill"}
+
+Kill: on POSIX the server also sends SIGTERM. Windows cannot deliver a catchable SIGTERM to another
+process, so a watcher thread turns control.json's "kill" into a SIGTERM raised in the main thread;
+either way `Reporter.on_sigterm` handles it and defers it past checkpoint writes.
 
 Only the standard library and ultralytics are imported, so the server process never pays for torch.
 """
@@ -16,13 +20,18 @@ from __future__ import annotations
 import json
 import math
 import os
+import _thread
 import signal
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
 
+from .fsutil import replace
+
 STATE_INTERVAL = 1.0  # seconds between state.json rewrites during an epoch
+CONTROL_INTERVAL = 0.5  # seconds between control.json checks of the kill watcher
 
 
 class RunPaused(Exception):
@@ -36,7 +45,7 @@ class RunKilled(Exception):
 def write_json(path: Path, data) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(json.dumps(data, default=_json_default), encoding="utf-8")
-    os.replace(temporary, path)
+    replace(temporary, path)
 
 
 def _json_default(value):
@@ -92,7 +101,14 @@ class Reporter:
             action = json.loads(self.control_path.read_text(encoding="utf-8")).get("action")
         except (OSError, ValueError, AttributeError):
             return None
-        return action if action in {"pause", "finish"} else None
+        return action if action in {"pause", "finish", "kill"} else None
+
+    def watch_kill(self, stop: threading.Event, interval: float = CONTROL_INTERVAL) -> None:
+        """Thread body: a "kill" in control.json becomes a SIGTERM in the main thread (see on_sigterm)."""
+        while not stop.wait(interval):
+            if self.control() == "kill":
+                _thread.interrupt_main(signal.SIGTERM)
+                return
 
     # ---------- callbacks ----------
 
@@ -129,6 +145,8 @@ class Reporter:
             self.finish_requested = True
 
     def on_sigterm(self, signum, frame) -> None:
+        if self.kill_requested:  # both the signal and the control.json watcher deliver a kill on POSIX
+            return
         self.kill_requested = True
         if not self.critical:
             raise RunKilled()
@@ -232,6 +250,8 @@ def run(spec_path: Path) -> int:
     resume = bool(spec.get("resume"))
     reporter = Reporter(workdir, resume)
     signal.signal(signal.SIGTERM, reporter.on_sigterm)
+    stop_watching = threading.Event()
+    threading.Thread(target=reporter.watch_kill, args=(stop_watching,), daemon=True).start()
     existing_caches = {path for path in spec.get("cache_files", []) if Path(path).exists()}
     status = "failed"
     try:
@@ -246,14 +266,20 @@ def run(spec_path: Path) -> int:
         else:
             model.train(**{key: value for key, value in spec["args"].items() if key != "model"})
         _test_eval(spec, run_dir, workdir, reporter)
+        stop_watching.set()
+        reporter.critical = True  # a kill arriving now must not interrupt the final state write
         status = "completed"
         reporter.write(force=True, status=status, phase="done", finished=time.time(), eta=0)
         return 0
     except RunPaused:
+        stop_watching.set()
+        reporter.critical = True
         status = "paused"
         reporter.write(force=True, status=status, phase="paused", finished=time.time(), eta=None)
         return 0
     except BaseException as exc:  # includes KeyboardInterrupt/SystemExit, so the state never stays "training"
+        stop_watching.set()
+        reporter.critical = True
         if reporter.kill_requested:  # RunKilled, or an error caused by the kill (e.g. a dataloader worker gone)
             reporter.write(force=True, status="stopped", phase="stopped", error="Stopped by user", finished=time.time(), eta=None)
             return 1

@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -53,13 +54,16 @@ class FakeHandle:
     def __init__(self):
         self.pid = os.getpid()
         self.code = None
-        self.signals = []
+        self.calls = []
 
     def poll(self):
         return self.code
 
-    def signal(self, signum, group=False):
-        self.signals.append((signum, group))
+    def terminate(self):
+        self.calls.append("terminate")
+
+    def kill(self):
+        self.calls.append("kill")
 
 
 class FakeLauncher:
@@ -294,7 +298,8 @@ def test_stop_modes(tmp_path):
     manager.stop(None, run["id"], "finish")
     assert json.loads((run_dir / "workbench" / "control.json").read_text())["action"] == "finish"
     manager.stop(None, run["id"], "kill")
-    assert launcher.handle.signals == [(signal.SIGTERM, False)]  # the runner alone; it defers past checkpoint writes
+    assert launcher.handle.calls == ["terminate"]  # the runner alone; it defers past checkpoint writes
+    assert json.loads((run_dir / "workbench" / "control.json").read_text())["action"] == "kill"  # how Windows runners hear it
     launcher.handle.code = -15
     manager.tick()
     summary = manager.run_detail(None, run["id"])
@@ -318,9 +323,9 @@ def test_force_kill_spares_a_resumed_process_in_the_same_run(tmp_path):
     # the resumed runner is a new process: give it a different identity
     (run_dir / "workbench" / "process.json").write_text(json.dumps({"pid": old["pid"], "create_time": (old["create_time"] or 0) + 5}))
     manager._force_kill(run_dir, old["pid"], old["create_time"])
-    assert launcher.handle.signals == []
+    assert launcher.handle.calls == []
     manager._force_kill(run_dir, old["pid"], (old["create_time"] or 0) + 5)
-    assert launcher.handle.signals == [(signal.SIGKILL, True)]
+    assert launcher.handle.calls == ["kill"]
 
 
 def test_paused_runs_resume_and_final_eval_ends_resumability(tmp_path):
@@ -613,6 +618,25 @@ def test_reporter_defers_a_kill_until_the_checkpoint_is_written(tmp_path):
     reporter.on_fit_epoch_end(trainer)  # still critical
     with pytest.raises(RunKilled):
         reporter.on_train_end(trainer)
+
+
+def test_reporter_hears_a_kill_through_control_json(tmp_path):
+    """Windows has no catchable SIGTERM: the watcher raises it in the main thread instead."""
+    reporter = Reporter(tmp_path, resume=False)
+    previous = signal.signal(signal.SIGTERM, reporter.on_sigterm)
+    stop = threading.Event()
+    watcher = threading.Thread(target=reporter.watch_kill, args=(stop, 0.01))
+    try:
+        (tmp_path / "control.json").write_text(json.dumps({"action": "kill"}))
+        watcher.start()
+        with pytest.raises(RunKilled):
+            for _ in range(500):  # the simulated signal is handled between bytecodes of this thread
+                time.sleep(0.01)
+        assert reporter.kill_requested
+        reporter.on_sigterm(signal.SIGTERM, None)  # a second delivery (the real SIGTERM on POSIX) is ignored
+    finally:
+        stop.set()
+        signal.signal(signal.SIGTERM, previous)
 
 
 # ---------- API ----------

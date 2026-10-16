@@ -30,6 +30,7 @@ import yaml
 from PIL import Image
 
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError, WriteConflict
+from .fsutil import replace
 from .jobs import JobManager
 from .session import DatasetSession
 from .training import TrainingManager, TrainingTarget
@@ -78,12 +79,12 @@ class Workspace:
         return data
 
     def _write_project(self, directory: Path, data: dict) -> None:
-        fd, temporary = tempfile.mkstemp(prefix=".project.", dir=directory, text=True)
+        fd, temporary = tempfile.mkstemp(prefix=".project.", dir=directory)
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
                 json.dump(data, stream, indent=2)
                 stream.write("\n")
-            os.replace(temporary, directory / PROJECT_FILE)
+            replace(temporary, directory / PROJECT_FILE)
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
@@ -203,7 +204,7 @@ class Workspace:
                 (directory / "models").mkdir()
                 (directory / "runs").mkdir()
                 header = "# Created by YOLO Workbench. Paths are relative to this file (no `path:` key, so Ultralytics resolves them here too).\n"
-                (directory / "data.yaml").write_text(header + yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+                (directory / "data.yaml").write_text(header + yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8", newline="\n")
                 now = _now()
                 self._write_project(directory, {
                     "version": 1,
@@ -253,7 +254,7 @@ class Workspace:
                 splits = {split: split for split in SPLITS if (directory / split).is_dir()}
                 yaml_path = directory / "data.yaml"
                 names = sorted({child.name for split in splits for child in (directory / split).iterdir() if child.is_dir() and not child.name.startswith(".")})
-                yaml_path.write_text(yaml.safe_dump({**splits, "names": names}, sort_keys=False, allow_unicode=True), encoding="utf-8")
+                yaml_path.write_text(yaml.safe_dump({**splits, "names": names}, sort_keys=False, allow_unicode=True), encoding="utf-8", newline="\n")
             Dataset(yaml_path, category, allow_empty=True)  # validates the layout before committing to it
             (directory / "models").mkdir(exist_ok=True)
             (directory / "runs").mkdir(exist_ok=True)
@@ -288,7 +289,7 @@ class Workspace:
             while target.exists():
                 target = self.trash_root / f"{entry}-{counter}"
                 counter += 1
-            os.replace(directory, target)
+            replace(directory, target)
             return {"entry": target.name, "slug": slug, "name": data.get("name", slug)}
 
     def list_trash(self) -> list[dict]:
@@ -321,7 +322,7 @@ class Workspace:
             while (self.root / slug).exists():
                 slug = f"{base}-restored-{counter}" if counter > 2 else f"{base}-restored"
                 counter += 1
-            os.replace(source, self.root / slug)
+            replace(source, self.root / slug)
             try:
                 return self.info(slug)
             except KeyError:
