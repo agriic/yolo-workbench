@@ -62,6 +62,7 @@ Images: `.jpg .jpeg .png .webp .bmp .tif .tiff`.
 
 - **Annotation** — a virtualized gallery of the whole dataset with filters (split, class, object count, search) and a canvas editor for boxes and polygons (keyboard shortcuts are listed in the editor). Select images with checkboxes (Shift-click for a range) or by dragging a rectangle across the gallery, then move them to another split or folder, or delete them into the dataset trash.
 - **Model-assisted labeling** — load an Ultralytics `.pt`/`.onnx` model (or a run's `best.pt`), predict on selected images, and accept or reject predictions individually or above a confidence threshold. Model classes are mapped to dataset classes by name; predictions stay in memory until accepted.
+- **Smart annotation** — in the editor, turn on **Smart annotation** (S) and click an object: [SAM 2.1](https://docs.ultralytics.com/models/sam-2/) outlines it. Right-click (or Shift+click) marks background, dragging gives a rough box, ⏎ adds the result in the draw class (a box for detection, a polygon for segmentation). Uses SAM 2.1 large on a GPU and base otherwise (or when large fails to load); the weights download on first use. Once you have used it, images are encoded as soon as they open so the first click is instant.
 - **Exploration** — every object as a crop, filterable by class and split; select objects to relabel or delete them in bulk.
 - **Statistics** — class balance, annotations per image, box sizes, aspect ratios, class co-occurrence, split comparison, and likely outliers to review.
 - **Embeddings** — a 3D UMAP of object patches (whole images for classification), computed with FiftyOne; see [Embeddings](#embeddings) for the one-time setup.
@@ -115,7 +116,7 @@ Everything else works without it; the Embeddings tab then reports that it is una
 | `<dataset>/.yolo-workbench/imports.jsonl` | import log |
 | `<dataset>/runs/` or `<project>/runs/` | training runs |
 | `~/.cache/yolo-workbench/media/` | rendered thumbnails and crops (pruned past 512 MB; honors `XDG_CACHE_HOME`) |
-| `~/.cache/yolo-workbench/weights/` | downloaded pretrained weights |
+| `~/.cache/yolo-workbench/weights/` | downloaded pretrained weights (training) and SAM 2.1 weights (smart annotation; a copy in Ultralytics' weights dir is used instead when present) |
 
 Label and YAML files are written with LF line endings on every platform.
 

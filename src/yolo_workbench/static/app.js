@@ -6,7 +6,7 @@ import {
   editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerMove,
   pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
   savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
-  zoomAt, zoomTo,
+  updateStatus, zoomAt, zoomTo,
 } from "./canvas.js";
 import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor,
@@ -19,6 +19,10 @@ import {
   embedPointerUp, embedWheel, refreshEmbeddings, reclassifyEmbedObject,
   renderEmbeddings, renderEmbedSelection, resetEmbedView, setEmbedMode,
 } from "./embeddings.js";
+import {
+  acceptSam, configureSam, drawSam, hasPrompts, clearPrompts, refreshSam, removeLastPrompt, samEditorClosed,
+  samHint, samImageOpened, samPointerDown, samPointerMove, samPointerUp, samRightClick, toggleSam,
+} from "./sam.js";
 import { bindManage, configureManage, loadClasses, renderManageMeta } from "./manage.js";
 import { bindTraining, configureTraining, hideTraining, showTraining } from "./training.js";
 
@@ -74,7 +78,7 @@ async function init() {
   const params = new URLSearchParams(location.search);
   if (params.get("tab") === "training") showTab("training", params.get("run"));
   else if (!state.meta.image_count && state.meta.capabilities.image_ops) showTab("dataset");
-  await Promise.all([loadImages(), loadObjects(), loadIssues(), refreshPredictor()]);
+  await Promise.all([loadImages(), loadObjects(), loadIssues(), refreshPredictor(), refreshSam()]);
 }
 
 // Fill every class/split control from state.meta; safe to call again after a class change.
@@ -217,6 +221,9 @@ function renderShortcuts() {
     ["Ctrl+Z / Ctrl+⇧+Z", "Undo / redo"],
     ["← →", "Previous / next image"],
     ["P", "Predict with the loaded model"],
+    ["S", "Smart annotation (SAM): click the object"],
+    ["Right click", "SAM: mark background (or Shift+Click)"],
+    ["⏎", "SAM: add the outlined object"],
     ["F", "Fit image"],
     ["Esc", "Cancel drawing / close"],
   ];
@@ -387,6 +394,8 @@ function bind() {
   $("redo").onclick = () => applyHistory("redo");
   $("delete").onclick = deleteSelected;
   $("predict-image").onclick = predictImage;
+  // blurred so ⏎ (accept) and Space (pan) don't press the button again
+  $("smart-annotate").onclick = e => { e.currentTarget.blur(); toggleSam(); };
   $("fit").onclick = fit;
   $("zoom-in").onclick = () => zoomCentered(1.25);
   $("zoom-out").onclick = () => zoomCentered(0.8);
@@ -408,6 +417,11 @@ function bind() {
 
   $("editor").addEventListener("cancel", e => {
     if (state.drawing) { e.preventDefault(); state.drawing = null; render(); }
+    // Esc in smart annotation clears the prompts, then leaves the mode, before it closes the editor
+    else if (state.sam.active) {
+      e.preventDefault();
+      if (hasPrompts()) { clearPrompts(); render(); } else toggleSam(false);
+    }
   });
   $("editor").addEventListener("close", () => {
     closeEditorSession();
@@ -416,6 +430,7 @@ function bind() {
     state.editorDetached = false;
     state.pred.items = [];
     renderPredList();
+    samEditorClosed();
   });
 
   $("annotation-list").addEventListener("click", e => {
@@ -458,11 +473,14 @@ function keyDown(e) {
     return;
   }
   if (key === " ") { e.preventDefault(); state.spaceDown = true; $("canvas").style.cursor = "grab"; return; }
+  if ((key === "Delete" || key === "Backspace") && state.sam.active && hasPrompts()) return removeLastPrompt();
   if (key === "Delete" || key === "Backspace") return deleteSelected();
   if (key === "ArrowLeft") return navigate(-1);
   if (key === "ArrowRight") return navigate(1);
   if (key.toLowerCase() === "f") return fit();
   if (key.toLowerCase() === "p") return predictImage();
+  if (key.toLowerCase() === "s" && !e.ctrlKey && !e.metaKey && !e.altKey) return toggleSam();
+  if (key === "Enter" && state.sam.active) { e.preventDefault(); return acceptSam(); }
   if (key === "+" || key === "=") return zoomCentered(1.25);
   if (key === "-") return zoomCentered(0.8);
   if (key === "Enter" && state.drawing?.points?.length >= 3) return finishPolygon();
@@ -938,6 +956,7 @@ configureCanvas({
   classOptions,
   datasetChanged,
   drawPredictions,
+  drawSam,
   hitPrediction,
   imageGallery: () => imageGallery,
   loadEditorPredictions,
@@ -946,6 +965,12 @@ configureCanvas({
   loadObjects,
   predictImage,
   renderPredList,
+  samHint,
+  samImageOpened,
+  samPointerDown,
+  samPointerMove,
+  samPointerUp,
+  samRightClick,
   statisticsChanged,
   toast,
 });
@@ -965,6 +990,7 @@ configurePredictor({
   toScreen,
   updateHistoryButtons,
 });
+configureSam({ render, save, shapePath, toast, toScreen, updateStatus });
 configureEmbeddings({ classOptions, editObject, toast });
 configureManage({ datasetChanged, toast });
 configureTraining({

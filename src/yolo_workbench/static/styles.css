@@ -536,6 +536,8 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 .tool-group button:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
 .tool-group button:last-child { border-radius: 0 6px 6px 0; }
 .zoom-label { min-width: 54px; justify-content: center; font-size: 12px; font-variant-numeric: tabular-nums; }
+#editor #smart-annotate.active, #editor #smart-annotate.active:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+#editor #smart-annotate.loading svg { animation: pulse 1.2s ease-in-out infinite; }
 #editor .danger-btn { color: #ff9c8f; }
 #editor .danger-btn:hover:not(:disabled) { border-color: #6b4038; background: #3a2723; }
 
@@ -892,6 +894,7 @@ body.classification #crop-padding-field,
 body.classification #draw-class-field,
 body.classification #delete,
 body.classification #predict-image,
+body.classification #smart-annotate,
 body.classification #bulk-delete,
 body.classification [data-delete-object],
 body.classification .stats-panel:has(#stats-density),

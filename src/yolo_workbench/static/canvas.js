@@ -42,6 +42,7 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   savedRevisionByImage.set(id, detail.revision);
   state.pred.items = [];
   deps.loadEditorPredictions(id);
+  deps.samImageOpened();
   state.selected = focus;
   state.drawing = null;
   state.drag = null;
@@ -189,6 +190,7 @@ export function render() {
   }
   deps.drawPredictions(ctx);
   drawPreview(ctx);
+  deps.drawSam(ctx);
   updateStatus();
 }
 
@@ -304,7 +306,9 @@ export function updateStatus() {
     ? `${state.detail.width}×${state.detail.height}px · ${state.detail.annotations.length} annotation${state.detail.annotations.length === 1 ? "" : "s"}`
     : "";
   let hint;
-  if (state.meta.category === "classification")
+  if (state.sam.active && state.meta.category !== "classification")
+    hint = deps.samHint();
+  else if (state.meta.category === "classification")
     hint = "Pick the class in the panel or press 1–9 · drag to pan · scroll to zoom";
   else if (state.drawing && state.meta.category === "segmentation")
     hint = "Click to add points · click the first point or press ⏎ to close · Esc cancels";
@@ -347,7 +351,9 @@ export function pointerDown(e) {
   if (!state.img) return;
   $("canvas").setPointerCapture(e.pointerId);
   if (e.button === 1 || e.button === 2 || state.spaceDown) {
-    state.pan = { sx: e.clientX, sy: e.clientY, ox: state.view.x, oy: state.view.y };
+    // in smart annotation a right click that does not move marks background
+    const samClick = e.button === 2 && !state.spaceDown && state.sam.active ? eventPoint(e) : null;
+    state.pan = { sx: e.clientX, sy: e.clientY, ox: state.view.x, oy: state.view.y, samClick };
     $("canvas").style.cursor = "grabbing";
     return;
   }
@@ -359,6 +365,7 @@ export function pointerDown(e) {
     return;
   }
   const { screen, norm } = eventPoint(e);
+  if (state.sam.active) return deps.samPointerDown(e, { screen, norm });
   const clamped = [clamp(norm[0], 0, 1), clamp(norm[1], 0, 1)];
   if (state.meta.category === "segmentation" && state.drawing) {
     if (state.drawing.points.length >= 3 && screenDistance(toScreen(...state.drawing.points[0]), screen) < 12)
@@ -397,11 +404,17 @@ export function pointerMove(e) {
   $("status-cursor").textContent = inside
     ? `${Math.round(norm[0] * state.img.width)}, ${Math.round(norm[1] * state.img.height)}px` : "";
   if (state.pan) {
+    if (Math.hypot(e.clientX - state.pan.sx, e.clientY - state.pan.sy) > 4) state.pan.samClick = null;
     state.view.x = state.pan.ox + e.clientX - state.pan.sx;
     state.view.y = state.pan.oy + e.clientY - state.pan.sy;
     return render();
   }
   if (state.drag) { applyDrag(norm); return render(); }
+  if (state.sam.active) {
+    $("canvas").style.cursor = state.spaceDown ? "grab" : "crosshair";
+    if (state.hovered) { state.hovered = null; render(); }
+    return deps.samPointerMove({ screen, norm });
+  }
   if (state.drawing) {
     if (state.meta.category === "detection") state.drawing.end = [clamp(norm[0], 0, 1), clamp(norm[1], 0, 1)];
     else state.drawing.cursor = [clamp(norm[0], 0, 1), clamp(norm[1], 0, 1)];
@@ -456,10 +469,13 @@ export function applyDrag(norm) {
 
 export async function pointerUp() {
   if (state.pan) {
+    const { samClick } = state.pan;
     state.pan = null;
     $("canvas").style.cursor = state.spaceDown ? "grab" : "crosshair";
+    if (samClick && state.sam.active) deps.samRightClick(samClick.norm, samClick.screen);
     return;
   }
+  if (state.sam.active) return deps.samPointerUp();
   if (state.drag) {
     const changed = JSON.stringify(state.drag.a.points) !== JSON.stringify(state.drag.original);
     state.drag = null;

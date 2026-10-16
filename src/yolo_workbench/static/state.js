@@ -28,6 +28,15 @@ export const state = {
     status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
     job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, poll: null, models: [],
   },
+  sam: {
+    status: "unavailable", model: null, message: null, error: null, poll: null,
+    active: false,       // smart annotation mode is on
+    points: [],          // {x, y, positive} prompts, normalized
+    box: null,           // [x1, y1, x2, y2] box prompt, normalized
+    press: null, drag: null,
+    result: null,        // {found, score, outline, points} from the server
+    busy: false, request: 0, encoding: null, encoded: null,
+  },
   embed: {
     status: "idle", error: null, items: [], hovered: null, poll: null,
     classes: new Set(), selection: [], band: null, mode: "3d",

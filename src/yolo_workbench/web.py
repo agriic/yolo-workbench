@@ -21,6 +21,7 @@ from .jobs import JobManager
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 from .predictor import PredictorManager
+from .sam import SamManager
 from .session import DatasetSession
 from .training import TrainingManager, ultralytics_defaults
 from .workspace import Workspace
@@ -88,6 +89,17 @@ class PredictionAcceptPayload(StrictPayload):
 
 class PredictionRejectPayload(BaseModel):
     prediction_ids: list[str] | None = None
+
+
+class SamPoint(StrictPayload):
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+    positive: bool = True
+
+
+class SamSegmentPayload(StrictPayload):
+    points: list[SamPoint] = Field(default_factory=list, max_length=64)
+    box: list[float] | None = Field(default=None, min_length=4, max_length=4)  # normalized x1, y1, x2, y2
 
 
 class ClassAddPayload(BaseModel):
@@ -197,7 +209,7 @@ MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 CSRF_HEADER = "x-workbench"
 
 
-def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager) -> APIRouter:
+def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager, sam: SamManager) -> APIRouter:
     """Every per-dataset endpoint; mounted at /api/v1 (single mode) or /api/v1/projects/{slug}."""
     router = APIRouter()
     current = Depends(get_session)
@@ -467,6 +479,18 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    # ---------- smart annotation (SAM) ----------
+
+    @router.post("/images/{image_id}/sam/encode")
+    def sam_encode(image_id: str, session: DatasetSession = current):
+        return sam.encode(require_image(session, image_id).path)
+
+    @router.post("/images/{image_id}/sam/segment")
+    def sam_segment(image_id: str, payload: SamSegmentPayload, session: DatasetSession = current):
+        record = require_image(session, image_id)
+        points = [point.model_dump() for point in payload.points]
+        return sam.segment(record.path, session.dataset.category, points, payload.box)
+
     @router.get("/embeddings")
     def embeddings_state(session: DatasetSession = current):
         return session.embeddings.payload()
@@ -638,13 +662,28 @@ def _mount_static(app: FastAPI) -> None:
     app.mount("/", StaticFiles(directory=static, html=True), name="static")
 
 
-def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None) -> FastAPI:
+def _sam_routes(app: FastAPI, sam: SamManager) -> None:
+    """One SAM model for the whole app (in projects mode it outlives switching projects)."""
+    app.state.sam = sam
+
+    @app.get("/api/v1/sam")
+    def sam_state():
+        return sam.payload()
+
+    @app.post("/api/v1/sam/start")
+    def sam_start():
+        return sam.start()
+
+
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None, sam: SamManager | None = None) -> FastAPI:
     """Single-dataset mode: the dataset API lives directly under /api/v1."""
     jobs = jobs or JobManager()
     app = _base_app("single", jobs, allowed_hosts, require_header)
     training = training or TrainingManager.for_dataset(dataset, jobs=jobs)
     training.attach(dataset)
     _training_routes(app, training)
+    sam = sam or SamManager()
+    _sam_routes(app, sam)
     session = DatasetSession.open(dataset, predictor)
     app.state.dataset = dataset
     app.state.session = session
@@ -652,16 +691,18 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     app.state.embeddings = session.embeddings
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
-    app.include_router(dataset_router(lambda: session, cache, jobs, training), prefix="/api/v1")
+    app.include_router(dataset_router(lambda: session, cache, jobs, training, sam), prefix="/api/v1")
     _mount_static(app)
     return app
 
 
-def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False) -> FastAPI:
+def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, sam: SamManager | None = None) -> FastAPI:
     """Projects mode: workspace endpoints plus the dataset API under /api/v1/projects/{slug}."""
     app = _base_app("projects", workspace.jobs, allowed_hosts, require_header)
     app.state.workspace = workspace
     _training_routes(app, workspace.training)
+    sam = sam or SamManager()
+    _sam_routes(app, sam)
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
 
@@ -714,7 +755,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     def trash_purge(entry: str):
         return not_found(lambda: workspace.purge(entry))
 
-    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training), prefix="/api/v1/projects/{slug}")
+    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training, sam), prefix="/api/v1/projects/{slug}")
     _mount_static(app)
     return app
 
