@@ -15,11 +15,12 @@ def test_size_index_written_and_reused(tmp_path):
     dataset, _ = make_dataset(tmp_path)
     index_path = tmp_path / ".yolo-workbench" / "index.json"
     assert index_path.exists()
-    entry = next(iter(json.loads(index_path.read_text()).values()))
+    data = json.loads(index_path.read_text())
+    entry = next(iter(data["images"].values()))
     assert (entry["width"], entry["height"]) == (100, 80)
     # poison the cache: a matching (mtime, size) entry must be trusted without re-probing
-    poisoned = {path: {**value, "width": 123, "height": 45} for path, value in json.loads(index_path.read_text()).items()}
-    index_path.write_text(json.dumps(poisoned))
+    poisoned = {path: {**value, "width": 123, "height": 45} for path, value in data["images"].items()}
+    index_path.write_text(json.dumps({**data, "images": poisoned}))
     dataset = Dataset(dataset.yaml_path, "detection")
     record = next(iter(dataset.images.values()))
     assert (record.width, record.height) == (123, 45)

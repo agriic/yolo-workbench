@@ -15,8 +15,9 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import augment_preview, classes, importer
+from . import augment_preview, classes, importer, storage
 from .dataset import Dataset, DatasetError, WriteConflict
+from .imaging import upright_rgb
 from .jobs import JobManager
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
@@ -91,6 +92,10 @@ class PredictionRejectPayload(BaseModel):
     prediction_ids: list[str] | None = None
 
 
+class QARunPayload(BaseModel):
+    split: str | None = None  # None / "all": every split
+
+
 class SamPoint(StrictPayload):
     x: float = Field(ge=0, le=1)
     y: float = Field(ge=0, le=1)
@@ -124,8 +129,24 @@ class ClassReorderPayload(BaseModel):
     order: list[int]
 
 
+class UnknownClassPayload(BaseModel):
+    action: Literal["map", "add", "delete"]
+    target_id: int | None = None
+    name: str | None = None
+
+
+class LabelTextPayload(BaseModel):
+    revision: int = Field(ge=1)
+    text: str = Field(max_length=5_000_000)
+
+
 class ImageIdsPayload(BaseModel):
     image_ids: list[str]
+
+
+class ReviewPayload(BaseModel):
+    image_ids: list[str]
+    status: Literal["done", "needs_work"] | None = None  # None clears it
 
 
 class ImageMovePayload(BaseModel):
@@ -232,6 +253,12 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    def found(call):
+        try:
+            return call()
+        except KeyError as exc:
+            raise HTTPException(404, str(exc.args[0]) if exc.args else "Not found") from exc
+
     @router.get("/dataset")
     def metadata(session: DatasetSession = current):
         meta = session.dataset.metadata()
@@ -244,10 +271,25 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def statistics(session: DatasetSession = current):
         return session.dataset.statistics()
 
-    @router.get("/images")
-    def images(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
+    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, session: DatasetSession = current) -> dict:
+        """The gallery filters, shared by the image list and "next unreviewed"."""
         prediction_ids = session.predictor.pending_image_ids() if has_predictions else None
-        return session.dataset.list_images(split, class_id, search, max(0, offset), limit, prediction_ids, min_labels, max_labels)
+        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None}
+
+    @router.get("/images")
+    def images(filters: dict = Depends(image_filters), offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
+        return session.dataset.list_images(offset=max(0, offset), limit=limit, **filters)
+
+    @router.get("/images/next-unreviewed")
+    def next_unreviewed(filters: dict = Depends(image_filters), start: int = Query(0, ge=0), session: DatasetSession = current):
+        return session.dataset.next_unreviewed(start, **filters)
+
+    @router.post("/images/review")
+    def review_images(payload: ReviewPayload, session: DatasetSession = current):
+        try:
+            return session.dataset.set_review(payload.image_ids, payload.status)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
     @router.post("/images/delete")
     def delete_images(payload: ImageIdsPayload, session: DatasetSession = current):
@@ -266,13 +308,19 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     @router.get("/images/{image_id}")
     def image_detail(image_id: str, session: DatasetSession = current):
         try:
-            return session.dataset.detail(image_id)
+            detail = session.dataset.detail(image_id)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
+        detail["image_version"] = image_version(require_image(session, image_id))
+        return detail
 
     @router.get("/images/{image_id}/file")
-    def image_file(image_id: str, session: DatasetSession = current):
-        return FileResponse(require_image(session, image_id).path)
+    def image_file(image_id: str, v: str | None = None, session: DatasetSession = current):
+        record = require_image(session, image_id)
+        # ?v= is the image_version from the image detail: a URL naming the current file may be kept,
+        # anything else (no or an outdated version) is revalidated
+        fresh = v is not None and v == image_version(record)
+        return FileResponse(record.path, headers={"Cache-Control": "private, max-age=86400, immutable" if fresh else "no-cache"})
 
     @router.get("/images/{image_id}/thumbnail")
     def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False, session: DatasetSession = current):
@@ -283,6 +331,16 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
             return Response(status_code=304)
         content = cache.get_or_render(key, lambda: render_thumbnail(record, size, category if annotated else None))
         return jpeg_response(content, etag=key)
+
+    @router.get("/images/{image_id}/label-text")
+    def label_text(image_id: str, session: DatasetSession = current):
+        require_image(session, image_id)
+        return session.dataset.label_text(image_id)
+
+    @router.put("/images/{image_id}/label-text")
+    def write_label_text(image_id: str, payload: LabelTextPayload, session: DatasetSession = current):
+        require_image(session, image_id)
+        return session.dataset.write_label_text(image_id, payload.text, payload.revision)
 
     @router.put("/images/{image_id}/annotations")
     def update_annotations(image_id: str, payload: AnnotationListPayload, session: DatasetSession = current):
@@ -314,7 +372,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.get("/issues")
     def issues(session: DatasetSession = current):
-        return {"items": session.dataset.issues()}
+        return {"items": session.dataset.issues(), "unknown_classes": classes.unknown_classes(session.dataset)}
 
     @router.post("/issues/fix-bulk")
     def fix_issues_bulk(payload: BulkFixPayload, session: DatasetSession = current):
@@ -354,6 +412,10 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def class_remove(class_id: int, payload: ClassRemovePayload, session: DatasetSession = current):
         return classes.remove_class(session.dataset, class_id, payload.mode, payload.target_id)
 
+    @router.post("/classes/unknown/{class_id}")
+    def class_resolve_unknown(class_id: int, payload: UnknownClassPayload, session: DatasetSession = current):
+        return classes.resolve_unknown(session.dataset, class_id, payload.action, payload.target_id, payload.name)
+
     @router.get("/folders")
     def folder_list(session: DatasetSession = current):
         return session.dataset.folders()
@@ -365,6 +427,20 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     @router.post("/rescan")
     def rescan(session: DatasetSession = current):
         return session.dataset.rescan()
+
+    # ---------- storage (trash and backups) ----------
+
+    @router.get("/storage")
+    def storage_summary(session: DatasetSession = current):
+        return storage.summary(session.dataset)
+
+    @router.post("/storage/trash/{session_id}/restore")
+    def storage_restore(session_id: str, session: DatasetSession = current):
+        return found(lambda: storage.restore_trash(session.dataset, session_id))
+
+    @router.delete("/storage/{kind}/{session_id}")
+    def storage_purge(kind: str, session_id: str, session: DatasetSession = current):
+        return found(lambda: storage.purge(session.dataset, kind, session_id))
 
     # ---------- import ----------
 
@@ -479,6 +555,51 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
+    # ---------- label QA (model vs labels) ----------
+
+    def labelqa(session: DatasetSession):
+        if session.labelqa is None:
+            raise DatasetError("Label QA is not available for this dataset")
+        return session.labelqa
+
+    @router.get("/qa")
+    def qa_state(session: DatasetSession = current):
+        return labelqa(session).payload()
+
+    @router.post("/qa/run")
+    def qa_run(payload: QARunPayload, session: DatasetSession = current):
+        return labelqa(session).start(payload.split)
+
+    @router.post("/qa/cancel")
+    def qa_cancel(session: DatasetSession = current):
+        return labelqa(session).cancel()
+
+    @router.delete("/qa")
+    def qa_clear(session: DatasetSession = current):
+        return labelqa(session).clear()
+
+    @router.get("/qa/findings")
+    def qa_findings(kind: Literal["missing_label", "wrong_class", "box_mismatch", "unmatched_label"] | None = None, split: str = "all", min_conf: float = Query(0.5, ge=0, le=1), offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=500), session: DatasetSession = current):
+        return labelqa(session).findings(kind, split, min_conf, offset, limit)
+
+    @router.get("/qa/images/{image_id}/findings/{key}/crop")
+    def qa_crop(request: Request, image_id: str, key: str, session: DatasetSession = current):
+        record = require_image(session, image_id)
+        # the finding key encodes both shapes and their classes, so it names the picture
+        cache_key = cache.key("qa", record.path, image_mtime(record), key, PALETTE_VERSION)
+        if request.headers.get("if-none-match") == f'"{cache_key}"':
+            return Response(status_code=304)
+        content = cache.get_or_render(cache_key, lambda: labelqa(session).crop(image_id, key, class_color))
+        return jpeg_response(content, etag=cache_key)
+
+    @router.post("/qa/images/{image_id}/findings/{key}/apply")
+    def qa_apply(image_id: str, key: str, session: DatasetSession = current):
+        return found(lambda: labelqa(session).apply(image_id, key))
+
+    @router.post("/qa/images/{image_id}/findings/{key}/dismiss")
+    def qa_dismiss(image_id: str, key: str, session: DatasetSession = current):
+        return found(lambda: labelqa(session).dismiss(image_id, key))
+
     # ---------- smart annotation (SAM) ----------
 
     @router.post("/images/{image_id}/sam/encode")
@@ -500,12 +621,6 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         return session.embeddings.start()
 
     # ---------- training ----------
-
-    def found(call):
-        try:
-            return call()
-        except KeyError as exc:
-            raise HTTPException(404, str(exc.args[0]) if exc.args else "Not found") from exc
 
     @router.get("/training/options")
     def training_options(session: DatasetSession = current):
@@ -765,6 +880,15 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     return app
 
 
+def image_version(record: ImageRecord) -> str:
+    """Changes whenever the image file does; the editor puts it in the image URL so the browser can cache it."""
+    try:
+        stat = record.path.stat()
+    except OSError:
+        return "0"
+    return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+
 def json_string(value: str) -> str:
     import json
 
@@ -784,7 +908,7 @@ def json_safe(value):
 
 def render_thumbnail(record: ImageRecord, size: int, category: str | None = None) -> bytes:
     with Image.open(record.path) as source:
-        image = source.convert("RGB")
+        image = upright_rgb(source)
         image.thumbnail((size, size))
         if category:
             draw = ImageDraw.Draw(image)
@@ -811,7 +935,7 @@ def draw_annotation(draw: ImageDraw.ImageDraw, annotation: Annotation, category:
 
 def render_crop(record, annotation, category: str, padding: float) -> bytes:
     with Image.open(record.path) as source:
-        image = source.convert("RGB")
+        image = upright_rgb(source)
         if category == "classification":
             image.thumbnail((420, 320))
             output = io.BytesIO()

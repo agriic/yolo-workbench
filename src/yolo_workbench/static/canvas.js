@@ -43,7 +43,11 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   state.pred.items = [];
   deps.loadEditorPredictions(id);
   deps.samImageOpened();
-  state.selected = focus;
+  // focus: an annotation id to select and zoom to, or { annotation, box, hint }: select an annotation,
+  // zoom to a normalized [l, t, r, b] box, outline another box (where Label QA's model saw an object)
+  const focusId = typeof focus === "string" ? focus : focus?.annotation ?? null;
+  state.selected = focusId;
+  state.focusHint = focus?.hint ?? null;
   state.drawing = null;
   state.drag = null;
   state.hovered = null;
@@ -59,13 +63,39 @@ export async function openEditor(id, focus = null, gridIndex = null) {
     state.img = img;
     resizeCanvas();
     fit();
-    if (focus) {
-      const annotation = state.detail.annotations.find(a => a.id === focus);
+    if (focus?.box) zoomToBox(focus.box, 0.3);
+    else if (focusId) {
+      const annotation = state.detail.annotations.find(a => a.id === focusId);
       if (annotation) zoomTo(annotation);
     }
+    if (request === editorRequest) prefetchNeighbors(state.editorGridIndex);
   };
   img.onerror = () => deps.toast("Failed to load image file", "error");
-  img.src = apiUrl(`/images/${id}/file?v=${Date.now()}`);
+  img.src = imageFileUrl(detail);
+}
+
+// The version changes with the file, so the browser may keep the image and ←/→ reopen it instantly.
+const imageFileUrl = detail => apiUrl(`/images/${detail.id}/file?v=${encodeURIComponent(detail.image_version ?? Date.now())}`);
+
+// Neighbors in the image list are fetched in the background so stepping through images does not wait on the network.
+const prefetched = new Map();  // url -> Image; holding the element lets the download finish
+async function prefetchNeighbors(index) {
+  const gallery = deps.imageGallery();
+  if (index == null || !gallery?.total) return;
+  const request = editorRequest;
+  for (const target of [index + 1, index - 1]) {
+    if (target < 0 || target >= gallery.total) continue;
+    try {
+      const item = await gallery.itemAt(target);
+      if (!item || request !== editorRequest) return;
+      const url = imageFileUrl(await api(`/images/${item.id}`));
+      if (prefetched.has(url)) continue;
+      const image = new Image();
+      image.src = url;
+      prefetched.set(url, image);
+      if (prefetched.size > 6) prefetched.delete(prefetched.keys().next().value);
+    } catch { /* best effort: the editor loads the image itself when it gets there */ }
+  }
 }
 
 export async function navigate(step) {
@@ -95,6 +125,15 @@ export function updateNavButtons() {
   position.hidden = index == null || total == null;
   position.textContent = position.hidden ? "" : `${state.editorDetached ? "–" : (index + 1).toLocaleString()} / ${total.toLocaleString()}`;
   $("editor-subtitle").textContent = `${state.detail.split} · ${state.detail.width}×${state.detail.height}px${state.editorDetached ? " · no longer matches filters" : ""}`;
+  updateReviewButtons();
+}
+
+export function updateReviewButtons() {
+  if (!state.detail) return;
+  $("review-done").classList.toggle("active", state.detail.review === "done");
+  $("review-done").setAttribute("aria-pressed", String(state.detail.review === "done"));
+  $("review-work").classList.toggle("active", state.detail.review === "needs_work");
+  $("review-work").setAttribute("aria-pressed", String(state.detail.review === "needs_work"));
 }
 
 export function updateHistoryButtons() {
@@ -153,9 +192,14 @@ export function closeEditorSession() {
 export function zoomTo(annotation) {
   if (!state.img) return;
   if (!annotation.points.length) return fit();
-  const [l, t, r, b] = bounds(annotation);
+  zoomToBox(bounds(annotation));
+}
+
+// Zoom to a normalized [left, top, right, bottom] region (e.g. a Label QA finding with no annotation yet).
+export function zoomToBox([l, t, r, b], fill = 0.5) {
+  if (!state.img) return;
   const width = Math.max((r - l) * state.img.width, 8), height = Math.max((b - t) * state.img.height, 8);
-  state.view.scale = clamp(Math.min(cssW / width, cssH / height) * 0.5, 0.02, 12);
+  state.view.scale = clamp(Math.min(cssW / width, cssH / height) * fill, 0.02, 12);
   state.view.x = cssW / 2 - (l + r) / 2 * state.img.width * state.view.scale;
   state.view.y = cssH / 2 - (t + b) / 2 * state.img.height * state.view.scale;
   render();
@@ -194,6 +238,7 @@ export function render() {
   }
   deps.drawPredictions(ctx);
   drawPreview(ctx);
+  drawFocusHint(ctx);
   deps.drawSam(ctx);
   updateStatus();
 }
@@ -300,6 +345,21 @@ export function drawPreview(ctx) {
       ctx.fill();
     });
   }
+}
+
+function drawFocusHint(ctx) {
+  if (!state.focusHint) return;
+  const [l, t, r, b] = state.focusHint;
+  const [x1, y1] = toScreen(l, t), [x2, y2] = toScreen(r, b);
+  ctx.save();
+  ctx.setLineDash([7, 5]);
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = "rgb(0 0 0 / 70%)";
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = "#fff";
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.restore();
 }
 
 export const screenDistance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
@@ -633,6 +693,7 @@ export async function applyHistory(direction) {
 export function renderList() {
   if (!state.detail) return;
   const annotations = state.detail.annotations;
+  renderLabelWarning();
   if (state.meta.category === "classification") {
     $("annotation-count").textContent = "";
     $("annotation-list").innerHTML = annotations.map(a => `
@@ -647,11 +708,23 @@ export function renderList() {
   $("annotation-list").innerHTML = annotations.map(a => `
     <div class="annotation-row ${a.id === state.selected ? "selected" : ""}" data-annotation="${esc(a.id)}" title="Double-click to zoom">
       <span class="swatch" style="background:${classColor(a.class_id)}"></span>
-      <select class="row-class">${deps.classOptions(a.class_id)}</select>
+      <select class="row-class">${a.class_id in state.meta.names ? "" : `<option value="${a.class_id}" selected disabled>${a.class_id} · unknown class</option>`}${deps.classOptions(a.class_id)}</select>
       <span class="row-meta">${sizeLabel(a)}</span>
       <button class="row-delete" title="Delete annotation">×</button>
     </div>`).join("")
     || `<p class="empty-note">No annotations yet. ${state.meta.category === "detection" ? "Drag on the image to draw a box." : "Click on the image to start a polygon."}</p>`;
+}
+
+// Label problems that make every save of this image fail, with the way out.
+function renderLabelWarning() {
+  const issues = state.detail.issues || [];
+  const malformed = issues.filter(issue => issue.kind === "malformed_label").length;
+  const unknown = issues.filter(issue => issue.kind === "unknown_class").length;
+  const warning = $("label-warning");
+  warning.hidden = !malformed && !unknown;
+  warning.innerHTML = malformed
+    ? `${malformed} malformed line${malformed === 1 ? "" : "s"} in the label file — edits cannot be saved until ${malformed === 1 ? "it is" : "they are"} fixed. <button type="button" class="link-btn" data-edit-label>Edit file</button>`
+    : unknown ? `${unknown} annotation${unknown === 1 ? " uses a class" : "s use classes"} missing from data.yaml. Delete ${unknown === 1 ? "it" : "them"} here, or resolve the class id in the Validation tab, before other edits can be saved.` : "";
 }
 
 export function sizeLabel(annotation) {

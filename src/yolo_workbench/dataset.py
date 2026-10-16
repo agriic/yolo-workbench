@@ -15,10 +15,14 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 from .fsutil import occupied, replace
+from .imaging import upright_size
 from .models import Annotation, Category, ImageRecord
+from .review import STATUSES as REVIEW_STATUSES, ReviewStore
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 WORKBENCH_DIR = ".yolo-workbench"  # per-dataset state: backups, size index, trash, upload staging
+SIZE_INDEX_VERSION = 2  # 2: sizes are EXIF-upright
+SIZE_INDEX_SAVE_INTERVAL = 5.0  # seconds between size-index saves while probing
 
 
 class DatasetError(ValueError):
@@ -74,6 +78,14 @@ class RecordMoveEntry:
     split_before: str | None
     split_after: str | None
     files: list[tuple[Path, Path]]  # (src, dst) pairs; the image comes first
+
+
+@dataclass
+class FileMoveEntry:
+    """History entry moving a file that belongs to no record (an orphan label into the trash, or back)."""
+
+    src: Path
+    dst: Path
 
 
 @dataclass
@@ -142,6 +154,7 @@ class Dataset:
         self._mtimes: dict[Path, int | None] = {}
         self._revisions: dict[Path, int] = {}
         self._lock = threading.RLock()
+        self._index_lock = threading.Lock()  # one size-index write at a time (probe threads of load and rescan)
         self._change_listeners: list = []
         self._schema_listeners: list = []
         self.annotation_generation = 0
@@ -161,6 +174,8 @@ class Dataset:
         self._redo: list[list] = []
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
         self._backed_up: set[Path] = set()
+        self.reviews: ReviewStore | None = None  # created once the dataset root is known (see _load)
+        self._reviews_dirty = False
         self.indexing: dict[str, int] = {"done": 0, "total": 0}
         self._load()
         pending = [record for record in self.images.values() if record.width == 0 and record.probe_error is None]
@@ -358,11 +373,14 @@ class Dataset:
         label_path = image_path if self.category == "classification" else self._label_for(image_path)
         record = ImageRecord(record_id, split, image_path, label_path)
         record.name_cf = image_path.name.casefold()
+        record.review = self.reviews.get(image_path) if self.reviews else None
         return record
 
     def _load(self) -> None:
+        discovered = self._discover()
+        self.reviews = ReviewStore(self.root / WORKBENCH_DIR / "review.json", self.root)
         size_index = self._load_size_index()
-        for split, image_path in self._discover():
+        for split, image_path in discovered:
             record = self._make_record(split, image_path)
             self._apply_cached_size(record, size_index)
             self._read_record(record)
@@ -469,9 +487,12 @@ class Dataset:
     def _load_size_index(self) -> dict:
         try:
             data = json.loads(self._index_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+        # older indexes (no version) hold sizes before EXIF orientation: re-probe those
+        if not isinstance(data, dict) or data.get("version") != SIZE_INDEX_VERSION or not isinstance(data.get("images"), dict):
+            return {}
+        return data["images"]
 
     def _apply_cached_size(self, record: ImageRecord, size_index: dict) -> None:
         entry = size_index.get(str(record.path))
@@ -485,15 +506,19 @@ class Dataset:
             record.width, record.height = int(entry.get("width", 0)), int(entry.get("height", 0))
 
     def _probe_all(self, pending: list[ImageRecord]) -> None:
+        # saved along the way too, so quitting halfway through a large dataset keeps what was probed
+        last_save = time.monotonic()
         with ThreadPoolExecutor(max_workers=12) as pool:
             for _ in pool.map(self._probe, pending):
-                pass
+                if time.monotonic() - last_save >= SIZE_INDEX_SAVE_INTERVAL:
+                    self._save_size_index()
+                    last_save = time.monotonic()
         self._save_size_index()
 
     def _probe(self, record: ImageRecord) -> None:
         try:
             with Image.open(record.path) as image:
-                width, height = image.size
+                width, height = upright_size(image)
             error = None
         except (OSError, UnidentifiedImageError) as exc:
             width = height = 0
@@ -507,12 +532,15 @@ class Dataset:
             self.indexing["done"] += 1
 
     def _save_size_index(self) -> None:
-        entries = {str(record.path): {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "width": record.width, "height": record.height} for record in self.images.values() if record.width > 0 and (stat := self._safe_stat(record.path))}
-        try:
-            self._index_path.parent.mkdir(parents=True, exist_ok=True)
-            self._atomic_write(self._index_path, json.dumps(entries))
-        except OSError:
-            pass  # the index is only a cache; failing to persist it must never break the app
+        with self._lock:  # snapshot only; stat() outside the lock so writers are not held up
+            probed = [(record.path, record.width, record.height) for record in self.images.values() if record.width > 0]
+        entries = {str(path): {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "width": width, "height": height} for path, width, height in probed if (stat := self._safe_stat(path))}
+        with self._index_lock:
+            try:
+                self._index_path.parent.mkdir(parents=True, exist_ok=True)
+                self._atomic_write(self._index_path, json.dumps({"version": SIZE_INDEX_VERSION, "images": entries}))
+            except OSError:
+                pass  # the index is only a cache; failing to persist it must never break the app
 
     @staticmethod
     def _safe_stat(path: Path):
@@ -623,7 +651,8 @@ class Dataset:
                     record.issues.append(self._issue("duplicate", "warning", "Exact duplicate annotation", record, annotation.id, True))
                 seen[key] = annotation.id
             except (ValueError, IndexError) as exc:
-                record.issues.append(self._issue("malformed_label", "error", f"Line {line_number}: {exc}", record))
+                # fixing removes the line; the raw label editor can repair it instead
+                record.issues.append(self._issue("malformed_label", "error", f"Line {line_number}: {exc}", record, fixable=True, line=line_number))
         record.class_ids = {annotation.class_id for annotation in record.annotations}
         self._mtimes[record.label_path] = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
         self._revisions[record.label_path] = self._revisions.get(record.label_path, 0) + 1
@@ -636,8 +665,8 @@ class Dataset:
         area = sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(points, points[1:] + points[:1]))
         return abs(area) < 1e-10
 
-    def _issue(self, kind, severity, message, record, annotation_id=None, fixable=False):
-        return {"id": hashlib.sha1(f"{record.id}:{kind}:{annotation_id}:{message}".encode()).hexdigest()[:16], "kind": kind, "severity": severity, "message": message, "image_id": record.id, "image_name": record.path.name, "split": record.split, "annotation_id": annotation_id, "fixable": fixable}
+    def _issue(self, kind, severity, message, record, annotation_id=None, fixable=False, **extra):
+        return {"id": hashlib.sha1(f"{record.id}:{kind}:{annotation_id}:{message}".encode()).hexdigest()[:16], "kind": kind, "severity": severity, "message": message, "image_id": record.id, "image_name": record.path.name, "split": record.split, "annotation_id": annotation_id, "fixable": fixable, **extra}
 
     def _excluded(self, path: Path) -> bool:
         return any(path.is_relative_to(root) for root in self._excluded_roots)
@@ -682,7 +711,8 @@ class Dataset:
                 "image_name": path.name,
                 "split": None,
                 "annotation_id": None,
-                "fixable": False,
+                "fixable": True,  # fixing moves the file to the dataset trash
+                "path": self.folder_label(path),
             }
             for path in self.orphan_labels
         ]
@@ -762,6 +792,7 @@ class Dataset:
                 "indexing": dict(self.indexing),
                 "schema_generation": self.schema_generation,
                 "capabilities": self.capabilities(),
+                "review_counts": self.review_counts(),
                 "can_undo": bool(self._undo),
                 "can_redo": bool(self._redo),
             }
@@ -995,30 +1026,84 @@ class Dataset:
             item.pop("score", None)
         return outliers[:100]
 
-    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None) -> dict:
+    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None) -> dict:
         with self._lock:
-            allowed: set[str] | None = None
-            if split != "all":
-                allowed = set(self._split_image_ids.get(split, set()))
-            if class_id is not None:
-                class_images = self._class_image_ids.get(class_id, set())
-                allowed = set(class_images) if allowed is None else allowed & class_images
-            if prediction_ids is not None:
-                allowed = set(prediction_ids) if allowed is None else allowed & prediction_ids
-            records = [self.images[image_id] for image_id in self._sorted_image_ids if allowed is None or image_id in allowed]
-            if search:
-                query = search.casefold()
-                records = [record for record in records if query in record.name_cf]
-            if min_labels is not None or max_labels is not None:
-                # With a class filter, count only that class's labels ("images with >= 3 cars").
-                def label_count(record: ImageRecord) -> int:
-                    if class_id is None:
-                        return len(record.annotations)
-                    return sum(1 for a in record.annotations if a.class_id == class_id)
-                low = min_labels if min_labels is not None else 0
-                high = max_labels if max_labels is not None else math.inf
-                records = [record for record in records if low <= label_count(record) <= high]
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue)
             return {"total": len(records), "items": [record.summary() for record in records[offset : offset + limit]]}
+
+    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None) -> dict:
+        """The first unreviewed image at or after `start` in the filtered list (wrapping around), with its position."""
+        with self._lock:
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue)
+            start = min(max(0, start), len(records))
+            for index in [*range(start, len(records)), *range(start)]:
+                if records[index].review is None:
+                    return {"index": index, "total": len(records), "item": records[index].summary()}
+            return {"index": None, "total": len(records), "item": None}
+
+    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue) -> list[ImageRecord]:
+        """The gallery's filters, in gallery order. review: done / needs_work / unreviewed; issue: any / none / an issue kind."""
+        allowed: set[str] | None = None
+        if split != "all":
+            allowed = set(self._split_image_ids.get(split, set()))
+        if class_id is not None:
+            class_images = self._class_image_ids.get(class_id, set())
+            allowed = set(class_images) if allowed is None else allowed & class_images
+        if prediction_ids is not None:
+            allowed = set(prediction_ids) if allowed is None else allowed & prediction_ids
+        records = [self.images[image_id] for image_id in self._sorted_image_ids if allowed is None or image_id in allowed]
+        if search:
+            query = search.casefold()
+            records = [record for record in records if query in record.name_cf]
+        if min_labels is not None or max_labels is not None:
+            # With a class filter, count only that class's labels ("images with >= 3 cars").
+            def label_count(record: ImageRecord) -> int:
+                if class_id is None:
+                    return len(record.annotations)
+                return sum(1 for a in record.annotations if a.class_id == class_id)
+            low = min_labels if min_labels is not None else 0
+            high = max_labels if max_labels is not None else math.inf
+            records = [record for record in records if low <= label_count(record) <= high]
+        if review:
+            wanted = None if review == "unreviewed" else review
+            records = [record for record in records if record.review == wanted]
+        if issue == "any":
+            records = [record for record in records if record.issues]
+        elif issue == "none":
+            records = [record for record in records if not record.issues]
+        elif issue:
+            records = [record for record in records if any(item["kind"] == issue for item in record.issues)]
+        return records
+
+    def set_review(self, image_ids: list[str], status: str | None) -> dict:
+        """Mark images done / needs work, or clear their status (None). Not on the undo stack."""
+        if status is not None and status not in REVIEW_STATUSES:
+            raise DatasetError(f"Review status must be one of {', '.join(REVIEW_STATUSES)}, or empty")
+        with self._lock:
+            records = [self.require_image(image_id) for image_id in dict.fromkeys(image_ids)]
+            for record in records:
+                record.review = status
+                self.reviews.set(record.path, status)
+            self._save_reviews(strict=True)
+            return {"updated": len(records), "status": status, "review_counts": self.review_counts()}
+
+    def review_counts(self) -> dict:
+        with self._lock:
+            counts = {status: 0 for status in REVIEW_STATUSES}
+            for record in self.images.values():
+                if record.review:
+                    counts[record.review] += 1
+            counts["unreviewed"] = len(self.images) - sum(counts.values())
+            return counts
+
+    def _save_reviews(self, strict: bool = False) -> None:
+        self._reviews_dirty = False
+        try:
+            self.reviews.save(self._atomic_write)
+        except OSError as exc:
+            if strict:
+                raise DatasetError(f"Cannot save review status: {exc}") from exc
+            self._reviews_dirty = True  # retried with the next change
 
     def list_objects(self, class_id: int, split="all", offset=0, limit=100) -> dict:
         with self._lock:
@@ -1046,17 +1131,18 @@ class Dataset:
             raise KeyError("Image not found") from exc
 
     def replace_annotations(self, image_id: str, raw_annotations: list[dict], expected_revision: int | None = None) -> dict:
-        record = self.require_image(image_id)
-        if self.category == "classification":
-            if len(raw_annotations) != 1 or raw_annotations[0].get("points"):
-                raise DatasetError("Classification images have exactly one class and no geometry")
-            class_id = int(raw_annotations[0]["class_id"])
-            if class_id not in self.names:
-                raise DatasetError(f"Unknown class {class_id}")
-            self._commit_moves([(record, class_id)], expected_revision=expected_revision)
+        with self._lock:
+            record = self.require_image(image_id)
+            if self.category == "classification":
+                if len(raw_annotations) != 1 or raw_annotations[0].get("points"):
+                    raise DatasetError("Classification images have exactly one class and no geometry")
+                class_id = int(raw_annotations[0]["class_id"])
+                if class_id not in self.names:
+                    raise DatasetError(f"Unknown class {class_id}")
+                self._commit_moves([(record, class_id)], expected_revision=expected_revision)
+                return self.detail(image_id)
+            self._commit_many([self._prepare(record, raw_annotations, expected_revision)])
             return self.detail(image_id)
-        self._commit_many([self._prepare(record, raw_annotations, expected_revision)])
-        return self.detail(image_id)
 
     def _commit_moves(self, moves: list[tuple[ImageRecord, int]], history: bool = True, expected_revision: int | None = None) -> None:
         """Reassign classification classes by moving files; all targets are checked before any move."""
@@ -1091,7 +1177,7 @@ class Dataset:
     def _prepare(self, record: ImageRecord, raw_annotations: list[dict], expected_revision: int | None = None) -> PreparedChange:
         """Validate raw annotations and capture the label state this change is based on."""
         if any(issue["kind"] == "malformed_label" for issue in record.issues):
-            raise DatasetError("Resolve or remove malformed label rows before editing this image")
+            raise DatasetError("This label file has malformed lines: repair them with “Edit label file” or remove them in the Validation tab")
         annotations = []
         for index, raw in enumerate(raw_annotations):
             class_id = int(raw["class_id"])
@@ -1103,6 +1189,10 @@ class Dataset:
                 raise DatasetError("Invalid annotation geometry")
             annotations.append(Annotation(raw.get("id") or f"{record.id}:new:{index}", class_id, points))
         content = "".join(f"{a.class_id} {' '.join(self._number(v) for v in a.points)}\n" for a in annotations)
+        return self._prepare_text(record, content, expected_revision)
+
+    def _prepare_text(self, record: ImageRecord, content: str, expected_revision: int | None = None) -> PreparedChange:
+        """Capture the label state a change to `content` (written as is) is based on."""
         before_exists = record.label_path.exists()
         before = record.label_path.read_text(encoding="utf-8") if before_exists else ""
         base_mtime = record.label_path.stat().st_mtime_ns if before_exists else None
@@ -1116,6 +1206,58 @@ class Dataset:
             base_revision=self._revisions[record.label_path],
             expected_revision=expected_revision,
         )
+
+    def _without_lines(self, record: ImageRecord, line_numbers: set[int]) -> str:
+        """The label text minus the given 1-based lines (numbered as _read_record numbers them)."""
+        try:
+            text = record.label_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise DatasetError(f"Cannot read {record.label_path.name}: {exc}") from exc
+        kept = [line for number, line in enumerate(text.splitlines(), 1) if number not in line_numbers]
+        return "".join(f"{line}\n" for line in kept)
+
+    def label_text(self, image_id: str) -> dict:
+        """The raw label file of one image, for the raw label editor."""
+        with self._lock:
+            record = self.require_image(image_id)
+            if self.category == "classification":
+                raise DatasetError("Classification images have no label file")
+            exists = record.label_path.exists()
+            try:
+                text = record.label_path.read_text(encoding="utf-8") if exists else ""
+            except (OSError, UnicodeDecodeError) as exc:
+                raise DatasetError(f"Cannot read {record.label_path.name}: {exc}") from exc
+            return {"image_id": record.id, "name": record.label_path.name, "path": self.folder_label(record.label_path), "exists": exists, "text": text, "revision": self._revisions[record.label_path], "issues": list(record.issues)}
+
+    def write_label_text(self, image_id: str, text: str, expected_revision: int | None = None) -> dict:
+        """Replace one label file with raw text (malformed lines allowed) through the normal commit path."""
+        with self._lock:
+            record = self.require_image(image_id)
+            if self.category == "classification":
+                raise DatasetError("Classification images have no label file")
+            lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            while lines and not lines[-1].strip():
+                lines.pop()
+            self._commit_many([self._prepare_text(record, "".join(f"{line}\n" for line in lines), expected_revision)])
+            return self.detail(image_id)
+
+    def trash_orphans(self, issue_ids: list[str]) -> dict:
+        """Move orphan label files into the dataset trash as one undoable transaction."""
+        with self._lock:
+            paths = {issue["id"]: path for issue, path in zip(self._orphan_issues, self.orphan_labels)}
+            missing = [issue_id for issue_id in issue_ids if issue_id not in paths]
+            if missing:
+                raise DatasetError("Orphan label not found; rescan or reload the issues")
+            entries, targets = [], set()
+            for issue_id in dict.fromkeys(issue_ids):
+                path = paths[issue_id]
+                target = self._trash_path(path)
+                while target in targets:  # two orphans with one trash name in this batch
+                    target = target.with_name(f"{target.stem}_{len(targets)}{target.suffix}")
+                targets.add(target)
+                entries.append(FileMoveEntry(path, target))
+            self._execute(entries)
+            return {"trashed": len(entries), **self.history_state()}
 
     def _number(self, value: float) -> str:
         return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
@@ -1253,6 +1395,8 @@ class Dataset:
                 self._resort()
                 self._find_orphans()
                 self._rebuild_orphan_issues()
+            if self._reviews_dirty:
+                self._save_reviews()
             image_ids = list(touched)
             if image_ids or schema is not None:
                 self.annotation_generation += 1
@@ -1304,6 +1448,12 @@ class Dataset:
                     raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
                 if dst.exists():
                     raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
+        elif isinstance(entry, FileMoveEntry):
+            src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
+            if not src.is_file():
+                raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
+            if dst.exists():
+                raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
         elif isinstance(entry, DirMoveEntry):
             src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
             if not src.is_dir():
@@ -1352,6 +1502,10 @@ class Dataset:
                 self._set_split(record, split_to)
             touched[record.id] = record
             return True
+        if isinstance(entry, FileMoveEntry):
+            src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
+            self._move_file(src, dst)
+            return True  # orphan labels are re-found
         if isinstance(entry, DirEntry):
             create = entry.created != (direction == "undo")
             if create:
@@ -1376,8 +1530,10 @@ class Dataset:
         raise TypeError(f"Unknown history entry {entry!r}")
 
     def _relocate(self, record: ImageRecord, image_path: Path, label_path: Path) -> None:
-        """Point a record at moved files, carrying its revision and mtime bookkeeping along."""
+        """Point a record at moved files, carrying its revision, mtime, and review bookkeeping along."""
         old_label = record.label_path
+        if record.review and self.reviews and self.reviews.move(record.path, image_path):
+            self._reviews_dirty = True
         record.path = image_path
         record.label_path = label_path
         record.name_cf = image_path.name.casefold()
@@ -1455,42 +1611,58 @@ class Dataset:
             return [issue for _, issue in self._issue_index.values()] + list(self._orphan_issues)
 
     def fix_issue(self, issue_id: str) -> dict:
-        indexed = self._issue_index.get(issue_id)
-        if not indexed or not indexed[1]["fixable"]:
-            raise DatasetError("Issue not found or cannot be fixed automatically")
-        record, issue = indexed
-        if issue["kind"] == "missing_label":
-            return self.replace_annotations(record.id, [])
-        annotation = next((a for a in record.annotations if a.id == issue["annotation_id"]), None)
-        if not annotation:
-            raise DatasetError("Annotation no longer exists")
-        annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
-        annotation = next(a for a in annotations if a.id == annotation.id)
-        if issue["kind"] == "out_of_range":
-            annotation.points = [min(1, max(0, value)) for value in annotation.points]
-        elif issue["kind"] in {"zero_area", "duplicate"}:
-            annotations.remove(annotation)
-        return self.replace_annotations(record.id, [a.as_dict() for a in annotations])
+        with self._lock:
+            if any(issue["id"] == issue_id for issue in self._orphan_issues):
+                return {**self.trash_orphans([issue_id]), "image_id": None}
+            indexed = self._issue_index.get(issue_id)
+            if not indexed or not indexed[1]["fixable"]:
+                raise DatasetError("Issue not found or cannot be fixed automatically")
+            record, issue = indexed
+            if issue["kind"] == "missing_label":
+                return self.replace_annotations(record.id, [])
+            if issue["kind"] == "malformed_label":
+                self._commit_many([self._prepare_text(record, self._without_lines(record, {issue["line"]}))])
+                return self.detail(record.id)
+            annotation = next((a for a in record.annotations if a.id == issue["annotation_id"]), None)
+            if not annotation:
+                raise DatasetError("Annotation no longer exists")
+            annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
+            annotation = next(a for a in annotations if a.id == annotation.id)
+            if issue["kind"] == "out_of_range":
+                annotation.points = [min(1, max(0, value)) for value in annotation.points]
+            elif issue["kind"] in {"zero_area", "duplicate"}:
+                annotations.remove(annotation)
+            return self.replace_annotations(record.id, [a.as_dict() for a in annotations])
 
     def fix_issues_bulk(self, kind: str, split: str | None = None, issue_ids: list[str] | None = None) -> dict:
         """Fix every matching fixable issue in one transaction; skips images that fail validation."""
         wanted = set(issue_ids) if issue_ids else None
-        changes, skipped, fixed = [], [], 0
-        grouped: dict[str, tuple[ImageRecord, list[dict]]] = {}
-        for record, issue in self._issue_index.values():
-            if issue["fixable"] and issue["kind"] == kind and (split is None or record.split == split) and (wanted is None or issue["id"] in wanted):
-                grouped.setdefault(record.id, (record, []))[1].append(issue)
-        for record, issues in grouped.values():
-            try:
-                changes.append(self._prepare(record, self._repair(record, issues)))
-                fixed += len(issues)
-            except DatasetError as exc:
-                skipped.append({"image_id": record.id, "image_name": record.path.name, "reason": str(exc)})
-        if not changes and not skipped:
-            raise DatasetError(f"No fixable {kind} issues match")
-        if changes:
-            self._commit_many(changes)
-        return {"fixed": fixed, "files": len(changes), "skipped": skipped}
+        with self._lock:
+            if kind == "orphan_label":
+                ids = [issue["id"] for issue in self._orphan_issues if wanted is None or issue["id"] in wanted]
+                if not ids:
+                    raise DatasetError("No orphan labels match")
+                result = self.trash_orphans(ids)
+                return {"fixed": result["trashed"], "files": result["trashed"], "skipped": []}
+            changes, skipped, fixed = [], [], 0
+            grouped: dict[str, tuple[ImageRecord, list[dict]]] = {}
+            for record, issue in self._issue_index.values():
+                if issue["fixable"] and issue["kind"] == kind and (split is None or record.split == split) and (wanted is None or issue["id"] in wanted):
+                    grouped.setdefault(record.id, (record, []))[1].append(issue)
+            for record, issues in grouped.values():
+                try:
+                    if kind == "malformed_label":
+                        changes.append(self._prepare_text(record, self._without_lines(record, {issue["line"] for issue in issues})))
+                    else:
+                        changes.append(self._prepare(record, self._repair(record, issues)))
+                    fixed += len(issues)
+                except DatasetError as exc:
+                    skipped.append({"image_id": record.id, "image_name": record.path.name, "reason": str(exc)})
+            if not changes and not skipped:
+                raise DatasetError(f"No fixable {kind} issues match")
+            if changes:
+                self._commit_many(changes)
+            return {"fixed": fixed, "files": len(changes), "skipped": skipped}
 
     def _repair(self, record: ImageRecord, issues: list[dict]) -> list[dict]:
         if any(issue["kind"] == "missing_label" for issue in issues):
@@ -1509,8 +1681,12 @@ class Dataset:
 
     def bulk_edit_objects(self, operations: list[dict]) -> dict:
         """Relabel or delete many annotations across images in one transaction."""
-        if self.category == "classification":
-            return self._bulk_reclassify(operations)
+        with self._lock:  # reads records the background probe may be updating
+            if self.category == "classification":
+                return self._bulk_reclassify(operations)
+            return self._bulk_edit(operations)
+
+    def _bulk_edit(self, operations: list[dict]) -> dict:
         grouped: dict[str, list[dict]] = {}
         for operation in operations:
             grouped.setdefault(operation["image_id"], []).append(operation)

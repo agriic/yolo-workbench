@@ -9,7 +9,8 @@ from typing import Callable
 from .fsutil import replace
 
 # Bump when PALETTE or the rendering style changes so stale cached media self-invalidates.
-PALETTE_VERSION = 1
+# 2: renders are EXIF-upright
+PALETTE_VERSION = 2
 
 
 def default_cache_dir() -> Path:

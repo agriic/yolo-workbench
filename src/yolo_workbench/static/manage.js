@@ -45,6 +45,13 @@ export function bindManage() {
     removing = null;
   });
   $("rescan").onclick = rescan;
+  $("refresh-storage").onclick = loadStorage;
+  $("storage-list").addEventListener("click", e => {
+    const restore = e.target.closest("[data-restore]");
+    if (restore) return restoreTrash(restore.dataset.restore);
+    const purge = e.target.closest("[data-purge]");
+    if (purge) purgeStorage(purge.dataset.kind, purge.dataset.purge);
+  });
   $("split-overview").addEventListener("click", e => {
     const add = e.target.closest("[data-add-folder]");
     if (add) addFolder(add.dataset.addFolder);
@@ -275,6 +282,53 @@ async function rescan() {
     const changes = [result.added && `${result.added} added`, result.removed && `${result.removed} removed`, result.updated && `${result.updated} labels re-read`].filter(Boolean);
     deps.toast(changes.length ? `Rescan: ${changes.join(", ")}` : "Rescan: nothing changed on disk");
     await deps.datasetChanged({ schema: result.names_changed });
+  } catch (error) { deps.toast(error.message, "error"); }
+}
+
+/* ---------- trash & backups ---------- */
+
+const formatBytes = bytes => bytes >= 1 << 30 ? `${(bytes / (1 << 30)).toFixed(1)} GB`
+  : bytes >= 1 << 20 ? `${(bytes / (1 << 20)).toFixed(1)} MB` : bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} B`;
+
+export async function loadStorage() {
+  try {
+    renderStorage(await api("/storage"));
+  } catch (error) { deps.toast(error.message, "error"); }
+}
+
+function renderStorage(data) {
+  $("storage-total").textContent = data.total_bytes ? formatBytes(data.total_bytes) : "";
+  const when = item => item.started ? new Date(item.started).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : item.session;
+  const section = (kind, title, items) => `<div class="storage-kind"><h3>${title}</h3>${items.length ? items.map(item => `
+    <div class="storage-row">
+      <div><strong>${esc(when(item))}</strong>${item.current ? ' <span class="pill">this session</span>' : ""}
+        <div class="muted">${kind === "trash" && item.images ? `${plural(item.images, "image")} · ` : ""}${plural(item.files, "file")} · ${formatBytes(item.bytes)}</div></div>
+      <span class="row-actions">
+        ${kind === "trash" ? `<button class="secondary mini" data-restore="${esc(item.session)}" title="Move these files back to where they were deleted from">Restore</button>` : ""}
+        ${item.current ? `<span class="muted" title="The current session's undo history uses these files">Ctrl+Z undoes</span>`
+          : `<button class="danger-btn mini" data-kind="${kind}" data-purge="${esc(item.session)}" title="Delete these files for good">Delete</button>`}
+      </span>
+    </div>`).join("") : `<p class="panel-note">Empty.</p>`}</div>`;
+  $("storage-list").innerHTML = section("trash", "Trash", data.trash) + section("backups", "Label backups", data.backups);
+}
+
+async function restoreTrash(session) {
+  if (!confirm("Move this session's trashed files back into the dataset? Files whose name is taken again stay in the trash.")) return;
+  try {
+    const result = await api(`/storage/trash/${encodeURIComponent(session)}/restore`, { method: "POST" });
+    renderStorage(result);
+    const kept = result.skipped.length ? ` · ${plural(result.skipped.length, "file")} kept in the trash (name taken)` : "";
+    deps.toast(`Restored ${plural(result.restored, "file")} · ${plural(result.added, "image")} back in the dataset${kept}`, result.skipped.length ? "error" : "info");
+    await deps.datasetChanged();
+  } catch (error) { deps.toast(error.message, "error"); }
+}
+
+async function purgeStorage(kind, session) {
+  const what = kind === "trash" ? "trashed images and labels" : "label backups";
+  if (!confirm(`Permanently delete this session's ${what}? This cannot be undone.`)) return;
+  try {
+    renderStorage(await api(`/storage/${kind}/${encodeURIComponent(session)}`, { method: "DELETE" }));
+    deps.toast(`Deleted the ${what}`);
   } catch (error) { deps.toast(error.message, "error"); }
 }
 

@@ -31,6 +31,7 @@ from PIL import Image
 
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError, WriteConflict
 from .fsutil import replace
+from .imaging import upright_rgb
 from .jobs import JobManager
 from .session import DatasetSession
 from .training import TrainingManager, TrainingTarget
@@ -41,6 +42,7 @@ SPLITS = ("train", "val", "test")
 CATEGORIES = ("detection", "segmentation", "classification")
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 COVER_SIZE = 480
+COVER_VERSION = 2  # bump when cover rendering changes; 2: EXIF-upright
 
 
 class Workspace:
@@ -411,12 +413,14 @@ class Workspace:
         summary = {"images": meta["image_count"], "annotated_images": annotated, "annotations": annotations, "classes": len(meta["names"]), "splits": meta["split_counts"]}
         cover_source = str(first.path) if first else None
         cover = directory / WORKBENCH_DIR / "cover.jpg"
-        if cover_source != data.get("cover_source") or (cover_source and not cover.exists()):
+        stale = data.get("cover_version") != COVER_VERSION
+        if cover_source != data.get("cover_source") or (cover_source and (stale or not cover.exists())):
             if first is None:
                 cover.unlink(missing_ok=True)
             else:
                 _write_cover(first.path, cover)
             data["cover_source"] = cover_source
+            data["cover_version"] = COVER_VERSION
             data["summary"] = None  # force a write below
         if summary != data.get("summary"):
             data["summary"] = summary
@@ -433,7 +437,7 @@ class Workspace:
 def _write_cover(image_path: Path, cover: Path) -> None:
     try:
         with Image.open(image_path) as source:
-            image = source.convert("RGB")
+            image = upright_rgb(source)
             image.thumbnail((COVER_SIZE, COVER_SIZE))
             cover.parent.mkdir(parents=True, exist_ok=True)
             image.save(cover, "JPEG", quality=82)

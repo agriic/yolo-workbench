@@ -25,7 +25,7 @@ def test_frontend_es_modules_are_served(tmp_path):
             assert app_script.status_code == 200
             assert 'from "./state.js"' in app_script.text
 
-            for name in ("api.js", "state.js", "grid.js", "canvas.js", "predictor.js", "embeddings.js", "manage.js", "projects.js", "projects.html"):
+            for name in ("api.js", "state.js", "grid.js", "canvas.js", "predictor.js", "embeddings.js", "manage.js", "repair.js", "labelqa.js", "projects.js", "projects.html"):
                 module = await client.get(f"/{name}")
                 assert module.status_code == 200
                 assert module.headers["cache-control"] == "no-cache"
@@ -186,4 +186,22 @@ def test_bulk_endpoints(tmp_path):
             assert label.read_text().startswith("0 ")
             undo = (await client.post("/api/v1/history/undo")).json()
             assert undo["image_ids"] == [image_id]
+    asyncio.run(run())
+
+
+def test_image_file_is_cacheable_only_under_its_current_version(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=make_app(dataset, tmp_path)), base_url="http://test") as client:
+            image_id = next(iter(dataset.images))
+            version = (await client.get(f"/api/v1/images/{image_id}")).json()["image_version"]
+            fresh = await client.get(f"/api/v1/images/{image_id}/file", params={"v": version})
+            assert fresh.status_code == 200 and "immutable" in fresh.headers["cache-control"]
+            stale = await client.get(f"/api/v1/images/{image_id}/file", params={"v": "old"})
+            assert stale.headers["cache-control"] == "no-cache"
+            # editing the image changes its version
+            Image.new("RGB", (100, 80), "black").save(dataset.images[image_id].path)
+            assert (await client.get(f"/api/v1/images/{image_id}")).json()["image_version"] != version
+
     asyncio.run(run())

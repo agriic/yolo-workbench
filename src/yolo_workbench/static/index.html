@@ -30,6 +30,7 @@
       <button class="tab" data-tab="statistics">Statistics</button>
       <button class="tab" data-tab="embeddings">Embeddings</button>
       <button class="tab" data-tab="validation">Validation <span id="issue-count" class="badge"></span></button>
+      <button class="tab" data-tab="quality" title="Find likely label mistakes where a trained model disagrees with the labels">Label QA <span id="qa-count" class="badge"></span></button>
       <button class="tab" data-tab="dataset">Dataset</button>
       <button class="tab" data-tab="training">Training</button>
     </nav>
@@ -46,6 +47,8 @@
         <div class="toolbar-group filter-controls">
           <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
           <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
+          <label class="field" title="Review status of the images">Review<select id="image-review"><option value="">All</option><option value="unreviewed">Unreviewed</option><option value="needs_work">Needs work</option><option value="done">Done</option></select></label>
+          <label class="field" title="Images with validation issues (see the Validation tab)">Issues<select id="image-issues"><option value="">All</option></select></label>
           <div class="field" id="label-count-field" title="Number of labels per image (of the selected class, if one is chosen)">Labels<div class="count-range">
             <input id="label-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum labels">
             <span aria-hidden="true">–</span>
@@ -54,6 +57,7 @@
           <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
           <label class="toggle" id="overlay-toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
           <label class="toggle" id="prediction-filter-toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
+          <button id="start-review" class="secondary" type="button" title="Open the first unreviewed image of this list in the editor (then D = done, W = needs work)">Review</button>
         </div>
         <div class="toolbar-group prediction-controls" id="assist-bar">
           <label class="field model-field grow">Model<div class="model-picker">
@@ -77,6 +81,11 @@
         </div>
         <div id="image-bulk" class="bulk-bar toolbar-group" hidden>
           <strong id="image-selected-count"></strong>
+          <span class="tool-group">
+            <button id="image-review-done" class="secondary" title="Mark the selected images as reviewed">✓ Done</button>
+            <button id="image-review-work" class="secondary" title="Flag the selected images as needing work">⚑ Needs work</button>
+            <button id="image-review-clear" class="secondary" title="Clear the review status of the selected images">Unmark</button>
+          </span>
           <select id="image-move-split" title="Target split"></select>
           <button id="image-move" class="secondary">Move</button>
           <button id="image-delete" class="danger-btn" title="Move the selected images and their labels to the dataset trash (Ctrl+Z undoes)">Delete</button>
@@ -161,7 +170,32 @@
     <section id="validation" class="view">
       <div class="section-title"><h1>Dataset issues</h1><button id="refresh-issues" class="secondary">Refresh</button></div>
       <div id="issue-summary" class="issue-summary"></div>
+      <div id="unknown-classes" class="stats-panel unknown-classes" hidden></div>
       <div id="issues" class="issue-list"></div>
+    </section>
+
+    <section id="quality" class="view">
+      <div class="section-title">
+        <div><h1>Label QA</h1><p class="section-subtitle">Where a trained model disagrees with the labels: objects nobody labelled, wrong classes, loose boxes, and labels the model cannot find. Most suspicious first.</p></div>
+        <button id="qa-clear" class="secondary" type="button" hidden title="Forget this analysis">Clear results</button>
+      </div>
+      <div class="stats-panel qa-setup">
+        <label class="field grow">Model<select id="qa-model"></select></label>
+        <button id="qa-load" class="secondary" type="button" title="Load this model (the Annotation tab's prediction model changes too)">Load</button>
+        <label class="field">Images<select id="qa-split"><option value="all">All splits</option></select></label>
+        <button id="qa-run" class="primary-btn" type="button">Analyze</button>
+        <button id="qa-cancel" class="secondary" type="button" hidden>Cancel</button>
+        <div class="qa-status" id="qa-status" role="status" aria-live="polite"></div>
+        <progress id="qa-progress" max="1" value="0" hidden></progress>
+      </div>
+      <div class="filters qa-filters" id="qa-filters" hidden>
+        <div class="field"><span class="field-label">Show</span><div id="qa-kinds" class="chip-row"></div></div>
+        <label class="field" title="Findings about a missing label, wrong class, or loose box need the model at least this sure"><span class="field-label">Model confidence ≥ <span id="qa-conf-value" class="muted">50%</span></span><input id="qa-conf" type="range" min="0.1" max="0.95" step="0.05" value="0.5"></label>
+        <label class="field">Split<select id="qa-filter-split"><option value="all">All splits</option></select></label>
+        <div id="qa-total" class="total"></div>
+      </div>
+      <div id="qa-grid" class="grid qa-grid"></div>
+      <div class="qa-more"><button id="qa-more" class="secondary" type="button" hidden>Show more</button></div>
     </section>
 
     <section id="dataset" class="view">
@@ -206,6 +240,11 @@
           <article class="stats-panel manage-panel" id="splits-panel">
             <div class="panel-head"><h2>Splits</h2></div>
             <div id="split-overview"></div>
+          </article>
+          <article class="stats-panel manage-panel" id="storage-panel">
+            <div class="panel-head"><h2>Trash &amp; backups <span id="storage-total" class="muted"></span></h2><button id="refresh-storage" class="secondary mini" type="button">Refresh</button></div>
+            <p class="panel-note">Deleted images go to the dataset trash, and the first edit of each label file in a session is backed up. Ctrl+Z covers the current session; restore or delete earlier sessions here.</p>
+            <div id="storage-list"></div>
           </article>
         </div>
       </div>
@@ -254,6 +293,17 @@
     </form>
   </dialog>
 
+  <dialog id="label-text-dialog" class="modal label-text-dialog">
+    <form method="dialog" id="label-text-form">
+      <div><h2 id="label-text-title"></h2><code id="label-text-path" class="muted"></code></div>
+      <p class="modal-text muted" id="label-text-format"></p>
+      <textarea id="label-text-input" rows="14" spellcheck="false" autocomplete="off" aria-label="Label file contents"></textarea>
+      <div id="label-text-problems" class="label-text-problems" aria-live="polite"></div>
+      <p class="modal-text muted">Saving keeps malformed lines as they are, so you can fix them later. Ctrl+Z undoes the save.</p>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button value="save" id="label-text-save" class="primary-btn">Save</button></div>
+    </form>
+  </dialog>
+
   <dialog id="editor">
     <div class="editor-head">
       <div class="editor-title-group">
@@ -264,6 +314,11 @@
         <div class="tool-group">
           <button id="prev-image" class="icon-btn" title="Previous image (←)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
           <button id="next-image" class="icon-btn" title="Next image (→)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>
+        </div>
+        <div class="tool-group review-tools">
+          <button id="review-done" class="secondary" title="Mark done and go to the next image (D); click again to unmark">✓ Done</button>
+          <button id="review-work" class="secondary" title="Flag as needing work and go to the next image (W); click again to unmark">⚑ Needs work</button>
+          <button id="review-next" class="icon-btn" title="Next unreviewed image (U)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 17 5-5-5-5"/><path d="m13 17 5-5-5-5"/></svg></button>
         </div>
         <div class="tool-group">
           <button id="undo" class="icon-btn" title="Undo (Ctrl+Z)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/></svg></button>
@@ -285,7 +340,8 @@
       <div id="canvas-wrap"><canvas id="canvas"></canvas></div>
       <aside class="inspector">
         <div class="inspector-section grow">
-          <h2>Annotations <span id="annotation-count"></span></h2>
+          <h2><span>Annotations <span id="annotation-count"></span></span><button id="edit-label-text" class="link-btn" type="button" title="Edit the raw label file of this image">Edit file</button></h2>
+          <div id="label-warning" class="label-warning" hidden></div>
           <div id="annotation-list"></div>
         </div>
         <div class="inspector-section" id="prediction-section" hidden>

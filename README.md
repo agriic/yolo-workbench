@@ -72,14 +72,16 @@ Images: `.jpg .jpeg .png .webp .bmp .tif .tiff`.
 
 ## What you can do
 
-- **Annotation** — a virtualized gallery of the whole dataset with filters (split, class, object count, search) and a canvas editor for boxes and polygons (keyboard shortcuts are listed in the editor). Select images with checkboxes (Shift-click for a range) or by dragging a rectangle across the gallery, then move them to another split or folder, or delete them into the dataset trash.
+- **Annotation** — a virtualized gallery of the whole dataset with filters (split, class, review status, validation issues, object count, search) and a canvas editor for boxes and polygons (keyboard shortcuts are listed in the editor). Select images with checkboxes (Shift-click for a range) or by dragging a rectangle across the gallery, then mark them reviewed, move them to another split or folder, or delete them into the dataset trash.
+- **Review passes** — mark images **done** or **needs work** (D / W in the editor marks and moves to the next image; U jumps to the next unreviewed one). With the gallery's Review filter on *Unreviewed*, reviewed images drop out as you go. Statuses are kept in `.yolo-workbench/review.json`, follow images that move, and are not part of undo.
 - **Model-assisted labeling** — load an Ultralytics `.pt`/`.onnx` model (or a run's `best.pt`), predict on selected images, and accept or reject predictions individually or above a confidence threshold. Model classes are mapped to dataset classes by name; predictions stay in memory until accepted.
 - **Smart annotation** — in the editor, turn on **Smart annotation** (S) and click an object: [SAM 2.1](https://docs.ultralytics.com/models/sam-2/) outlines it. Right-click (or Shift+click) marks background, dragging gives a rough box, ⏎ adds the result in the draw class (a box for detection, a polygon for segmentation). Uses SAM 2.1 large on a GPU and base otherwise (or when large fails to load); the weights download on first use. Once you have used it, images are encoded as soon as they open so the first click is instant.
 - **Exploration** — every object as a crop, filterable by class and split; select objects to relabel or delete them in bulk.
 - **Statistics** — class balance, annotations per image, box sizes, aspect ratios, class co-occurrence, split comparison, and likely outliers to review.
 - **Embeddings** — a 3D UMAP of object patches (whole images for classification), computed with FiftyOne; see [Embeddings](#embeddings) for the one-time setup.
-- **Validation** — malformed or unreadable labels, unknown classes, out-of-range, zero-area and duplicate annotations, missing labels, unreadable images, and orphan label files. Many are auto-fixable one by one or in bulk.
-- **Dataset** — add, rename, reorder, merge and remove classes (labels are rewritten, `data.yaml` keeps its comments); manage splits and add folders to a split; **import** images by browser upload or from a local folder, with labels, class mapping by name, a fixed or seeded random split, duplicate skipping, and an optional crop (labels are clipped to it).
+- **Validation** — malformed or unreadable labels, unknown classes, out-of-range, zero-area and duplicate annotations, missing labels, unreadable images, and orphan label files. Most are fixable one by one or in bulk: malformed lines can be removed or repaired in a raw label-file editor (also in the editor's inspector), unknown class ids can be mapped to a class, added as a new class, or deleted, and orphan label files go to the trash. **Show images** filters the gallery to one kind. Every fix is undoable.
+- **Label QA** — run a trained model (a training run's `best.pt` works well) over the dataset and list where it disagrees with the labels, most suspicious first: objects nobody labelled, wrong classes, loose boxes, and labels the model cannot find. Each finding shows the label and the model's box side by side and has a one-click fix (add the label, take the model's class or box, delete the label) or **Dismiss** when the label is right. Findings are recomputed from the current labels, so fixing something elsewhere clears it too; results survive a restart in `.yolo-workbench/labelqa.json`.
+- **Dataset** — add, rename, reorder, merge and remove classes (labels are rewritten, `data.yaml` keeps its comments); manage splits and add folders to a split; see how much the trash and label backups take per session, and restore or delete earlier sessions' files; **import** images by browser upload or from a local folder, with labels, class mapping by name, a fixed or seeded random split, duplicate skipping, and an optional crop (labels are clipped to it).
 - **Training** — see [Training](#training).
 
 Edits, class changes, moves and deletes are undoable with Ctrl+Z / Ctrl+Shift+Z. When a file changed on disk since it was loaded, the save is refused instead of overwriting it; **Rescan** picks up changes made outside the app.
@@ -123,8 +125,10 @@ Everything else works without it; the Embeddings tab then reports that it is una
 | Path | Contents |
 | --- | --- |
 | `<dataset>/.yolo-workbench/backups/<session>/` | the original of every label file before its first change in a session |
-| `<dataset>/.yolo-workbench/trash/` | images deleted from the gallery (undoable) |
+| `<dataset>/.yolo-workbench/trash/<session>/` | images deleted from the gallery and orphan labels moved away (undoable; restore or delete earlier sessions in the Dataset tab) |
 | `<dataset>/.yolo-workbench/index.json` | cached image sizes |
+| `<dataset>/.yolo-workbench/review.json` | review status per image |
+| `<dataset>/.yolo-workbench/labelqa.json` | the last Label QA analysis and its dismissed findings |
 | `<dataset>/.yolo-workbench/imports.jsonl` | import log |
 | `<dataset>/runs/` or `<project>/runs/` | training runs |
 | `~/.cache/yolo-workbench/media/` | rendered thumbnails and crops (pruned past 512 MB; honors `XDG_CACHE_HOME`) |

@@ -74,8 +74,9 @@ class UltralyticsBackend:
         self.model = YOLO(str(path))
         self.names = {int(key): str(value) for key, value in self.model.names.items()}
 
-    def predict(self, image_path: Path) -> list[dict]:
-        result = self.model.predict(str(image_path), conf=self.conf, iou=self.iou, verbose=False)[0]
+    def predict(self, image_path: Path, conf: float | None = None) -> list[dict]:
+        """Predictions at the backend's confidence threshold, or at `conf` (Label QA looks lower)."""
+        result = self.model.predict(str(image_path), conf=self.conf if conf is None else conf, iou=self.iou, verbose=False)[0]
         predictions: list[dict] = []
         if result.boxes is None:
             return predictions
@@ -109,6 +110,10 @@ class PredictorManager:
         self._backend_factory = backend_factory or self._default_factory
         self._available = (backend_factory is not None or ultralytics_available()) and dataset.category != "classification"
         self._lock = threading.Lock()
+        # one inference at a time on the shared model (batch runs, the editor's predict, Label QA)
+        self.backend_lock = threading.Lock()
+        # why the model must not be swapped or run in a batch right now (set by Label QA while it analyzes)
+        self.external_busy: str | None = None
         self._thread: threading.Thread | None = None
         self._cancel_event = threading.Event()
         self._failed_image_ids: list[str] = []
@@ -190,6 +195,8 @@ class PredictorManager:
         with self._lock:
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is in progress; wait for it to finish before loading a model")
+            if self.external_busy:
+                raise DatasetError(f"{self.external_busy}; wait for it to finish before loading a model")
             self.status = "loading"
             self.error = None
         try:
@@ -341,6 +348,8 @@ class PredictorManager:
                 raise DatasetError("Load a model first")
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is already in progress")
+            if self.external_busy:
+                raise DatasetError(f"{self.external_busy}; wait for it to finish")
             records = self._select(image_ids, split, only_unlabeled)
             self.job = self._new_job("running", len(records))
             self._failed_image_ids = []
@@ -387,7 +396,8 @@ class PredictorManager:
                     self.job["cancelled"] = len(records) - index
                 break
             try:
-                raw = self.backend.predict(record.path)
+                with self.backend_lock:
+                    raw = self.backend.predict(record.path)
                 with self._lock:
                     items = [self._prediction(record, item) for item in raw]
                     self.predictions[record.id] = self._filter_new(record, items)
@@ -427,7 +437,8 @@ class PredictorManager:
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is already in progress")
         try:
-            raw = self.backend.predict(record.path)
+            with self.backend_lock:
+                raw = self.backend.predict(record.path)
         except Exception as exc:
             raise DatasetError(f"Prediction failed: {exc}") from exc
         with self._lock:

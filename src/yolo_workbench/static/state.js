@@ -17,6 +17,7 @@ export const state = {
   img: null,           // loaded HTMLImageElement
   selected: null,      // annotation id
   hovered: null,
+  focusHint: null,     // [l, t, r, b] outlined in the editor (a Label QA prediction), or null
   drawing: null,       // {start,end} box or {points,cursor} polygon in progress
   drag: null,          // {mode:"move"|"resize"|"vertex", a, index, start, original}
   pan: null,

@@ -41,7 +41,57 @@ def class_summary(dataset: Dataset) -> dict:
             }
             for class_id, name in sorted(dataset.names.items())
         ]
-        return {"items": items, "category": dataset.category, "reorderable": dataset.category != "classification"}
+        return {"items": items, "unknown": unknown_classes(dataset), "category": dataset.category, "reorderable": dataset.category != "classification"}
+
+
+def unknown_classes(dataset: Dataset) -> list[dict]:
+    """Class ids used in label files but missing from the dataset names."""
+    with dataset._lock:
+        return [
+            {"id": class_id, "annotations": len(objects), "images": len(dataset._class_image_ids.get(class_id, ()))}
+            for class_id, objects in sorted(dataset._object_index.items())
+            if class_id not in dataset.names and objects
+        ]
+
+
+def resolve_unknown(dataset: Dataset, class_id: int, action: str, target_id: int | None = None, name: str | None = None) -> dict:
+    """Give an unknown class id a home: map it to a class, add it as a new class, or delete its annotations.
+
+    One undoable transaction; adding a class takes the next free id (so names stay contiguous)
+    and renumbers the unknown id to it.
+    """
+    with dataset._lock:
+        if dataset.category == "classification":
+            raise DatasetError("Classification datasets have no unknown class ids")
+        if class_id in dataset.names or not dataset._object_index.get(class_id):
+            raise DatasetError(f"Class {class_id} is not an unknown class in this dataset")
+        if action == "add":
+            new_id = max(dataset.names, default=-1) + 1
+            if new_id != class_id and dataset._object_index.get(new_id):
+                # the new class takes id new_id; labels already using it would silently join it
+                raise DatasetError(f"Class id {new_id} is also used by unknown labels; resolve class {new_id} first")
+            new_names = {**dataset.names, new_id: validate_name(dataset, name or "")}
+            return _remap(dataset, {**{key: key for key in dataset.names}, class_id: new_id}, new_names)
+        if action == "map":
+            if target_id is None:
+                raise DatasetError("Mapping needs a target class")
+            _require(dataset, target_id)
+            mapping: dict[int, int | None] = {class_id: target_id}
+        elif action == "delete":
+            mapping = {class_id: None}
+        else:
+            raise DatasetError("Action must be 'map', 'add', or 'delete'")
+        entries = []
+        for record in dataset.images.values():
+            if record.label_path.exists() and any(annotation.class_id == class_id for annotation in record.annotations):
+                before = record.label_path.read_text(encoding="utf-8")
+                after = remap_label_text(before, mapping)
+                if after != before:
+                    entries.append(HistoryEntry(record.label_path, before, after, True, True))
+        if not entries:
+            raise DatasetError(f"No label file uses class {class_id}")
+        dataset._execute(entries)
+        return _result(dataset, {key: key for key in dataset.names}, len(entries))
 
 
 def validate_name(dataset: Dataset, name: str, exclude_id: int | None = None, pending: tuple[str, ...] = ()) -> str:

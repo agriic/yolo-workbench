@@ -135,7 +135,9 @@ header nav { margin-left: auto; display: flex; height: 100%; }
   background: transparent;
   color: var(--text-2);
   font-weight: 500;
+  white-space: nowrap;
 }
+@media (max-width: 1400px) { .tab { padding: 0 11px; } .dataset-chip { max-width: 200px; } }
 .tab:hover:not(:disabled) { color: var(--text); background: transparent; border: 0; }
 .tab.active { color: var(--accent-strong); }
 .tab.active::after {
@@ -212,6 +214,8 @@ main { padding: 18px 22px 48px; }
 .annotation-toolbar .field input, .annotation-toolbar .field select { height: 32px; }
 .annotation-toolbar #image-split { width: 104px; min-width: 104px; }
 .annotation-toolbar #image-class { width: 118px; min-width: 118px; }
+.annotation-toolbar #image-review { width: 112px; min-width: 112px; }
+.annotation-toolbar #image-issues { width: 128px; min-width: 128px; }
 .annotation-toolbar #image-search { min-width: 145px; }
 .count-range { display: flex; align-items: center; gap: 4px; color: var(--text-3); }
 .count-range input { width: 58px; min-width: 58px; padding: 0 6px; }
@@ -650,9 +654,10 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 #toast.error { border-left-color: #ff6b57; }
 
 /* ---------- small screens ---------- */
-@media (max-width: 1180px) {
+/* the filters and the model controls share one row only on wide screens */
+@media (max-width: 1720px) {
   .annotation-toolbar { flex-wrap: wrap; }
-  .filter-controls { flex: 1 1 100%; }
+  .filter-controls { flex: 1 1 100%; flex-wrap: wrap; row-gap: 8px; }
   .prediction-controls { flex: 1 1 auto; }
 }
 
@@ -760,8 +765,9 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 
 /* ---------- bulk operations ---------- */
 .issue-chip-group { display: inline-flex; align-items: center; gap: 4px; }
-.fix-all { border-radius: 999px; font-size: 12px; padding: 5px 10px; color: var(--accent-strong); border-color: var(--accent); }
-.fix-all:hover:not(:disabled) { background: var(--accent-weak); }
+.fix-all, .show-kind { border-radius: 999px; font-size: 12px; padding: 5px 10px; color: var(--accent-strong); border-color: var(--accent); }
+.fix-all:hover:not(:disabled), .show-kind:hover:not(:disabled) { background: var(--accent-weak); }
+.show-kind { border-style: dashed; }
 .bulk-bar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 1px solid var(--accent); background: var(--accent-weak); border-radius: var(--radius); }
 .bulk-bar strong { font-size: 13px; color: var(--accent-strong); white-space: nowrap; }
 .card-check { position: absolute; top: 8px; left: 8px; width: 17px; height: 17px; margin: 0; accent-color: var(--accent); cursor: pointer; opacity: 0; transition: opacity .12s; }
@@ -897,6 +903,7 @@ body.classification #delete,
 body.classification #predict-image,
 body.classification #smart-annotate,
 body.classification #bulk-delete,
+body.classification #edit-label-text,
 body.classification [data-delete-object],
 body.classification .stats-panel:has(#stats-density),
 body.classification .stats-panel:has(#stats-box-size),
@@ -926,7 +933,8 @@ code { font-size: 12px; background: var(--bg); border: 1px solid var(--line); bo
 /* image selection in the annotation grid */
 .card[data-image]:hover .card-check { opacity: 1; }
 .card.selected { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
-body:not(.image-ops) #image-bulk { display: none !important; }
+/* review works on any dataset; moving and deleting need plain split folders */
+body:not(.image-ops) #image-move-split, body:not(.image-ops) #image-move, body:not(.image-ops) #image-delete { display: none !important; }
 
 #dataset .section-subtitle { overflow-wrap: anywhere; }
 .manage-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 14px; margin-top: 12px; align-items: start; }
@@ -1050,7 +1058,7 @@ dialog.modal .field input, dialog.modal .field select, dialog.modal textarea { b
 .lock-banner .link-btn { padding: 0; }
 body.on-training .lock-banner { display: none; }
 /* while a run trains this dataset the server refuses writes; take the write controls out of reach too */
-body.training-locked #image-bulk, body.training-locked #object-bulk, body.training-locked .issue-actions,
+body.training-locked #image-move-split, body.training-locked #image-move, body.training-locked #image-delete, body.training-locked #object-bulk, body.training-locked .issue-actions,
 body.training-locked .fix-all, body.training-locked #class-add-form, body.training-locked #class-table,
 body.training-locked #import-panel, body.training-locked #split-overview .link-btn,
 body.training-locked .pred-actions, body.training-locked #prediction-list, body.training-locked #editor #delete { opacity: .45; pointer-events: none; }
@@ -1297,3 +1305,76 @@ dialog.aug-zoom { width: min(1400px, calc(100vw - 32px)); }
   .aug-zoom-body { grid-template-columns: 1fr; max-width: none; }
   .aug-toolbar-note { margin-left: 0; }
 }
+
+/* ---------- repair tools ---------- */
+.label-warning { font-size: 12px; line-height: 1.5; color: #ffd28a; background: #3a3020; border: 1px solid #5c4a26; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; }
+.label-warning .link-btn { padding: 0 0 0 4px; color: #ffd28a; text-decoration: underline; }
+#editor .inspector h2 .link-btn { padding: 0; border: 0; background: none; color: var(--accent); font-size: 11px; letter-spacing: 0; text-transform: none; font-weight: 600; }
+#editor .inspector h2 .link-btn:hover { text-decoration: underline; }
+dialog.label-text-dialog { width: min(760px, calc(100vw - 32px)); }
+.label-text-dialog code { font-size: 12px; overflow-wrap: anywhere; }
+.label-text-dialog textarea { font: 13px/1.5 ui-monospace, "Cascadia Mono", Consolas, monospace !important; white-space: pre; overflow: auto; min-height: 220px; tab-size: 4; }
+.label-text-problems { display: grid; gap: 4px; max-height: 160px; overflow-y: auto; }
+.label-text-problems .panel-note { margin: 0; }
+.line-problem { justify-content: flex-start; gap: 8px; font-size: 12px; padding: 5px 9px; text-align: left; border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); color: var(--text); }
+.line-problem strong { color: var(--danger); white-space: nowrap; }
+.ok-note { color: var(--accent-strong) !important; }
+.unknown-classes { margin: 0 0 16px; }
+.unknown-classes .panel-note { margin-bottom: 10px; }
+.unknown-row { display: grid; grid-template-columns: 48px minmax(0, 1fr) minmax(180px, 260px) minmax(0, 180px) auto; gap: 10px; align-items: center; padding: 8px 0; border-top: 1px solid var(--line); }
+.unknown-row select, .unknown-row input { height: 32px; border: 1px solid var(--line); border-radius: 6px; padding: 0 8px; background: var(--surface); min-width: 0; }
+.unknown-row input[hidden] { display: block !important; visibility: hidden; }
+.unknown-id { font-weight: 700; font-variant-numeric: tabular-nums; font-size: 15px; }
+@media (max-width: 760px) { .unknown-row { grid-template-columns: 40px minmax(0, 1fr); } }
+
+/* ---------- trash & backups ---------- */
+.storage-kind h3 { margin: 12px 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; color: var(--text-2); }
+.storage-kind:first-child h3 { margin-top: 0; }
+.storage-kind .panel-note { margin: 0 0 6px; }
+.storage-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.storage-row .muted { font-size: 12px; margin-top: 2px; }
+.storage-row .row-actions { display: flex; gap: 6px; align-items: center; flex: none; }
+
+/* ---------- review status ---------- */
+.review-flag {
+  position: absolute;
+  bottom: 8px; left: 8px;
+  width: 22px; height: 22px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  font-size: 12px; font-weight: 700;
+  color: #fff;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 30%);
+}
+.review-flag.done { background: var(--accent); }
+.review-flag.needs_work { background: var(--warn); }
+#editor .review-tools button { font-size: 12px; }
+#editor #review-done.active, #editor #review-done.active:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
+#editor #review-work.active, #editor #review-work.active:hover { background: #b37d0b; border-color: #b37d0b; color: #fff; }
+#image-bulk .tool-group button { white-space: nowrap; }
+
+/* ---------- label QA ---------- */
+body.classification .tab[data-tab="quality"] { display: none; }
+.qa-setup { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 12px 0 14px; }
+.qa-setup .field.grow { flex: 1 1 280px; min-width: 0; }
+.qa-setup select { max-width: 100%; }
+.qa-status { flex: 1 1 100%; font-size: 12px; color: var(--text-2); line-height: 1.5; overflow-wrap: anywhere; }
+.qa-setup progress { flex: 1 1 100%; height: 6px; accent-color: var(--accent); }
+.qa-filters { align-items: end; }
+.qa-grid { grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+.qa-card .thumb { cursor: zoom-in; }
+.qa-card .thumb img { height: 190px; }
+.qa-card.busy { opacity: .5; pointer-events: none; }
+.qa-kind { position: absolute; top: 8px; left: 8px; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 4px; color: #fff; background: #5f6b67; box-shadow: 0 1px 4px rgb(0 0 0 / 25%); }
+.qa-kind.missing_label { background: #2a78d6; }
+.qa-kind.wrong_class { background: #c03221; }
+.qa-kind.box_mismatch { background: #b37d0b; }
+.qa-kind.unmatched_label { background: #7a4fc0; }
+.qa-score { position: absolute; top: 8px; right: 8px; font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 999px; background: rgb(0 0 0 / 60%); color: #fff; font-variant-numeric: tabular-nums; }
+.qa-detail { font-size: 12px; color: var(--text-2); margin-top: 4px; line-height: 1.4; min-height: 34px; }
+.qa-detail strong { color: var(--text); font-weight: 600; }
+.qa-card .object-actions button { flex: none; white-space: nowrap; }
+.qa-card .object-actions .qa-fix { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.qa-card .qa-fix { color: var(--accent-strong); border-color: var(--accent); }
+.qa-more { display: flex; justify-content: center; margin: 14px 0 24px; }
+body.training-locked .qa-fix { opacity: .45; pointer-events: none; }

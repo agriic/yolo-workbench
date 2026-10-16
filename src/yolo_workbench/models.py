@@ -31,6 +31,7 @@ class ImageRecord:
     class_ids: set[int] = field(default_factory=set)
     name_cf: str = ""
     probe_error: str | None = None
+    review: str | None = None  # "done", "needs_work", or None (unreviewed); see review.py
 
     def summary(self) -> dict:
         return {
@@ -42,4 +43,5 @@ class ImageRecord:
             "annotation_count": len(self.annotations),
             "classes": sorted(self.class_ids),
             "issue_count": len(self.issues),
+            "review": self.review,
         }

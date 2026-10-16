@@ -6,7 +6,7 @@ import {
   editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerMove,
   pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
   savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
-  updateStatus, zoomAt, zoomTo,
+  updateReviewButtons, updateStatus, zoomAt, zoomTo,
 } from "./canvas.js";
 import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor,
@@ -23,7 +23,9 @@ import {
   acceptSam, configureSam, drawSam, hasPrompts, clearPrompts, refreshSam, removeLastPrompt, samEditorClosed,
   samHint, samImageOpened, samPointerDown, samPointerMove, samPointerUp, samRightClick, toggleSam,
 } from "./sam.js";
-import { bindManage, configureManage, loadClasses, renderManageMeta } from "./manage.js";
+import { bindManage, configureManage, loadClasses, loadStorage, renderManageMeta } from "./manage.js";
+import { bindRepair, configureRepair, openLabelText, renderUnknownClasses } from "./repair.js";
+import { bindLabelQA, configureLabelQA, labelsChangedForQA, showLabelQA } from "./labelqa.js";
 import { bindTraining, configureTraining, hideTraining, showTraining } from "./training.js";
 
 export let imageGallery = null;
@@ -71,6 +73,8 @@ async function init() {
   setupVirtualGalleries();
   bind();
   bindManage();
+  bindRepair();
+  bindLabelQA();
   bindTraining();
   updateHistoryButtons();
   watchIndexing();
@@ -158,8 +162,9 @@ export async function datasetChanged({ schema = false } = {}) {
   statisticsChanged();
   updateHistoryButtons();
   const tasks = [loadImages({ reset: schema }), loadObjects({ reset: schema }), loadIssues(), refreshPredictor()];
-  if ($("dataset").classList.contains("active")) tasks.push(loadClasses());
+  if ($("dataset").classList.contains("active")) tasks.push(loadClasses(), loadStorage());
   if ($("embeddings").classList.contains("active")) tasks.push(refreshEmbeddings());
+  labelsChangedForQA();  // findings are recomputed from the labels (undo of a Label QA fix, imports, …)
   await Promise.all(tasks.map(task => Promise.resolve(task).catch(error => toast(error.message, "error"))));
 }
 
@@ -181,7 +186,8 @@ function showTab(tab, runId = null) {
   if (tab === "exploration") objectGallery?.refreshLayout();
   if (tab === "embeddings") refreshEmbeddings();
   if (tab === "statistics") loadStatistics();
-  if (tab === "dataset") loadClasses();
+  if (tab === "quality") showLabelQA();
+  if (tab === "dataset") { loadClasses(); loadStorage(); }
 }
 
 function watchIndexing() {
@@ -205,6 +211,8 @@ function renderShortcuts() {
       ["Drag", "Pan the image"],
       ["Ctrl+Z / Ctrl+⇧+Z", "Undo / redo"],
       ["← →", "Previous / next image"],
+      ["D / W", "Review: done / needs work, then next"],
+      ["U", "Next unreviewed image"],
       ["F", "Fit image"],
       ["Esc", "Close"],
     ].map(([key, hint]) => `<dt><kbd>${key}</kbd></dt><dd>${hint}</dd>`).join("");
@@ -220,6 +228,8 @@ function renderShortcuts() {
     ["⌫", "Delete selection"],
     ["Ctrl+Z / Ctrl+⇧+Z", "Undo / redo"],
     ["← →", "Previous / next image"],
+    ["D / W", "Review: done / needs work, then next"],
+    ["U", "Next unreviewed image"],
     ["P", "Predict with the loaded model"],
     ["S", "Smart annotation (SAM): click the object"],
     ["Right click", "SAM: mark background (or Shift+Click)"],
@@ -232,7 +242,11 @@ function renderShortcuts() {
 
 function bind() {
   document.querySelectorAll(".tab").forEach(button => button.onclick = () => showTab(button.dataset.tab));
-  [$("image-split"), $("image-class"), $("filter-predictions")].forEach(el => el.onchange = () => loadImages({ reset: true }));
+  [$("image-split"), $("image-class"), $("filter-predictions"), $("image-review"), $("image-issues")].forEach(el => el.onchange = () => loadImages({ reset: true }));
+  $("start-review").onclick = () => openNextUnreviewed(0);
+  $("image-review-done").onclick = () => reviewSelection("done");
+  $("image-review-work").onclick = () => reviewSelection("needs_work");
+  $("image-review-clear").onclick = () => reviewSelection(null);
   $("show-overlays").onchange = () => loadImages();
   $("image-search").oninput = debounce(() => loadImages({ reset: true }), 250);
   [$("label-min"), $("label-max")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
@@ -365,6 +379,8 @@ function bind() {
     if (select) editObject(select.dataset.owner, select.dataset.objectClass, a => a.class_id = +select.value);
   });
   $("issue-summary").addEventListener("click", e => {
+    const show = e.target.closest("[data-show-kind]");
+    if (show) return showIssueImages(show.dataset.showKind);
     const fixAll = e.target.closest("[data-fix-kind]");
     if (fixAll) return fixAllIssues(fixAll.dataset.fixKind, +fixAll.dataset.count);
     const chip = e.target.closest("[data-kind]");
@@ -375,6 +391,8 @@ function bind() {
   $("issues").addEventListener("click", async e => {
     const open = e.target.closest("[data-issue-open]");
     if (open) return openEditor(open.dataset.issueOpen, open.dataset.object || null);
+    const raw = e.target.closest("[data-edit-label]");
+    if (raw) return openLabelText(raw.dataset.editLabel);
     const fix = e.target.closest("[data-fix]");
     if (!fix) return;
     try {
@@ -394,6 +412,14 @@ function bind() {
   $("redo").onclick = () => applyHistory("redo");
   $("delete").onclick = deleteSelected;
   $("predict-image").onclick = predictImage;
+  // a click on the active status unmarks it; otherwise mark and move on, like D / W
+  $("review-done").onclick = e => { e.currentTarget.blur(); reviewCurrent("done", state.detail?.review !== "done"); };
+  $("review-work").onclick = e => { e.currentTarget.blur(); reviewCurrent("needs_work", state.detail?.review !== "needs_work"); };
+  $("review-next").onclick = e => { e.currentTarget.blur(); openNextUnreviewed(); };
+  $("edit-label-text").onclick = () => state.detail && openLabelText(state.detail.id);
+  $("label-warning").addEventListener("click", e => {
+    if (e.target.closest("[data-edit-label]") && state.detail) openLabelText(state.detail.id);
+  });
   // blurred so ⏎ (accept) and Space (pan) don't press the button again
   $("smart-annotate").onclick = e => { e.currentTarget.blur(); toggleSam(); };
   $("fit").onclick = fit;
@@ -431,6 +457,7 @@ function bind() {
     state.pred.items = [];
     renderPredList();
     samEditorClosed();
+    labelsChangedForQA();
   });
 
   $("annotation-list").addEventListener("click", e => {
@@ -479,6 +506,11 @@ function keyDown(e) {
   if (key === "ArrowRight") return navigate(1);
   if (key.toLowerCase() === "f") return fit();
   if (key.toLowerCase() === "p") return predictImage();
+  if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+    if (key.toLowerCase() === "d") return reviewCurrent("done", true);
+    if (key.toLowerCase() === "w") return reviewCurrent("needs_work", true);
+    if (key.toLowerCase() === "u") return openNextUnreviewed();
+  }
   if (key.toLowerCase() === "s" && !e.ctrlKey && !e.metaKey && !e.altKey) return toggleSam();
   if (key === "Enter" && state.sam.active) { e.preventDefault(); return acceptSam(); }
   if (key === "+" || key === "=") return zoomCentered(1.25);
@@ -520,7 +552,7 @@ function setupVirtualGalleries() {
     },
   });
   imageGallery.enableMarquee({
-    canStart: () => !!state.meta.capabilities.image_ops && !state.imageSelectionBusy,
+    canStart: () => !state.imageSelectionBusy,
     onSelect: marqueeSelect,
     onClear: additive => { if (!additive && state.imageSelection.size) clearImageSelection(); },
   });
@@ -538,16 +570,26 @@ function setupVirtualGalleries() {
   });
 }
 
-function fetchImagePage(offset, limit, signal) {
-  const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value, limit: String(limit), offset: String(offset) });
+// The Annotation tab's filters as query parameters (the image list and "next unreviewed" share them).
+function imageFilterParams() {
+  const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value });
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   if ($("filter-predictions").checked) params.set("has_predictions", "true");
+  if ($("image-review").value) params.set("review", $("image-review").value);
+  if ($("image-issues").value) params.set("issue", $("image-issues").value);
   if (state.meta.category !== "classification") {
     for (const [id, key] of [["label-min", "min_labels"], ["label-max", "max_labels"]]) {
       const value = $(id).value.trim();
       if (/^\d+$/.test(value)) params.set(key, value);
     }
   }
+  return params;
+}
+
+function fetchImagePage(offset, limit, signal) {
+  const params = imageFilterParams();
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
   return api(`/images?${params}`, { signal });
 }
 
@@ -592,10 +634,10 @@ function renderImageCard(item, index) {
   const chips = item.classes.slice(0, 3).map(id =>
     `<span class="chip" style="--c:${classColor(id)}">${esc(state.meta.names[id] ?? `class ${id}`)}</span>`).join("");
   const more = item.classes.length > 3 ? `<span class="chip">+${item.classes.length - 3}</span>` : "";
-  const selectable = state.meta.capabilities.image_ops;
   return `<article class="card ${state.imageSelection.has(item.id) ? "selected" : ""}" data-image="${item.id}" data-index="${index}" tabindex="0">
       <div class="thumb"><img loading="lazy" src="${apiUrl(`/images/${item.id}/thumbnail?size=320${overlay}`)}" alt="">
-        ${selectable ? `<input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for a range, or drag a rectangle from the space between images)" aria-label="Select ${esc(item.name)}" ${state.imageSelection.has(item.id) ? "checked" : ""}>` : ""}
+        <input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for a range, or drag a rectangle from the space between images)" aria-label="Select ${esc(item.name)}" ${state.imageSelection.has(item.id) ? "checked" : ""}>
+        ${item.review ? `<span class="review-flag ${item.review}" title="${item.review === "done" ? "Reviewed: done" : "Review: needs work"}">${item.review === "done" ? "✓" : "⚑"}</span>` : ""}
         ${item.issue_count ? `<span class="issue-flag">${item.issue_count} ⚠</span>` : ""}
         ${state.pred.pending[item.id] ? `<span class="pred-flag" title="Pending predictions">${state.pred.pending[item.id]} ✨</span>` : ""}</div>
       <div class="card-body">
@@ -663,6 +705,80 @@ function clearImageSelection() {
   state.lastImageIndex = null;
   renderImageBulkBar();
   imageGallery?.render();
+}
+
+/* ---------- review status ---------- */
+
+const REVIEW_NAMES = { done: "done", needs_work: "needs work" };
+
+async function setReview(imageIds, status) {
+  const result = await api("/images/review", { method: "POST", body: JSON.stringify({ image_ids: imageIds, status }) });
+  state.meta.review_counts = result.review_counts;
+  return result;
+}
+
+async function reviewSelection(status) {
+  const ids = [...state.imageSelection.keys()];
+  if (!ids.length) return;
+  try {
+    const result = await setReview(ids, status);
+    toast(status ? `Marked ${result.updated} image${result.updated === 1 ? "" : "s"} ${REVIEW_NAMES[status]}` : `Cleared the review status of ${result.updated} image${result.updated === 1 ? "" : "s"}`);
+    clearImageSelection();
+    await loadImages();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+// Editor: set the status of the open image; `advance` moves on to the next image of the list
+// (under the "Unreviewed" filter the image drops out of the list, and its successor takes its place).
+async function reviewCurrent(status, advance) {
+  if (!state.detail) return;
+  const id = state.detail.id;
+  const next = advance || state.detail.review !== status ? status : null;
+  try {
+    if (state.detail.review !== next) {
+      await setReview([id], next);
+      if (state.detail?.id === id) state.detail.review = next;
+      updateReviewButtons();
+    }
+    await loadImages();
+    if (!advance || state.detail?.id !== id) return;
+    const index = state.editorGridIndex, total = imageGallery.total;
+    if (index == null) return;  // opened from outside the list (Validation, Label QA)
+    if (state.editorDetached ? index >= total : index + 1 >= total) return toast("That was the last image in this list");
+    await navigate(1);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+// Open the first unreviewed image after the editor's position (or from `start`), wrapping around the list.
+async function openNextUnreviewed(start = null) {
+  const from = start ?? (state.detail && state.editorGridIndex != null ? state.editorGridIndex + (state.editorDetached ? 0 : 1) : 0);
+  const params = imageFilterParams();
+  params.set("start", String(from));
+  try {
+    const result = await api(`/images/next-unreviewed?${params}`);
+    if (result.index == null) return toast(result.total ? "Every image in this list is reviewed" : "No images match the current filters");
+    openEditor(result.item.id, null, result.index);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+/* ---------- issue filter ---------- */
+
+function renderIssueFilter() {
+  const select = $("image-issues");
+  const previous = select.value;
+  const kinds = [...new Set(state.issues.filter(issue => issue.image_id).map(issue => issue.kind))].sort();
+  // a kind that was just fixed away stays selectable, so the empty list explains itself
+  if (previous && previous !== "any" && previous !== "none" && !kinds.includes(previous)) kinds.push(previous);
+  select.innerHTML = `<option value="">All</option><option value="any">With issues</option><option value="none">Without issues</option>`
+    + kinds.map(kind => `<option value="${esc(kind)}">${esc(kind.replaceAll("_", " "))}</option>`).join("");
+  select.value = previous;
+}
+
+function showIssueImages(kind) {
+  renderIssueFilter();
+  $("image-issues").value = kind;
+  showTab("annotation");
+  loadImages({ reset: true });
 }
 
 async function runImageBulk(action) {
@@ -777,6 +893,22 @@ async function runObjectBulk(action, classId = null) {
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+// One image's labels were rewritten outside the editor's own save (raw label editor): refresh what shows them.
+async function labelsChanged(imageId, detail) {
+  state.canUndo = true;
+  state.canRedo = false;
+  updateHistoryButtons();
+  statisticsChanged();
+  if (state.detail?.id === imageId && detail) {
+    state.detail = { ...detail, image_version: state.detail.image_version };
+    savedRevisionByImage.set(imageId, detail.revision);
+    state.selected = null;
+    renderList();
+    render();
+  }
+  await Promise.all([loadImages(), loadObjects(), loadIssues()].map(task => task.catch(error => toast(error.message, "error"))));
 }
 
 export async function editObject(imageId, id, change) {
@@ -906,7 +1038,15 @@ export async function loadIssues() {
   state.issues = data.items;
   $("issue-count").textContent = data.items.length || "";
   renderIssues();
+  renderUnknownClasses(data.unknown_classes || []);
+  renderIssueFilter();
 }
+
+// What "Fix" does for kinds where the generic word would be unclear: [button, bulk button, tooltip, confirm question]
+const FIX_ACTIONS = {
+  malformed_label: ["Remove line", "Remove all", "Remove the malformed line from the label file", count => `Remove ${count} malformed line${count === 1 ? "" : "s"} from the label files?`],
+  orphan_label: ["Trash", "Trash all", "Move the label file to the dataset trash", count => `Move ${count} orphan label file${count === 1 ? "" : "s"} to the dataset trash?`],
+};
 
 function renderIssues() {
   const items = state.issues;
@@ -919,24 +1059,27 @@ function renderIssues() {
   $("issue-summary").innerHTML = Object.entries(counts).map(([kind, count]) => `
     <span class="issue-chip-group">
       <button class="issue-chip ${state.issueFilter === kind ? "active" : ""}" data-kind="${esc(kind)}">${esc(kind.replaceAll("_", " "))} <strong>${count}</strong></button>
-      ${fixable[kind] ? `<button class="fix-all" data-fix-kind="${esc(kind)}" data-count="${fixable[kind]}" title="Fix all ${fixable[kind]} automatically">Fix all</button>` : ""}
+      ${fixable[kind] ? `<button class="fix-all" data-fix-kind="${esc(kind)}" data-count="${fixable[kind]}" title="${esc(FIX_ACTIONS[kind]?.[2] ?? "Fix")} — all ${fixable[kind]}">${esc(FIX_ACTIONS[kind]?.[1] ?? "Fix all")}</button>` : ""}
+      ${kind !== "orphan_label" ? `<button class="show-kind" data-show-kind="${esc(kind)}" title="Show these images in the Annotation tab">Show images</button>` : ""}
     </span>`).join("");
   const visible = state.issueFilter ? items.filter(issue => issue.kind === state.issueFilter) : items;
   $("issues").innerHTML = visible.map(issue => `
     <div class="issue">
       <span class="severity-dot ${esc(issue.severity)}" title="${esc(issue.severity)}"></span>
       <span class="pill">${esc(issue.kind.replaceAll("_", " "))}</span>
-      <div><strong>${esc(issue.image_name)}</strong><div class="message">${esc(issue.message)}</div></div>
+      <div><strong title="${esc(issue.path || issue.image_name)}">${esc(issue.path || issue.image_name)}</strong><div class="message">${esc(issue.message)}</div></div>
       <span class="split-badge">${esc(issue.split || "—")}</span>
       <span class="issue-actions">
         ${issue.image_id ? `<button data-issue-open="${issue.image_id}" data-object="${esc(issue.annotation_id || "")}">Open</button>` : ""}
-        ${issue.fixable ? `<button data-fix="${issue.id}">Fix</button>` : ""}
+        ${issue.kind === "malformed_label" ? `<button data-edit-label="${issue.image_id}" title="Repair the line in the raw label file">Edit file</button>` : ""}
+        ${issue.fixable ? `<button data-fix="${issue.id}" title="${esc(FIX_ACTIONS[issue.kind]?.[2] ?? "Fix automatically")} (Ctrl+Z undoes)">${esc(FIX_ACTIONS[issue.kind]?.[0] ?? "Fix")}</button>` : ""}
       </span>
     </div>`).join("") || `<div class="empty">No issues found. The dataset looks clean.</div>`;
 }
 
 async function fixAllIssues(kind, count) {
-  if (!confirm(`Fix all ${count} ${kind.replaceAll("_", " ")} issue${count === 1 ? "" : "s"}? Ctrl+Z undoes the whole batch.`)) return;
+  const question = FIX_ACTIONS[kind]?.[3](count) ?? `Fix all ${count} ${kind.replaceAll("_", " ")} issue${count === 1 ? "" : "s"}?`;
+  if (!confirm(`${question} Ctrl+Z undoes the whole batch.`)) return;
   try {
     const result = await api("/issues/fix-bulk", { method: "POST", body: JSON.stringify({ kind }) });
     state.canUndo = true;
@@ -991,6 +1134,8 @@ configurePredictor({
   updateHistoryButtons,
 });
 configureSam({ render, save, shapePath, toast, toScreen, updateStatus });
+configureRepair({ datasetChanged, labelsChanged, toast });
+configureLabelQA({ labelsChanged, openEditor, toast });
 configureEmbeddings({ classOptions, editObject, toast });
 configureManage({ datasetChanged, toast });
 configureTraining({
