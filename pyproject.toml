@@ -38,6 +38,11 @@ packages = ["src/yolo_workbench"]
 pythonpath = ["src"]
 testpaths = ["tests"]
 
+# ultralytics wants opencv-python, fiftyone opencv-python-headless (<5); both install the same cv2/ package
+# and a mixed install breaks `import cv2`, so drop opencv-python (the marker never matches) and keep headless
+[tool.uv]
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
 # PyPI's Windows torch wheels are CPU-only; Linux ones already bundle CUDA 13.0, so match that on Windows
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
