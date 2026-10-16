@@ -8,7 +8,19 @@ Works on Linux and Windows (and should on macOS). Python 3.10 or newer.
 
 ## Install
 
-[uv](https://docs.astral.sh/uv/) is the supported way to set up the environment. Everything (model-assisted labeling, embeddings, training, tests) is a core dependency, so one command installs it all:
+[uv](https://docs.astral.sh/uv/) is the supported way to set up the environment. 
+
+Windows:
+```bash
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+Linux/OSX:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+(Restart the shell..)
+
+Everything (model-assisted labeling, embeddings, training, tests) is a core dependency, so one command installs it all:
 
 ```bash
 uv sync
@@ -83,7 +95,7 @@ The Training tab trains Ultralytics YOLO models on the open dataset (detect, seg
 - **New run:** a form for the common options (epochs, image size, batch, device, optimizer, …) and a Raw YAML mode for any Ultralytics argument. The **Augmentation** group previews each augmentation at both ends of its range on your own images, using Ultralytics' own transforms. The base model is an official pretrained one (YOLO26 / YOLO11 / YOLOv8, downloaded on first use to `~/.cache/yolo-workbench/weights/`) or a previous run's weights. **Duplicate** and **Fine-tune** prefill the form from an earlier run.
 - **Live view:** epoch and batch progress, ETA, best epoch so far, loss and metric charts, and the per-epoch table. **Pause** (resumable), **Finish early** (runs the final evaluation), or **Kill**.
 - **Results:** final validation of `best.pt` and, when the dataset has a test split, a test-split evaluation, both per class, plus the Ultralytics plots and the log.
-- **History and comparison:** every run in the dataset's `runs/` folder, including runs made with `yolo train`. Rename runs, add notes, and tick runs to compare their curves, results, and the arguments that differ. **Use for labeling** loads a run's `best.pt` as the Annotation tab's model.
+- **History and comparison:** every run in the dataset's `runs/` folder, including runs made with `yolo train`. Rename runs, add notes, and tick runs to compare their curves, results, and the arguments that differ. **Use for labeling** loads a run's `best.pt` as the Annotation tab's model; **Download best.pt** saves it as `<dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD>.pt` (the date `best.pt` was written; a fine-tune names the pretrained model it descends from).
 - **Queue:** a run is a separate process that keeps going if the server stops (the server picks it up again on restart). One run trains at a time; the rest wait in a reorderable queue, shared by all projects in projects mode. While a run trains, its dataset is read-only.
 
 Runs are stored in `<project>/runs/<run>/`, or in single-dataset mode in `runs/` next to the dataset YAML. Delete a run by deleting its folder.

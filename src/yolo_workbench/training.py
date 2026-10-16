@@ -801,8 +801,8 @@ class TrainingManager:
         created = meta.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_dir.stat().st_mtime))
         return {
             "id": self.run_id(run_dir),
-            "dir": str(run_dir.relative_to(target.runs_root)) if run_dir.is_relative_to(target.runs_root) else str(run_dir),
-            "path": str(run_dir),
+            "dir": (run_dir.relative_to(target.runs_root) if run_dir.is_relative_to(target.runs_root) else run_dir).as_posix(),
+            "path": run_dir.as_posix(),
             "name": meta.get("name") or run_dir.name,
             "notes": meta.get("notes", ""),
             "source": source,
@@ -856,7 +856,7 @@ class TrainingManager:
                 except OSError:
                     continue  # deleted while listing
         items.sort(key=lambda item: item["created"] or "", reverse=True)
-        return {"items": items, "category": target.category, "runs_root": str(target.runs_root)}
+        return {"items": items, "category": target.category, "runs_root": target.runs_root.as_posix()}
 
     def run_detail(self, project: str | None, run_id: str) -> dict:
         self.tick()
@@ -912,6 +912,24 @@ class TrainingManager:
             raise KeyError("File not found")
         return path
 
+    def best_weights(self, project: str | None, run_id: str) -> tuple[Path, str]:
+        """best.pt and its download name: <dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD of best.pt>.pt."""
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            summary = self._summary(target, run_dir)
+        path = run_dir / "weights" / "best.pt"
+        try:
+            written = path.stat().st_mtime
+        except OSError:
+            raise KeyError("This run has no best.pt") from None
+        imgsz = summary["imgsz"]
+        if isinstance(imgsz, (list, tuple)):
+            imgsz = "x".join(str(side) for side in imgsz)
+        parts = [target.name, summary["name"], imgsz, _model_label(summary["model"]), time.strftime("%Y.%m.%d", time.localtime(written))]
+        parts = [_filename_part(part) for part in parts if part not in (None, "")]
+        return path, "-".join(part for part in parts if part) + ".pt"
+
     def update_run(self, project: str | None, run_id: str, name: str | None = None, notes: str | None = None) -> dict:
         target = self.resolve(project)
         with self._lock:
@@ -954,7 +972,7 @@ class TrainingManager:
         names = [dataset.names[class_id] for class_id in sorted(dataset.names)]
         previous = []
         for summary in self.list_runs(project)["items"]:
-            weights = {kind: str(Path(summary["path"]) / "weights" / f"{kind}.pt") for kind, present in summary["has_weights"].items() if present}
+            weights = {kind: f"{summary['path']}/weights/{kind}.pt" for kind, present in summary["has_weights"].items() if present}
             if weights:
                 run_names = (summary.get("dataset") or {}).get("names")
                 previous.append({"id": summary["id"], "name": summary["name"], "weights": weights, "best_metrics": summary["best_metrics"], "names_match": None if run_names is None else run_names == names})
@@ -967,7 +985,7 @@ class TrainingManager:
             "pretrained": pretrained,
             "runs": previous,
             "devices": self.devices(),
-            "weights_dir": str(self.weights_dir),
+            "weights_dir": self.weights_dir.as_posix(),
             "next_name": _next_name(None, {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set()),
         }
 
@@ -1000,8 +1018,10 @@ class TrainingManager:
         warnings = list(plan["warnings"])
         model = str((args or {}).get("model") or "")
         if model:
+            # Path comparison: the weights path comes back POSIX-style from options(), run folders are OS-native
+            model_dir = Path(model).expanduser().resolve().parent
             for run_dir in self._scan(target):
-                if model.startswith(str(run_dir / "weights")):
+                if model_dir == (run_dir / "weights").resolve():
                     run_names = ((_read_json(run_dir / META_DIR / "run.json") or {}).get("dataset") or {}).get("names")
                     if run_names is not None and run_names != plan["names"]:
                         warnings.append("The base run was trained with different classes; its class head is re-initialized")
@@ -1153,6 +1173,30 @@ def _ultralytics_label_path(image_path: str) -> str:
 
 def _slugify(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")[:64] or "run"
+
+
+def _filename_part(value) -> str:
+    """One piece of a download name: path separators, characters Windows rejects and whitespace become `_`."""
+    return re.sub(r'[\s<>:"/\\|?*\x00-\x1f]+', "_", str(value)).strip("_.")
+
+
+def _model_label(model) -> str:
+    """What a run started from, by name: yolo11n.pt -> yolo11n. A previous run's weights stand for
+    that run's own base model (followed back through fine-tunes), or else that run's folder name."""
+    seen: set[Path] = set()
+    fallback = ""
+    while model:
+        path = Path(str(model).replace("\\", "/"))
+        if path.parent.name != "weights":
+            return path.stem
+        run_dir = path.parent.parent
+        fallback = fallback or run_dir.name
+        if run_dir in seen:
+            break
+        seen.add(run_dir)
+        meta = _read_json(run_dir / META_DIR / "run.json") or {}
+        model = meta.get("base_model") or (_read_yaml(run_dir / "args.yaml") or {}).get("model")
+    return fallback
 
 
 def _unique_dir(name: str, existing: set[str]) -> str:

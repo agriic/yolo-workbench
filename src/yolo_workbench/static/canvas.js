@@ -90,6 +90,10 @@ export function updateNavButtons() {
   const total = deps.imageGallery()?.total;
   $("prev-image").disabled = index == null || index <= 0 || !total;
   $("next-image").disabled = index == null || total == null || index + (state.editorDetached ? 0 : 1) >= total;
+  // position in the filtered image list; a detached image has none, but the remaining total still counts down
+  const position = $("editor-position");
+  position.hidden = index == null || total == null;
+  position.textContent = position.hidden ? "" : `${state.editorDetached ? "–" : (index + 1).toLocaleString()} / ${total.toLocaleString()}`;
   $("editor-subtitle").textContent = `${state.detail.split} · ${state.detail.width}×${state.detail.height}px${state.editorDetached ? " · no longer matches filters" : ""}`;
 }
 

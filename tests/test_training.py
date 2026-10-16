@@ -491,6 +491,48 @@ def test_run_files_logs_and_epochs(tmp_path):
     assert [row["epoch"] for row in epochs["items"]] == [2, 3] and epochs["best_epoch"] == 3 and epochs["state"]["status"] == "training"
 
 
+def test_best_weights_download_name(tmp_path):
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+    run = manager.enqueue(None, dataset, "Night shift: v2", "", ARGS)["run"]
+    with pytest.raises(KeyError):
+        manager.best_weights(None, run["id"])  # no best.pt yet
+    runner_finishes(Path(run["path"]))
+    launcher.handle.code = 0
+    best = Path(run["path"]) / "weights" / "best.pt"
+    written = time.mktime((2026, 3, 4, 12, 0, 0, 0, 0, -1))
+    os.utime(best, (written, written))
+    assert manager.best_weights(None, run["id"]) == (best, "ds-Night_shift_v2-64-yolo11n-2026.03.04.pt")
+
+    # a fine-tune names the architecture it descends from, not "best"
+    finetune = manager.enqueue(None, dataset, "tuned", "", f"model: {best.as_posix()}\nepochs: 5\nimgsz: [96, 64]\n")["run"]
+    runner_finishes(Path(finetune["path"]))
+    os.utime(Path(finetune["path"]) / "weights" / "best.pt", (written, written))
+    assert manager.best_weights(None, finetune["id"])[1] == "ds-tuned-96x64-yolo11n-2026.03.04.pt"
+
+
+def test_best_weights_download_api(tmp_path):
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media"), training=manager)
+    run = manager.enqueue(None, dataset, "baseline", "", ARGS)["run"]
+
+    async def check():
+        async with client_for(app) as client:
+            url = f"/api/v1/training/runs/{run['id']}/weights/best"
+            assert (await client.get(url)).status_code == 404
+            runner_finishes(Path(run["path"]))
+            launcher.handle.code = 0
+            response = await client.get(url)
+            assert response.status_code == 200 and response.content == b"x"
+            assert response.headers["content-disposition"] == f'attachment; filename="ds-baseline-64-yolo11n-{time.strftime("%Y.%m.%d")}.pt"'
+            assert (await client.get("/api/v1/training/runs/nope/weights/best")).status_code == 404
+
+    asyncio.run(check())
+
+
 def test_options_list_pretrained_models_and_previous_weights(tmp_path, monkeypatch):
     dataset = make_dataset(tmp_path)
     launcher = FakeLauncher()
@@ -507,6 +549,26 @@ def test_options_list_pretrained_models_and_previous_weights(tmp_path, monkeypat
     assert options["defaults"]["epochs"] == 100 and "data" not in options["defaults"] and options["help"]["epochs"]
     assert options["runs"][0]["names_match"] is True and options["runs"][0]["weights"]["best"].endswith("weights/best.pt")
     assert options["next_name"] == "exp-2"
+
+
+def test_preflight_warns_when_base_run_has_other_classes(tmp_path):
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+    run = manager.enqueue(None, dataset, "", "", ARGS)["run"]
+    run_dir = Path(run["path"])
+    runner_finishes(run_dir)
+    launcher.handle.code = 0
+    best = manager.options(None, dataset)["runs"][0]["weights"]["best"]
+    assert best == run_dir.as_posix() + "/weights/best.pt"
+    assert manager.preflight(None, dataset, {"model": best})["warnings"] == []
+    meta = json.loads((run_dir / "workbench" / "run.json").read_text())
+    meta["dataset"]["names"] = ["other"]
+    (run_dir / "workbench" / "run.json").write_text(json.dumps(meta))
+    # the POSIX path options() hands out and the OS-native one both point into the run's weights
+    for model in (best, str(run_dir / "weights" / "best.pt")):
+        assert any("different classes" in warning for warning in manager.preflight(None, dataset, {"model": model})["warnings"])
+    assert manager.preflight(None, dataset, {"model": "yolo11n.pt"})["warnings"] == []
 
 
 # ---------- dataset scans ignore runs/ ----------
@@ -678,7 +740,7 @@ def test_single_mode_training_api(tmp_path):
             runner_finishes(Path(run["path"]))
             launcher.handle.code = 0
             listed = (await client.get("/api/v1/training/runs")).json()
-            assert listed["items"][0]["status"] == "completed" and listed["runs_root"] == str(dataset.root / "runs")
+            assert listed["items"][0]["status"] == "completed" and listed["runs_root"] == (dataset.root / "runs").as_posix()
             assert (await client.get(f"/api/v1/training/runs/{run['id']}/epochs?since=2")).json()["items"][0]["epoch"] == 3
             assert (await client.post(f"/api/v1/training/runs/{run['id']}/stop", json={"mode": "pause"})).status_code == 400
             response = await client.patch(f"/api/v1/training/runs/{run['id']}", json={"notes": "good"})

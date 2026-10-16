@@ -93,7 +93,7 @@ function drawCharts() {
 }
 
 const shortModel = model => {
-  const parts = String(model ?? "?").split("/");
+  const parts = String(model ?? "?").split(/[\\/]/);
   return parts.length > 2 && parts[parts.length - 2] === "weights" ? `${parts[parts.length - 3]}/${parts[parts.length - 1]}` : parts[parts.length - 1];
 };
 

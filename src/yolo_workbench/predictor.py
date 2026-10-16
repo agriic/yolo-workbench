@@ -54,6 +54,14 @@ def _clamp(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
 
 
+def _same_file(a: str, b: str) -> bool:
+    """Whether two model paths name the same file, whatever separators or relative form they use."""
+    try:
+        return Path(a).expanduser().resolve() == Path(b).expanduser().resolve()
+    except (OSError, RuntimeError):  # e.g. a symlink loop
+        return a == b
+
+
 class UltralyticsBackend:
     """Thin wrapper so PredictorManager only depends on names + predict()."""
 
@@ -193,7 +201,7 @@ class PredictorManager:
             raise DatasetError(f"Failed to load model: {exc}") from exc
         with self._lock:
             self.backend = backend
-            self.model_path = str(model_path)
+            self.model_path = model_path.as_posix()
             if conf is not None:
                 self.conf = conf
             if iou is not None:
@@ -204,7 +212,7 @@ class PredictorManager:
             self._failed_image_ids = []
             self._cancel_event.clear()
             self.status = "ready"
-        self._remember_model(str(model_path))
+        self._remember_model(model_path.as_posix())
         return self.payload()
 
     @property
@@ -220,7 +228,8 @@ class PredictorManager:
             return []
 
     def _remember_model(self, path: str) -> None:
-        recents = [path] + [item for item in self._recent_models() if item != path]
+        # older recents may name the same file differently (backslashes on Windows, relative paths)
+        recents = [path] + [item for item in self._recent_models() if not _same_file(item, path)]
         try:
             self._recents_path.parent.mkdir(parents=True, exist_ok=True)
             self._recents_path.write_text(json.dumps({"recent_models": recents[:10]}), encoding="utf-8")
@@ -250,6 +259,10 @@ class PredictorManager:
         items: list[dict] = []
         seen: set[Path] = set()
         trained = self._trained_models()
+        with self._lock:
+            model_path = self.model_path
+        # matched here as resolved paths: the client may have loaded it as "D:/x/best.pt" or "D:\x\best.pt"
+        loaded = Path(model_path).resolve() if model_path else None
 
         def add(path: Path, source: str) -> None:
             resolved = path.resolve()
@@ -260,7 +273,7 @@ class PredictorManager:
             except OSError:
                 return
             seen.add(resolved)
-            items.append({"path": str(resolved), "name": trained.get(resolved, resolved.name), "size": stat.st_size, "mtime": int(stat.st_mtime), "source": source, "trained": resolved in trained})
+            items.append({"path": resolved.as_posix(), "name": trained.get(resolved, resolved.name), "size": stat.st_size, "mtime": int(stat.st_mtime), "source": source, "trained": resolved in trained, "loaded": resolved == loaded})
 
         recents = self._recent_models()
         for recent in recents:

@@ -9,7 +9,7 @@ from PIL import Image
 from test_dataset import make_dataset
 from yolo_workbench.dataset import DatasetError
 from yolo_workbench.media_cache import MediaCache
-from yolo_workbench.sam import BASE, LARGE, SamManager, mask_box, mask_outline
+from yolo_workbench.sam import BASE, LARGE, SamManager, drop_specks, mask_box, mask_outlines
 from yolo_workbench.web import create_app
 
 
@@ -92,7 +92,25 @@ def test_detection_returns_box_around_mask(tmp_path):
     assert result["found"]
     # positive points at x=30,50 y=40 → mask x 20..60, y 30..50
     assert result["points"] == pytest.approx([0.4, 0.5, 0.4, 0.25])
-    assert len(result["outline"]) >= 6
+    assert len(result["outlines"]) == 1 and len(result["outlines"][0]) >= 6
+
+
+class SpeckledSam(FakeSam):
+    """FakeSam plus the kind of speck real SAM leaves far from the object (a 2×2 island in a corner)."""
+
+    def segment(self, features, shape, points, labels, box):
+        mask, score = super().segment(features, shape, points, labels, box)
+        mask[-3:-1, -3:-1] = True
+        return mask, score
+
+
+def test_specks_do_not_stretch_the_box(tmp_path):
+    dataset, _ = make_dataset(tmp_path)  # 100×80 image
+    record = next(iter(dataset.images.values()))
+    manager = ready_manager(SpeckledSam)
+    result = manager.segment(record.path, "detection", [{"x": 0.3, "y": 0.5, "positive": True}, {"x": 0.5, "y": 0.5, "positive": True}], None)
+    assert result["points"] == pytest.approx([0.4, 0.5, 0.4, 0.25])  # as without the speck
+    assert len(result["outlines"]) == 1
 
 
 def test_segmentation_returns_polygon_and_box_prompt_works(tmp_path):
@@ -120,16 +138,32 @@ def test_prompt_validation(tmp_path):
 
 
 def test_nothing_found_is_not_an_error():
-    assert mask_outline(np.zeros((10, 10), dtype=bool)) == []
+    assert mask_outlines(np.zeros((10, 10), dtype=bool)) == []
 
 
 def test_mask_helpers_cover_every_part():
     mask = np.zeros((10, 20), dtype=bool)
-    mask[1:3, 1:3] = True
+    mask[1:4, 1:4] = True
     mask[5:9, 10:18] = True
     assert mask_box(mask) == pytest.approx([0.475, 0.5, 0.85, 0.8])
-    outline = mask_outline(mask)  # largest part only
-    assert min(outline[0::2]) == pytest.approx(0.5) and min(outline[1::2]) == pytest.approx(0.5)
+    largest, small = mask_outlines(mask)  # every part, largest first
+    assert min(largest[0::2]) == pytest.approx(0.5) and min(largest[1::2]) == pytest.approx(0.5)
+    assert max(small[0::2]) == pytest.approx(0.15) and max(small[1::2]) == pytest.approx(0.3)
+
+
+def test_drop_specks_keeps_object_parts():
+    mask = np.zeros((640, 640), dtype=bool)  # specks: under 10×10 px here, or under 1% of the largest part
+    mask[100:300, 100:200] = True  # an object split by an occluder: both halves stay
+    mask[100:300, 220:260] = True
+    mask[600:609, 600:609] = True  # 81 px: a speck
+    mask[10:12, 400:402] = True
+    cleaned = drop_specks(mask)
+    assert cleaned.sum() == 200 * 100 + 200 * 40
+    assert mask_box(cleaned) == pytest.approx([180 / 640, 200 / 640, 160 / 640, 200 / 640])
+    tiny = np.zeros((640, 640), dtype=bool)  # the largest part stays however small
+    tiny[5:8, 5:8] = True
+    tiny[50:52, 50:52] = True
+    assert drop_specks(tiny).sum() == 9
 
 
 def test_encodes_each_image_once_until_it_changes(tmp_path):

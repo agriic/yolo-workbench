@@ -221,11 +221,13 @@ export function drawSam(ctx) {
   const color = classColor(+$("draw-class").value);
   if (s.result?.found) {
     const outline = new Path2D();
-    for (let i = 0; i < s.result.outline.length; i += 2) {
-      const [sx, sy] = deps.toScreen(s.result.outline[i], s.result.outline[i + 1]);
-      i === 0 ? outline.moveTo(sx, sy) : outline.lineTo(sx, sy);
+    for (const part of s.result.outlines) {
+      for (let i = 0; i < part.length; i += 2) {
+        const [sx, sy] = deps.toScreen(part[i], part[i + 1]);
+        i === 0 ? outline.moveTo(sx, sy) : outline.lineTo(sx, sy);
+      }
+      outline.closePath();
     }
-    outline.closePath();
     ctx.save();
     ctx.fillStyle = `${color}40`;
     ctx.fill(outline);

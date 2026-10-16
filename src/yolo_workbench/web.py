@@ -566,6 +566,11 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         path = found(lambda: training.run_file(session.slug, run_id, name))
         return FileResponse(path, headers={"Cache-Control": "no-cache"})
 
+    @router.get("/training/runs/{run_id}/weights/best")
+    def training_best_weights(run_id: str, session: DatasetSession = current):
+        path, filename = found(lambda: training.best_weights(session.slug, run_id))
+        return FileResponse(path, media_type="application/octet-stream", filename=filename, headers={"Cache-Control": "no-cache"})
+
     @router.post("/training/runs/{run_id}/stop")
     def training_stop(run_id: str, payload: TrainingStopPayload, session: DatasetSession = current):
         return found(lambda: training.stop(session.slug, run_id, payload.mode))

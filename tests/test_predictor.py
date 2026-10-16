@@ -383,18 +383,18 @@ def test_discover_models_scans_and_prioritizes_recents(tmp_path):
     (tmp_path / "notes.txt").write_text("not a model")
 
     found = manager.discover_models()["items"]
-    names = [item["name"] for item in found if str(tmp_path) in item["path"]]
+    names = [item["name"] for item in found if tmp_path.resolve().as_posix() in item["path"]]
     assert "model.pt" in names and "best.pt" in names
     assert "exported.onnx" not in names  # only .pt models are discovered
     assert "skipped.pt" not in names and "notes.txt" not in names
-    assert all(item["source"] == "found" for item in found if str(tmp_path) in item["path"])
+    assert all(item["source"] == "found" for item in found if tmp_path.resolve().as_posix() in item["path"])
 
     manager.load(str(model))
     assert (tmp_path / ".yolo-workbench" / "predictor.json").exists()
     found = manager.discover_models()["items"]
-    assert found[0]["path"] == str(model.resolve())
+    assert found[0]["path"] == model.resolve().as_posix()
     assert found[0]["source"] == "recent"
-    assert [item["path"] for item in found].count(str(model.resolve())) == 1  # no duplicate from the scan
+    assert [item["path"] for item in found].count(model.resolve().as_posix()) == 1  # no duplicate from the scan
 
 
 def test_discover_scans_directories_of_recent_models(tmp_path, tmp_path_factory):
@@ -405,8 +405,8 @@ def test_discover_scans_directories_of_recent_models(tmp_path, tmp_path_factory)
     (outside / "sibling.pt").write_bytes(b"fake")
     manager.load(str(loaded))
     found = manager.discover_models()["items"]
-    assert found[0]["path"] == str(loaded.resolve())
-    assert any(item["path"] == str((outside / "sibling.pt").resolve()) for item in found)
+    assert found[0]["path"] == loaded.resolve().as_posix()
+    assert any(item["path"] == (outside / "sibling.pt").resolve().as_posix() for item in found)
 
 
 def test_discover_lists_trained_runs_by_name(tmp_path):
@@ -419,16 +419,36 @@ def test_discover_lists_trained_runs_by_name(tmp_path):
             (runs / run / "workbench").mkdir()
             (runs / run / "workbench" / "run.json").write_text(json.dumps({"name": name}))
     found = {item["path"]: item for item in manager.discover_models()["items"]}
-    baseline = found[str((runs / "exp-1" / "weights" / "best.pt").resolve())]
+    baseline = found[(runs / "exp-1" / "weights" / "best.pt").resolve().as_posix()]
     assert baseline["name"] == "Baseline · best.pt" and baseline["source"] == "run" and baseline["trained"]
-    assert found[str((runs / "detect" / "train2" / "weights" / "best.pt").resolve())]["name"] == "train2 · best.pt"
+    assert found[(runs / "detect" / "train2" / "weights" / "best.pt").resolve().as_posix()]["name"] == "train2 · best.pt"
 
 
 def test_recent_models_skip_deleted_files(tmp_path):
     dataset, _, manager, model = make_predictor(tmp_path)
     manager.load(str(model))
     model.unlink()
-    assert all(item["path"] != str(model.resolve()) for item in manager.discover_models()["items"])
+    assert all(item["path"] != model.resolve().as_posix() for item in manager.discover_models()["items"])
+
+
+def test_model_paths_are_posix_and_matched_however_spelled(tmp_path):
+    dataset, _, manager, model = make_predictor(tmp_path)
+    (tmp_path / "weights").mkdir()
+    # a recent persisted by an older version with native separators (backslashes on Windows)
+    (tmp_path / ".yolo-workbench").mkdir(exist_ok=True)
+    (tmp_path / ".yolo-workbench" / "predictor.json").write_text(json.dumps({"recent_models": [str(model)]}))
+
+    # "Use for labeling" sends POSIX paths; a typed path may be relative or use either separator
+    payload = manager.load((tmp_path / "weights" / ".." / "model.pt").as_posix())
+    assert "\\" not in payload["model"]["path"]
+    recents = json.loads((tmp_path / ".yolo-workbench" / "predictor.json").read_text())["recent_models"]
+    assert len(recents) == 1  # the same file is remembered once, whatever its spelling
+
+    found = manager.discover_models()["items"]
+    assert all("\\" not in item["path"] for item in found)
+    loaded = [item for item in found if item["loaded"]]
+    assert [item["path"] for item in loaded] == [model.resolve().as_posix()]
+    assert loaded[0]["source"] == "recent"
 
 
 def test_models_endpoint(tmp_path):

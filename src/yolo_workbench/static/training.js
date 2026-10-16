@@ -76,7 +76,7 @@ function duration(seconds) {
 // a resumed or fine-tuned run's model is a weights path; the file name and its run folder say enough
 const modelName = model => {
   if (!model) return "?";
-  const parts = String(model).split("/");
+  const parts = String(model).split(/[\\/]/);
   return parts.length > 2 && parts[parts.length - 2] === "weights" ? `${parts[parts.length - 3]}/${parts[parts.length - 1]}` : parts[parts.length - 1];
 };
 
@@ -499,6 +499,7 @@ function renderActions() {
   }
   if (run.resumable) buttons.push(`<button class="primary-btn" data-resume>Resume</button>`);
   if (run.status === "queued") buttons.push(`<button class="secondary" data-cancel>Remove from queue</button>`);
+  if (run.has_weights?.best) buttons.push(`<button class="secondary" data-download-best title="Download ${run.active ? "the best weights so far" : "the best weights"} (best.pt), named dataset-run-imgsz-model-date.pt">Download best.pt</button>`);
   if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-use-model title="Load this run's ${run.has_weights.best ? "best" : "last"}.pt as the prediction model in the Annotation tab">Use for labeling</button>`);
   buttons.push(`<button class="secondary" data-duplicate title="Start a new run with the same arguments">Duplicate</button>`);
   buttons.push(`<button class="icon-btn" data-edit-run title="Rename / notes" aria-label="Rename or add notes"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>`);
@@ -532,6 +533,12 @@ async function onDetailClick(e) {
       await loadRuns();
     } else if (e.target.closest("[data-edit-run]")) {
       openEditDialog();
+    } else if (e.target.closest("[data-download-best]")) {
+      // the server names the file (Content-Disposition); a link keeps the browser's own download progress
+      const link = document.createElement("a");
+      link.href = apiUrl(`/training/runs/${encodeURIComponent(id)}/weights/best`);
+      link.download = "";
+      link.click();
     } else if (e.target.closest("[data-use-model]")) {
       const kind = detail.has_weights.best ? "best" : "last";
       await deps.useModel(`${detail.path}/weights/${kind}.pt`);
