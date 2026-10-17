@@ -48,7 +48,7 @@ from .frameworks import (  # noqa: F401  (re-exported: the Ultralytics argument 
     validate_args,
 )
 from .fsutil import WINDOWS, replace
-from .jobs import JobManager
+from .jobs import Job, JobCancelled, JobManager
 
 META_DIR = "workbench"
 ACTIVE_STATES = {"starting", "preparing", "training", "validating", "testing"}
@@ -58,6 +58,7 @@ PLOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 LOG_TAIL = 64 * 1024
 SCAN_DEPTH = 3
 KILL_GRACE = 30.0  # the runner may first finish a checkpoint write; then it and its workers are killed
+EXPORT_POLL = 0.5
 
 
 @dataclass
@@ -184,8 +185,18 @@ def kill_process_tree(pid: int) -> None:
 
 
 def launch_subprocess(spec_path: Path, run_dir: Path, cwd: Path) -> SubprocessHandle:
+    return _spawn("yolo_workbench.train_runner", spec_path, spec_path.parent / "train.log", cwd)
+
+
+def launch_export(spec_path: Path, log_path: Path, cwd: Path) -> SubprocessHandle:
+    """The ONNX exporter (export_runner.py); its log is rewritten by every export."""
+    log_path.unlink(missing_ok=True)
+    return _spawn("yolo_workbench.export_runner", spec_path, log_path, cwd)
+
+
+def _spawn(module: str, spec_path: Path, log_path: Path, cwd: Path) -> SubprocessHandle:
     cwd.mkdir(parents=True, exist_ok=True)
-    log = (spec_path.parent / "train.log").open("ab")
+    log = log_path.open("ab")
     if WINDOWS:
         # no sessions on Windows: a new process group with its own hidden console keeps the run out of
         # the server console's Ctrl+C and close events, and its dataloader workers open no windows
@@ -194,7 +205,7 @@ def launch_subprocess(spec_path: Path, run_dir: Path, cwd: Path) -> SubprocessHa
         detach = {"start_new_session": True}
     try:
         process = subprocess.Popen(
-            [sys.executable, "-m", "yolo_workbench.train_runner", str(spec_path)],
+            [sys.executable, "-m", module, str(spec_path)],
             cwd=cwd,  # Ultralytics downloads weights (and its AMP-check model) into the cwd
             stdin=subprocess.DEVNULL,
             stdout=log,
@@ -238,11 +249,13 @@ def _process_alive(info: dict | None) -> bool:
 
 
 class TrainingManager:
-    def __init__(self, state_dir: Path, resolve: Callable[[str | None], TrainingTarget], jobs: JobManager | None = None, launcher=None, weights_dir: Path | None = None):
+    def __init__(self, state_dir: Path, resolve: Callable[[str | None], TrainingTarget], jobs: JobManager | None = None, launcher=None, weights_dir: Path | None = None, exporter=None):
         self.state_dir = state_dir
         self.resolve = resolve
         self.jobs = jobs or JobManager()
         self.launcher = launcher or launch_subprocess
+        self.exporter = exporter or launch_export
+        self._exports: dict[Path, str] = {}  # run dir -> its latest ONNX export job
         self.weights_dir = weights_dir or Path.home() / ".cache" / "yolo-workbench" / "weights"
         self._lock = threading.RLock()
         self._handle = None  # process handle of a run this server launched (None after a restart)
@@ -344,6 +357,8 @@ class TrainingManager:
                 return "a training run is in progress"
             if any(entry.get("project") == project for entry in self._queue["queue"]):
                 return "it has queued training runs"
+        if self.jobs.running(project, "export"):
+            return "an ONNX export is running"
         return None
 
     # ---------- lifecycle ----------
@@ -366,7 +381,7 @@ class TrainingManager:
                     self._queue["queue"].pop(0)  # the run folder was deleted by hand
                     self._save_queue()
                     continue
-                if self.jobs.running(entry.get("project")):
+                if self.jobs.running(entry.get("project"), "import"):
                     self._write_state(run_dir, status="queued", waiting="an import into this dataset is running")
                     break
                 self._launch(entry, target, run_dir)
@@ -693,6 +708,7 @@ class TrainingManager:
             "resumable": self._resumable(framework, source, status, state, run_dir, rows, active, position),
             "weights": {kind: path.as_posix() for kind, path in weights.items()},
             "has_weights": {kind: kind in weights for kind in ("best", "last")},
+            "onnx": self._onnx_info(run_dir, weights.get("best")),
             "dataset": meta.get("dataset"),
         }
 
@@ -783,8 +799,9 @@ class TrainingManager:
             raise KeyError("File not found")
         return path
 
-    def best_weights(self, project: str | None, run_id: str) -> tuple[Path, str]:
-        """The best weights and their download name: <dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD written>.pt (.pth for RF-DETR)."""
+    def best_weights(self, project: str | None, run_id: str, onnx: bool = False) -> tuple[Path, str]:
+        """The best weights (or their ONNX export) and the download name:
+        <dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD best weights written>.pt (.pth for RF-DETR, .onnx)."""
         target = self.resolve(project)
         with self._lock:
             run_dir = self._require_run(target, run_id)
@@ -794,12 +811,94 @@ class TrainingManager:
             written = path.stat().st_mtime
         except OSError:
             raise KeyError("This run has no best weights") from None
+        if onnx:
+            if not summary["onnx"]["available"]:
+                raise KeyError("This run's best weights have not been exported to ONNX")
+            path = path.with_suffix(".onnx")
         imgsz = summary["imgsz"]
         if isinstance(imgsz, (list, tuple)):
             imgsz = "x".join(str(side) for side in imgsz)
         parts = [target.name, summary["name"], imgsz, _model_label(summary["model"]), time.strftime("%Y.%m.%d", time.localtime(written))]
         parts = [_filename_part(part) for part in parts if part not in (None, "")]
         return path, "-".join(part for part in parts if part) + path.suffix
+
+    # ---------- ONNX export ----------
+
+    def _export_job(self, run_dir: Path) -> dict | None:
+        job_id = self._exports.get(run_dir)
+        if job_id is None:
+            return None
+        try:
+            return self.jobs.get(job_id)
+        except KeyError:  # pruned from the job list
+            return None
+
+    def _onnx_info(self, run_dir: Path, best: Path | None) -> dict | None:
+        """The ONNX export next to the best weights (best.onnx, checkpoint_best_total.onnx); stale once the best
+        weights changed after it (a run still training, a resume). Carries a running or failed export job."""
+        if best is None:
+            return None
+        job = self._export_job(run_dir)
+        output = best.with_suffix(".onnx")
+        info = {"available": False, "file": output.name, "job": job if job and job["state"] in ("running", "failed") else None}
+        try:
+            stat, weights = output.stat(), best.stat()
+        except OSError:
+            return info
+        record = _read_json(run_dir / META_DIR / "export.json") or {}
+        if record.get("output") != output.name or not record.get("weights_mtime_ns"):
+            record = {}  # exported outside the workbench: compare the files' times
+        stale = record["weights_mtime_ns"] != weights.st_mtime_ns if record else stat.st_mtime_ns < weights.st_mtime_ns
+        return {**info, "available": True, "bytes": stat.st_size, "exported": stat.st_mtime, "stale": stale, "options": record.get("options")}
+
+    def export_onnx(self, project: str | None, run_id: str, imgsz=None, dynamic: bool = False, simplify: bool = True, nms: bool = False) -> dict:
+        """Export the run's best weights to ONNX next to them: a background job running export_runner.py.
+
+        Ultralytics takes the input size (default: the run's imgsz), a dynamic batch and image size, onnxslim
+        simplification, and NMS inside the graph (not for classification). RF-DETR exports at its trained
+        resolution, and `dynamic` makes only its batch dynamic."""
+        target = self.resolve(project)
+        with self._lock:
+            run_dir = self._require_run(target, run_id)
+            summary = self._summary(target, run_dir)
+            if not summary["weights"].get("best"):
+                raise DatasetError("This run has no best weights to export yet")
+            previous = self._export_job(run_dir)
+            if previous and previous["state"] == "running":
+                raise DatasetError("This run's best weights are already being exported")
+            framework = frameworks.get(summary["framework"])
+            best = Path(summary["weights"]["best"])
+            if framework is frameworks.RFDETR:
+                options = {"dynamic": bool(dynamic)}
+            else:
+                options = {"imgsz": _export_imgsz(imgsz or summary["imgsz"]), "dynamic": bool(dynamic), "simplify": bool(simplify), "nms": bool(nms) and target.category != "classification"}
+            workdir = run_dir / META_DIR
+            workdir.mkdir(exist_ok=True)
+            output = best.with_suffix(".onnx")
+            spec_path = workdir / "export-spec.json"
+            scratch = workdir / "export-tmp"
+            _write_json(spec_path, {"framework": framework.id, "weights": best.as_posix(), "output": output.as_posix(), "scratch": scratch.as_posix(), **options})
+
+            def work(job: Job) -> dict:
+                written = best.stat().st_mtime_ns  # before the runner copies it: weights rewritten meanwhile leave the export stale
+                log = workdir / "export.log"
+                handle = self.exporter(spec_path, log, workdir)
+                try:
+                    while handle.poll() is None:
+                        job.progress(message=_last_line(log))
+                        time.sleep(EXPORT_POLL)
+                except JobCancelled:
+                    handle.kill()
+                    shutil.rmtree(scratch, ignore_errors=True)
+                    raise
+                if handle.poll() != 0 or not output.is_file():
+                    raise DatasetError(f"ONNX export failed: {_last_line(log, error=True) or f'the exporter exited with code {handle.poll()}'}")
+                _write_json(workdir / "export.json", {"version": 1, "output": output.name, "weights_mtime_ns": written, "options": options, "exported": time.time()})
+                return {"path": output.as_posix(), "bytes": output.stat().st_size}
+
+            job = self.jobs.start("export", project, f"Export '{summary['name']}' to ONNX", work)
+            self._exports[run_dir] = job["id"]
+        return job
 
     def update_run(self, project: str | None, run_id: str, name: str | None = None, notes: str | None = None) -> dict:
         target = self.resolve(project)
@@ -828,6 +927,8 @@ class TrainingManager:
                 raise DatasetError("This run is in progress; stop it before deleting it")
             if self._queue_position(target, run_dir) is not None:
                 raise DatasetError("This run is queued; remove it from the queue before deleting it")
+            if (self._export_job(run_dir) or {}).get("state") == "running":
+                raise DatasetError("This run's best weights are being exported to ONNX; wait for the export or cancel it first")
             user = self._started_from(run_dir)
             if user:
                 raise DatasetError(f"Run '{user}' starts from this run's weights; delete this run once '{user}' has finished or left the queue")
@@ -1085,6 +1186,31 @@ def _ultralytics_label_path(image_path: str) -> str:
     """Ultralytics' img2label_paths for one image (the last /images/ becomes /labels/)."""
     marker, replacement = f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}"
     return replacement.join(image_path.rsplit(marker, 1)).rsplit(".", 1)[0] + ".txt"
+
+
+def _export_imgsz(imgsz):
+    """An export input size: one side, or [height, width]; None leaves Ultralytics' choice (the model's)."""
+    if isinstance(imgsz, (list, tuple)):
+        imgsz = list(imgsz)[:2]
+        imgsz = imgsz[0] if len(imgsz) == 1 else imgsz
+    sides = imgsz if isinstance(imgsz, list) else [imgsz]
+    if imgsz is not None and not all(isinstance(side, int) and not isinstance(side, bool) and 32 <= side <= 8192 for side in sides):
+        raise DatasetError("The export image size must be whole pixels between 32 and 8192")
+    return imgsz
+
+
+def _last_line(log: Path, error: bool = False) -> str:
+    """A log's last line (export progress), or with `error` the line that says why it failed: Ultralytics'
+    `export failure` line or a traceback's last line."""
+    try:
+        with log.open("rb") as stream:
+            stream.seek(max(log.stat().st_size - LOG_TAIL, 0))
+            lines = [line.strip() for line in collapse_progress(stream.read().decode("utf-8", "replace")).splitlines() if line.strip()]
+    except OSError:
+        return ""
+    if error:
+        lines = [line for line in lines if "export failure" in line or re.match(r"[\w.]*(Error|Exception)\b", line)] or lines
+    return lines[-1][:300] if lines else ""
 
 
 def _tree_size(directory: Path) -> int:

@@ -22,6 +22,7 @@ const LIST_POLL = 3000;       // runs list while something is active or queued
 const IDLE_LIST_POLL = 15000;
 const QUEUE_POLL = 5000;      // header chip / lock, any tab
 const LOG_POLL = 2000;
+const EXPORT_POLL = 1000;     // a running ONNX export of the selected run
 
 const ACTIVE = new Set(["starting", "preparing", "training", "validating", "testing"]);
 const STATUS_LABEL = {
@@ -54,6 +55,7 @@ let listTimer = null;
 let liveTimer = null;
 let logTimer = null;
 let queueTimer = null;
+let exportTimer = null;
 let lastLock = undefined;
 let selectToken = 0;
 let formOpen = false;     // the new-run form owns the detail pane
@@ -118,6 +120,11 @@ export function bindTraining() {
   $("queue-panel").addEventListener("click", onQueueClick);
   // the submit event fires synchronously with the click (the dialog's close event is queued as a task)
   $("run-edit-dialog").querySelector("form").addEventListener("submit", e => { if (e.submitter?.value === "save") saveEdit(); });
+  $("run-export-dialog").querySelector("form").addEventListener("submit", e => {
+    if (e.submitter?.value !== "export") return;
+    if (!exportOptions()) { e.preventDefault(); $("run-export-imgsz").focus(); return; }
+    startExport();
+  });
   $("run-detail").addEventListener("click", onDetailClick);
   $("training-chip").onclick = openActiveRun;
   $("training-lock-banner").addEventListener("click", e => { if (e.target.closest("[data-open-active]")) openActiveRun(); });
@@ -298,6 +305,101 @@ async function saveEdit() {
   }
 }
 
+// ---------- ONNX export of the best weights ----------
+
+function onnxButtons(run) {
+  if (!run.onnx) return [];
+  const { job, available, stale } = run.onnx;
+  if (job?.state === "running") {
+    return [`<button class="secondary" data-export-cancel title="${esc(job.message || "Starting the exporter…")}
+Click to cancel"><span class="live-dot" aria-hidden="true"></span> Exporting ONNX…</button>`];
+  }
+  const buttons = [`<button class="secondary" data-export-onnx title="Export ${run.active ? "the best weights so far" : "the best weights"} to ONNX (${esc(run.onnx.file)}, next to them)">${available ? "Re-export ONNX…" : "Export ONNX…"}</button>`];
+  if (available) {
+    const facts = [formatBytes(run.onnx.bytes), `exported ${new Date(run.onnx.exported * 1000).toLocaleString()}`, onnxOptionsText(run.onnx.options)].filter(Boolean).join(" · ");
+    const note = stale ? `
+The best weights changed after this export; export again for the current ones.` : "";
+    buttons.unshift(`<button class="secondary" data-download-onnx title="Download ${esc(run.onnx.file)} (${esc(facts)}), named dataset-run-imgsz-model-date.onnx${note}">Download ONNX${stale ? " (outdated)" : ""}</button>`);
+  }
+  return buttons;
+}
+
+function onnxOptionsText(options) {
+  if (!options) return "";
+  const imgsz = Array.isArray(options.imgsz) ? options.imgsz.join("×") : options.imgsz;
+  return [imgsz && `imgsz ${imgsz}`, options.dynamic && "dynamic", options.simplify && "simplified", options.nms && "with NMS"].filter(Boolean).join(", ");
+}
+
+function openExportDialog() {
+  const run = detail;
+  const rfdetr = isRfdetr(run);
+  const previous = run.onnx?.options || {};
+  $("run-export-intro").innerHTML = `Writes <code>${esc(run.onnx.file)}</code> next to ${run.active ? "the best weights so far" : "the best weights"}${rfdetr && run.imgsz ? `, at the resolution the model was trained at (${esc(run.imgsz)} px)` : ""}.`;
+  $("run-export-ultralytics").hidden = rfdetr;
+  $("run-export-nms-row").hidden = category === "classification";
+  $("run-export-dynamic-label").textContent = rfdetr ? "Dynamic batch size" : "Dynamic batch and image size";
+  const imgsz = previous.imgsz ?? run.imgsz;
+  $("run-export-imgsz").value = Array.isArray(imgsz) ? imgsz.join(",") : imgsz ?? "";
+  $("run-export-simplify").checked = previous.simplify ?? true;
+  $("run-export-nms").checked = previous.nms ?? false;
+  $("run-export-dynamic").checked = previous.dynamic ?? false;
+  $("run-export-imgsz").setCustomValidity("");
+  $("run-export-dialog").showModal();
+}
+
+// the dialog's values as the export request, or null when the image size is not one or two whole numbers
+function exportOptions() {
+  const options = { dynamic: $("run-export-dynamic").checked };
+  if (isRfdetr(detail)) return options;
+  const text = $("run-export-imgsz").value.trim();
+  const sides = text ? text.split(/[\s,x×]+/).filter(Boolean).map(Number) : [];
+  const valid = sides.length <= 2 && sides.every(side => Number.isInteger(side) && side >= 32 && side <= 8192);
+  $("run-export-imgsz").setCustomValidity(valid ? "" : "One size, or height,width: whole pixels from 32 to 8192");
+  $("run-export-imgsz").reportValidity();
+  if (!valid) return null;
+  return { ...options, imgsz: sides.length ? (sides.length === 1 ? sides[0] : sides) : null, simplify: $("run-export-simplify").checked, nms: $("run-export-nms").checked && category !== "classification" };
+}
+
+async function startExport() {
+  if (!detail) return;
+  const id = detail.id;
+  try {
+    const job = await api(`/training/runs/${encodeURIComponent(id)}/export/onnx`, { method: "POST", body: JSON.stringify(exportOptions()) });
+    if (detail?.id !== id) return;
+    detail.onnx = { ...detail.onnx, job };
+    renderActions();
+    renderAlerts();
+    pollExport(id, job.id);
+  } catch (error) {
+    deps.toast(error.message, "error");
+  }
+}
+
+async function pollExport(runId, jobId) {
+  clearTimeout(exportTimer);
+  let job;
+  try {
+    job = await api(`/api/v1/jobs/${encodeURIComponent(jobId)}`);
+  } catch (error) {
+    return;  // the server restarted: the run's summary no longer lists the job
+  }
+  if (job.state === "running") {
+    if (detail?.id === runId && detail.onnx) { detail.onnx.job = job; renderActions(); }
+    exportTimer = setTimeout(() => pollExport(runId, jobId), EXPORT_POLL);
+    return;
+  }
+  if (job.state === "done") deps.toast(`Exported to ONNX (${formatBytes(job.result.bytes)})`);
+  else if (job.state === "failed") deps.toast(job.error, "error");
+  if (detail?.id !== runId) return;
+  try {
+    const data = await api(`/training/runs/${encodeURIComponent(runId)}`);
+    if (detail?.id !== runId) return;
+    detail.onnx = data.onnx;
+    renderActions();
+    renderAlerts();
+  } catch (error) { /* the next reload shows it */ }
+}
+
 function renderNoRun() {
   destroyCharts();
   detail = null;
@@ -468,6 +570,7 @@ function renderDetailSkeleton() {
   renderActions();
   renderResults();
   renderPlots();
+  if (run.onnx?.job?.state === "running") pollExport(run.id, run.onnx.job.id);
 }
 
 const argValue = value => value === null || value === undefined ? "null" : typeof value === "object" ? JSON.stringify(value) : String(value);
@@ -506,6 +609,7 @@ function renderActions() {
   const weightsFile = kind => run.weights?.[kind]?.split("/").pop() ?? `${kind}.pt`;
   const extension = isRfdetr(run) ? "pth" : "pt";
   if (run.has_weights?.best) buttons.push(`<button class="secondary" data-download-best title="Download ${run.active ? "the best weights so far" : "the best weights"} (${esc(weightsFile("best"))}), named dataset-run-imgsz-model-date.${extension}">Download ${esc(bestName(run))}</button>`);
+  buttons.push(...onnxButtons(run));
   if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-use-model title="Load this run's ${esc(weightsFile(run.has_weights.best ? "best" : "last"))} as the prediction model in the Annotation tab">Use for labeling</button>`);
   buttons.push(`<button class="secondary" data-duplicate title="Start a new run with the same arguments">Duplicate</button>`);
   buttons.push(`<button class="icon-btn" data-edit-run title="Rename / notes" aria-label="Rename or add notes"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>`);
@@ -555,6 +659,16 @@ async function onDetailClick(e) {
       link.href = apiUrl(`/training/runs/${encodeURIComponent(id)}/weights/best`);
       link.download = "";
       link.click();
+    } else if (e.target.closest("[data-download-onnx]")) {
+      const link = document.createElement("a");
+      link.href = apiUrl(`/training/runs/${encodeURIComponent(id)}/weights/onnx`);
+      link.download = "";
+      link.click();
+    } else if (e.target.closest("[data-export-onnx]")) {
+      openExportDialog();
+    } else if (e.target.closest("[data-export-cancel]")) {
+      if (!confirm("Cancel the ONNX export?")) return;
+      await api(`/api/v1/jobs/${encodeURIComponent(detail.onnx.job.id)}/cancel`, { method: "POST" });
     } else if (e.target.closest("[data-use-model]")) {
       await deps.useModel(detail.weights.best ?? detail.weights.last);
     } else if (e.target.closest("[data-duplicate]")) {
@@ -640,6 +754,7 @@ function renderAlerts() {
   const notes = [];
   if (detail.error && ["failed", "interrupted", "stopped"].includes(detail.status)) notes.push(`<div class="banner run-error"><strong>${esc(STATUS_LABEL[detail.status])}:</strong> ${esc(detail.error)}${detail.resumable ? " — it can be resumed from the last completed epoch." : ""}</div>`);
   if (detail.test_error) notes.push(`<div class="banner">Test evaluation failed: ${esc(detail.test_error)}</div>`);
+  if (detail.onnx?.job?.state === "failed") notes.push(`<div class="banner run-error">${esc(detail.onnx.job.error)} <span class="muted">(log: <code>${esc(detail.path)}/workbench/export.log</code>)</span></div>`);
   if (detail.waiting) notes.push(`<div class="banner">Waiting: ${esc(detail.waiting)}</div>`);
   if (detail.status === "queued") notes.push(`<div class="banner">Queued as #${esc(detail.queue_position)}; it starts when the runs ahead of it finish.</div>`);
   $("run-alerts").innerHTML = notes.join("");

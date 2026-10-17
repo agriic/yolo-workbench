@@ -275,6 +275,21 @@
     </form>
   </dialog>
 
+  <dialog id="run-export-dialog" class="modal">
+    <form method="dialog">
+      <h2>Export best weights to ONNX</h2>
+      <p class="modal-text muted" id="run-export-intro"></p>
+      <div id="run-export-ultralytics">
+        <label class="field">Image size<input id="run-export-imgsz" type="text" inputmode="numeric" placeholder="640, or height,width"><span class="field-hint">The model's fixed input size, unless the shape is dynamic</span></label>
+        <label class="toggle"><input type="checkbox" id="run-export-simplify" checked><span>Simplify the graph (onnxslim)</span></label>
+        <label class="toggle" id="run-export-nms-row"><input type="checkbox" id="run-export-nms"><span>Include NMS: outputs final boxes</span></label>
+      </div>
+      <label class="toggle"><input type="checkbox" id="run-export-dynamic"><span id="run-export-dynamic-label">Dynamic batch and image size</span></label>
+      <p class="modal-text muted">Runs on the CPU and takes from seconds to a few minutes. An earlier export of this run is replaced.</p>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button value="export" class="primary-btn">Export</button></div>
+    </form>
+  </dialog>
+
   <dialog id="plot-dialog" class="modal plot-dialog">
     <div class="plot-dialog-head">
       <strong id="plot-dialog-title"></strong>

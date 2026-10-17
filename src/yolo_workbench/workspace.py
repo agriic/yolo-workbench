@@ -344,7 +344,7 @@ class Workspace:
         return DatasetSession.open(dataset, slug=slug)
 
     def busy_reason(self, session: DatasetSession) -> str | None:
-        if self.jobs.running(session.slug):
+        if self.jobs.running(session.slug, "import"):
             return "an import is running"
         return session.busy_reason()
 

@@ -591,6 +591,124 @@ def test_best_weights_download_api(tmp_path):
     asyncio.run(check())
 
 
+class FakeExporter:
+    """Stands in for export_runner.py: writes the .onnx (or a failing log) and 'exits' at once."""
+
+    def __init__(self, code=0, log="", on_poll=None):
+        self.code, self.log, self.on_poll = code, log, on_poll
+        self.specs: list[dict] = []
+        self.handle = FakeHandle()
+
+    def __call__(self, spec_path: Path, log_path: Path, cwd: Path):
+        spec = json.loads(spec_path.read_text())
+        self.specs.append(spec)
+        log_path.write_text(self.log, encoding="utf-8")
+        if self.code == 0:
+            Path(spec["output"]).write_bytes(b"onnx")
+        self.handle.code = None if self.on_poll else self.code
+        if self.on_poll:
+            self.handle.poll = self.on_poll
+        return self.handle
+
+
+def make_export_manager(dataset, tmp_path, exporter):
+    launcher = FakeLauncher()
+    manager = TrainingManager.for_dataset(dataset, jobs=JobManager(synchronous=True), launcher=launcher, weights_dir=tmp_path / "weights", exporter=exporter)
+    manager.attach(dataset)
+    return manager, launcher
+
+
+def test_onnx_export(tmp_path, monkeypatch):
+    monkeypatch.setattr("yolo_workbench.training.EXPORT_POLL", 0)
+    dataset = make_dataset(tmp_path)
+    exporter = FakeExporter()
+    manager, launcher = make_export_manager(dataset, tmp_path, exporter)
+    run = manager.enqueue(None, dataset, "baseline", "", ARGS)["run"]
+    assert run["onnx"] is None
+    with pytest.raises(DatasetError, match="no best weights"):
+        manager.export_onnx(None, run["id"])
+    runner_finishes(Path(run["path"]))
+    launcher.handle.code = 0
+    best = Path(run["path"]) / "weights" / "best.pt"
+    written = time.mktime((2026, 3, 4, 12, 0, 0, 0, 0, -1))
+    os.utime(best, (written, written))
+    summary = manager.run_detail(None, run["id"])
+    assert summary["onnx"] == {"available": False, "file": "best.onnx", "job": None}
+    with pytest.raises(KeyError, match="not been exported"):
+        manager.best_weights(None, run["id"], onnx=True)
+
+    job = manager.export_onnx(None, run["id"], dynamic=True, nms=True)
+    assert job["state"] == "done" and job["kind"] == "export" and job["result"]["bytes"] == 4
+    assert exporter.specs[-1] == {
+        "framework": "ultralytics", "weights": best.as_posix(), "output": best.with_suffix(".onnx").as_posix(),
+        "scratch": (Path(run["path"]) / "workbench" / "export-tmp").as_posix(), "imgsz": 64, "dynamic": True, "simplify": True, "nms": True,
+    }
+    onnx = manager.run_detail(None, run["id"])["onnx"]
+    assert onnx["available"] and not onnx["stale"] and onnx["bytes"] == 4 and onnx["job"] is None
+    assert onnx["options"] == {"imgsz": 64, "dynamic": True, "simplify": True, "nms": True}
+    assert manager.best_weights(None, run["id"], onnx=True) == (best.with_suffix(".onnx"), "ds-baseline-64-yolo11n-2026.03.04.onnx")
+
+    # newer best weights (a resume) leave the export outdated until it runs again
+    os.utime(best, (written + 60, written + 60))
+    assert manager.run_detail(None, run["id"])["onnx"]["stale"]
+    manager.export_onnx(None, run["id"], imgsz=[96, 128], simplify=False)
+    assert exporter.specs[-1]["imgsz"] == [96, 128] and not exporter.specs[-1]["simplify"]
+    assert not manager.run_detail(None, run["id"])["onnx"]["stale"]
+    with pytest.raises(DatasetError, match="between 32 and 8192"):
+        manager.export_onnx(None, run["id"], imgsz=16)
+
+
+def test_onnx_export_failure_and_cancel(tmp_path, monkeypatch):
+    monkeypatch.setattr("yolo_workbench.training.EXPORT_POLL", 0)
+    dataset = make_dataset(tmp_path)
+    log = "Traceback (most recent call last):\n  File \"x.py\", line 1\nValueError: unsupported op\nsome cleanup output\n"
+    exporter = FakeExporter(code=1, log=log)
+    manager, launcher = make_export_manager(dataset, tmp_path, exporter)
+    run = manager.enqueue(None, dataset, "baseline", "", ARGS)["run"]
+    runner_finishes(Path(run["path"]))
+    launcher.handle.code = 0
+    job = manager.export_onnx(None, run["id"])
+    assert job["state"] == "failed" and job["error"] == "ONNX export failed: ValueError: unsupported op"
+    onnx = manager.run_detail(None, run["id"])["onnx"]
+    assert not onnx["available"] and onnx["job"]["id"] == job["id"]
+
+    # a cancel kills the exporter and leaves no file behind
+    def cancel_on_poll():
+        manager.jobs.cancel(manager.jobs.running(None, "export")[0]["id"])
+        return None
+
+    exporter.on_poll = cancel_on_poll
+    job = manager.export_onnx(None, run["id"])
+    assert job["state"] == "cancelled" and exporter.handle.calls == ["kill"]
+    assert not Path(run["path"], "weights", "best.onnx").exists()
+    assert manager.run_detail(None, run["id"])["onnx"]["job"] is None  # a cancelled export is no news
+
+
+def test_onnx_export_api(tmp_path, monkeypatch):
+    monkeypatch.setattr("yolo_workbench.training.EXPORT_POLL", 0)
+    dataset = make_dataset(tmp_path)
+    manager, launcher = make_export_manager(dataset, tmp_path, FakeExporter())
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media"), training=manager, jobs=manager.jobs)
+    run = manager.enqueue(None, dataset, "baseline", "", ARGS)["run"]
+    runner_finishes(Path(run["path"]))
+    launcher.handle.code = 0
+
+    async def check():
+        async with client_for(app) as client:
+            url = f"/api/v1/training/runs/{run['id']}"
+            assert (await client.get(f"{url}/weights/onnx")).status_code == 404
+            assert (await client.post(f"{url}/export/onnx", json={"imgsz": 8})).status_code == 400
+            response = await client.post(f"{url}/export/onnx", json={"dynamic": True})
+            assert response.status_code == 200 and response.json()["state"] == "done"
+            assert (await client.get(f"/api/v1/jobs/{response.json()['id']}")).json()["kind"] == "export"
+            response = await client.get(f"{url}/weights/onnx")
+            assert response.status_code == 200 and response.content == b"onnx"
+            assert response.headers["content-disposition"] == f'attachment; filename="ds-baseline-64-yolo11n-{time.strftime("%Y.%m.%d")}.onnx"'
+            assert (await client.post("/api/v1/training/runs/nope/export/onnx", json={})).status_code == 404
+
+    asyncio.run(check())
+
+
 def test_options_list_pretrained_models_and_previous_weights(tmp_path, monkeypatch):
     dataset = make_dataset(tmp_path)
     launcher = FakeLauncher()

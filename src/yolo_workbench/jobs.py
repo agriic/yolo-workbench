@@ -129,7 +129,7 @@ class JobManager:
         job._cancel.set()
         return job.payload()
 
-    def running(self, project: str | None) -> list[dict]:
+    def running(self, project: str | None, kind: str | None = None) -> list[dict]:
         with self._lock:
-            jobs = [job for job in self._jobs.values() if job.state == "running" and job.project == project]
+            jobs = [job for job in self._jobs.values() if job.state == "running" and job.project == project and kind in (None, job.kind)]
         return [job.payload() for job in jobs]

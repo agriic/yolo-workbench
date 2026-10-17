@@ -222,6 +222,13 @@ class TrainingStopPayload(BaseModel):
     mode: Literal["pause", "finish", "kill"]
 
 
+class TrainingExportPayload(BaseModel):
+    imgsz: int | list[int] | None = None  # None: the run's imgsz
+    dynamic: bool = False
+    simplify: bool = True
+    nms: bool = False
+
+
 class TrainingReorderPayload(BaseModel):
     order: list[str]
 
@@ -484,7 +491,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         dataset.check_writable()
         source = importer.resolve_source(dataset, payload.path, payload.staging_id)
         importer.crop_options(payload.crop.model_dump() if payload.crop else None)  # reject a bad crop before the job starts
-        if jobs.running(session.slug):
+        if jobs.running(session.slug, "import"):
             raise DatasetError("Another import is still running")
         options = payload.model_dump()
 
@@ -690,6 +697,15 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def training_best_weights(run_id: str, session: DatasetSession = current):
         path, filename = found(lambda: training.best_weights(session.slug, run_id))
         return FileResponse(path, media_type="application/octet-stream", filename=filename, headers={"Cache-Control": "no-cache"})
+
+    @router.get("/training/runs/{run_id}/weights/onnx")
+    def training_onnx_weights(run_id: str, session: DatasetSession = current):
+        path, filename = found(lambda: training.best_weights(session.slug, run_id, onnx=True))
+        return FileResponse(path, media_type="application/octet-stream", filename=filename, headers={"Cache-Control": "no-cache"})
+
+    @router.post("/training/runs/{run_id}/export/onnx")
+    def training_export_onnx(run_id: str, payload: TrainingExportPayload, session: DatasetSession = current):
+        return found(lambda: training.export_onnx(session.slug, run_id, payload.imgsz, payload.dynamic, payload.simplify, payload.nms))
 
     @router.post("/training/runs/{run_id}/stop")
     def training_stop(run_id: str, payload: TrainingStopPayload, session: DatasetSession = current):
