@@ -45,39 +45,55 @@
     <section id="annotation" class="view active">
       <div class="filters annotation-toolbar">
         <div class="toolbar-group filter-controls">
-          <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
-          <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
-          <label class="field" title="Review status of the images">Review<select id="image-review"><option value="">All</option><option value="unreviewed">Unreviewed</option><option value="needs_work">Needs work</option><option value="done">Done</option></select></label>
-          <label class="field" title="Images with validation issues (see the Validation tab)">Issues<select id="image-issues"><option value="">All</option></select></label>
-          <div class="field" id="label-count-field" title="Number of labels per image (of the selected class, if one is chosen)">Labels<div class="count-range">
-            <input id="label-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum labels">
-            <span aria-hidden="true">–</span>
-            <input id="label-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum labels">
-          </div></div>
-          <label class="field grow">Search<input id="image-search" type="search" placeholder="Filter by filename…"></label>
-          <label class="toggle" id="overlay-toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
-          <label class="toggle" id="prediction-filter-toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
-          <button id="start-review" class="secondary" type="button" title="Open the first unreviewed image of this list in the editor (then D = done, W = needs work)">Review</button>
-        </div>
-        <div class="toolbar-group prediction-controls" id="assist-bar">
-          <label class="field model-field grow">Model<div class="model-picker">
-            <input id="model-path" type="text" placeholder="Model path…" spellcheck="false" autocomplete="off">
-            <button id="model-browse" class="model-browse" type="button" title="Show models found near the dataset" aria-label="Show discovered models">▾</button>
-            <div id="model-menu" class="model-menu" hidden></div>
-          </div></label>
-          <button id="load-model" class="secondary" title="Load prediction model">Load</button>
-          <details id="mapping-panel" class="mapping-panel" hidden>
-            <summary title="Prediction settings">Options</summary>
-            <div class="prediction-options">
-              <label class="toggle" id="predict-unlabeled-wrap" hidden title="Skip images that already have annotations"><input type="checkbox" id="predict-unlabeled" checked><span>Only unlabeled</span></label>
-              <div class="prediction-options-title">Class mapping</div>
-              <div id="mapping-list" class="mapping-list"></div>
+          <div class="toolbar-popover-anchor" id="image-options-anchor">
+            <button id="image-options-toggle" class="secondary" type="button" aria-expanded="false" aria-controls="image-options" title="Filter the images and run the prediction model">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 5h18l-7 8.5V19l-4 2v-7.5Z"/></svg>
+              <span>Filters<span class="assist-label"> &amp; prediction</span></span><span id="image-filter-count" class="badge filter-count"></span>
+            </button>
+            <div id="image-options" class="toolbar-popover" role="dialog" aria-label="Image filters and prediction" hidden>
+              <section class="popover-section">
+                <div class="popover-title">Filters <button id="image-filters-reset" class="link-btn" type="button" title="Show all images">Reset</button></div>
+                <div class="popover-fields">
+                  <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
+                  <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
+                  <label class="field" title="Review status of the images">Review<select id="image-review"><option value="">All</option><option value="unreviewed">Unreviewed</option><option value="needs_work">Needs work</option><option value="done">Done</option></select></label>
+                  <label class="field" title="Images with validation issues (see the Validation tab)">Issues<select id="image-issues"><option value="">All</option></select></label>
+                  <div class="field" id="label-count-field" title="Number of labels per image (of the selected class, if one is chosen)">Labels<div class="count-range">
+                    <input id="label-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum labels">
+                    <span aria-hidden="true">–</span>
+                    <input id="label-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum labels">
+                  </div></div>
+                  <label class="toggle" id="prediction-filter-toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
+                </div>
+              </section>
+              <section class="popover-section" id="assist-bar">
+                <div class="popover-title">Prediction</div>
+                <div class="model-row">
+                  <label class="field model-field">Model<div class="model-picker">
+                    <input id="model-path" type="text" placeholder="Model path…" spellcheck="false" autocomplete="off">
+                    <button id="model-browse" class="model-browse" type="button" title="Show models found near the dataset" aria-label="Show discovered models">▾</button>
+                    <div id="model-menu" class="model-menu" hidden></div>
+                  </div></label>
+                  <button id="load-model" class="secondary" title="Load prediction model">Load</button>
+                </div>
+                <div id="predictor-status" class="popover-status" role="status" aria-live="polite"></div>
+                <div class="predict-row">
+                  <label class="toggle" id="predict-unlabeled-wrap" hidden title="Skip images that already have annotations"><input type="checkbox" id="predict-unlabeled" checked><span>Only unlabeled</span></label>
+                  <button id="run-predict" class="secondary" hidden title="Run the model on the images of the split chosen in the filters">Predict</button>
+                  <button id="cancel-predict" class="secondary" hidden>Cancel</button>
+                  <button id="retry-predict" class="secondary" hidden>Retry failed</button>
+                </div>
+                <div id="mapping-panel" class="mapping-panel" hidden>
+                  <div class="prediction-options-title">Class mapping</div>
+                  <div id="mapping-list" class="mapping-list"></div>
+                </div>
+              </section>
             </div>
-          </details>
-          <button id="run-predict" class="secondary" hidden>Predict</button>
-          <button id="cancel-predict" class="secondary" hidden>Cancel</button>
-          <button id="retry-predict" class="secondary" hidden>Retry failed</button>
-          <div id="predictor-status" class="toolbar-status" role="status" aria-live="polite"></div>
+          </div>
+          <input id="image-search" class="toolbar-search" type="search" placeholder="Search filenames…" aria-label="Filter by filename">
+          <label class="toggle" id="overlay-toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
+          <button id="start-review" class="secondary" type="button" title="Open the first unreviewed image of this list in the editor (then D = done, W = needs work)">Review</button>
+          <button id="model-chip" class="model-chip" type="button" hidden></button>
         </div>
         <div id="image-bulk" class="bulk-bar toolbar-group" hidden>
           <strong id="image-selected-count"></strong>

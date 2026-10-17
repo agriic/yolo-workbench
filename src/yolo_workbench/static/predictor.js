@@ -55,6 +55,7 @@ export function applyPredictorState(data) {
   pred.pending = data.pending;
   pred.job = data.job;
   pred.maxPoints = data.max_points ?? null;
+  pred.modelPath = data.model.path;
   $("pred-points-wrap").hidden = state.meta.category !== "segmentation";
   if (document.activeElement !== $("pred-max-points")) $("pred-max-points").value = pred.maxPoints ?? "";
   const ready = pred.status === "ready";
@@ -83,6 +84,7 @@ export function applyPredictorState(data) {
       : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""}`,
   }[pred.status] || "";
   $("predictor-status").title = $("predictor-status").textContent;
+  renderModelChip();
   renderMapping();
   renderModelMenu();
   clearTimeout(pred.poll);
@@ -96,6 +98,28 @@ export function applyPredictorState(data) {
     if (state.detail) loadEditorPredictions(state.detail.id);
   }
 }
+
+// the toolbar only notes which model is loaded (and a batch's progress); its controls are in the popup
+function renderModelChip(status = state.pred.status) {
+  const pred = state.pred, chip = $("model-chip");
+  const running = pred.job.state === "running";
+  const text = {
+    loading: "Loading model…",
+    error: "Model failed to load",
+    ready: `${modelLabel(pred.modelPath)}${running ? ` · predicting ${pred.job.done}/${pred.job.total}` : ""}`,
+  }[status] || "";
+  chip.hidden = !text;
+  chip.className = `model-chip ${status === "loading" || status === "error" ? status : ""}`;
+  chip.innerHTML = `<span>${esc(text)}</span>`;
+  chip.title = status === "ready" ? `Prediction model: ${pred.modelPath}\n${$("predictor-status").textContent}` : $("predictor-status").textContent;
+}
+
+// trained weights are all best.pt: name them after their run folder
+const modelLabel = path => {
+  const parts = (path || "").split(/[\\/]/);
+  const name = parts.at(-1);
+  return parts.at(-2) === "weights" && parts.length > 2 ? `${parts.at(-3)} · ${name}` : name;
+};
 
 export function renderMapping() {
   const pred = state.pred;
@@ -113,6 +137,7 @@ export async function loadModel() {
   $("load-model").disabled = true;
   $("predictor-status").textContent = "Loading model…";
   $("predictor-status").title = "Loading model…";
+  renderModelChip("loading");
   try {
     applyPredictorState(await api("/predictor/load", { method: "POST", body: JSON.stringify({ path }) }));
     deps.toast("Model loaded");
@@ -121,6 +146,7 @@ export async function loadModel() {
     $("load-model").disabled = false;
     $("predictor-status").textContent = error.message;
     $("predictor-status").title = error.message;
+    renderModelChip();
     deps.toast(error.message, "error");
   }
 }

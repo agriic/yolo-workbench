@@ -27,7 +27,7 @@ export const state = {
   canRedo: false,
   pred: {
     status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
-    job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
+    modelPath: null, job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
   },
   sam: {
     status: "unavailable", model: null, message: null, error: null, poll: null,

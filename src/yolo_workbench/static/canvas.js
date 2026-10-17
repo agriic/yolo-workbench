@@ -166,7 +166,7 @@ export function eventPoint(e) {
 
 export function fit() {
   if (!state.img) return;
-  state.view.scale = clamp(Math.min((cssW - 48) / state.img.width, (cssH - 48) / state.img.height), 0.02, 40);
+  state.view.scale = clamp(Math.min((cssW - 24) / state.img.width, (cssH - 24) / state.img.height), 0.02, 40);
   state.view.x = (cssW - state.img.width * state.view.scale) / 2;
   state.view.y = (cssH - state.img.height * state.view.scale) / 2;
   render();

@@ -250,6 +250,24 @@ function bind() {
   $("show-overlays").onchange = () => loadImages();
   $("image-search").oninput = debounce(() => loadImages({ reset: true }), 250);
   [$("label-min"), $("label-max")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
+  $("image-filters-reset").onclick = () => {
+    for (const [id, value] of [["image-split", "all"], ["image-class", ""], ["image-review", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
+    $("filter-predictions").checked = false;
+    loadImages({ reset: true });
+  };
+  // the filters and the prediction controls share one popup; the model chip opens it too
+  $("image-options-toggle").onclick = () => showImageOptions($("image-options").hidden);
+  $("model-chip").onclick = () => showImageOptions(true);
+  document.addEventListener("pointerdown", e => {
+    if (!$("image-options").hidden && !e.target.closest("#image-options-anchor, #model-chip")) showImageOptions(false);
+  });
+  $("image-options").addEventListener("keydown", e => {
+    if (e.key !== "Escape") return;
+    e.stopPropagation();
+    if (!$("model-menu").hidden) return void ($("model-menu").hidden = true);
+    showImageOptions(false);
+    $("image-options-toggle").focus();
+  });
   [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects({ reset: true }); });
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
   $("bulk-delete").onclick = () => {
@@ -590,6 +608,20 @@ function imageFilterParams() {
   return params;
 }
 
+function showImageOptions(open) {
+  $("image-options").hidden = !open;
+  $("image-options-toggle").setAttribute("aria-expanded", String(open));
+}
+
+// the toolbar button counts the popup's active filters (the search box is in plain sight)
+function renderFilterCount() {
+  const params = imageFilterParams();
+  params.delete("search");
+  if (params.get("split") === "all") params.delete("split");
+  const count = new Set([...params.keys()].map(key => key.endsWith("_labels") ? "labels" : key)).size;
+  $("image-filter-count").textContent = count || "";
+}
+
 function fetchImagePage(offset, limit, signal) {
   const params = imageFilterParams();
   params.set("limit", String(limit));
@@ -606,6 +638,7 @@ function fetchObjectPage(offset, limit, signal) {
 
 export async function loadImages(options = {}) {
   if (!imageGallery) return;
+  renderFilterCount();
   await imageGallery.reload(options);
   await syncEditorGridIndex();
 }
