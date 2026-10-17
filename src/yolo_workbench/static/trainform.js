@@ -6,6 +6,7 @@
 import { $, api, esc, debounce } from "./api.js";
 import { state } from "./state.js";
 import { augmentationArgChanged, augmentationHtml, mountAugmentations } from "./augments.js";
+import { mountRfAugmentations, rfAugmentationArgChanged, rfAugmentationHtml } from "./rfaugments.js";
 
 let deps;
 export function configureRunForm(dependencies) {
@@ -31,12 +32,14 @@ const GROUPS = {
   rfdetr: [
     { id: "basics", title: "Basics", open: true },
     { id: "optimizer", title: "Optimizer" },
+    { id: "augmentation", title: "Augmentation" },
     { id: "stopping", title: "Stopping & checkpoints" },
     { id: "advanced", title: "Advanced" },
   ],
 };
 // `cats` limits a field to dataset categories, `fw` to a framework (default Ultralytics); everything else is reachable in raw YAML.
-// The augmentation group renders as preview cards (augments.js); its entries here keep counts and raw YAML in step.
+// The augmentation group renders as preview cards (augments.js; RF-DETR's aug_config: rfaugments.js); its entries here keep
+// counts and raw YAML in step.
 const FIELDS = [
   { group: "basics", key: "epochs", label: "Epochs", type: "int", min: 1 },
   { group: "basics", key: "imgsz", label: "Image size", type: "int", min: 32, step: 32 },
@@ -105,6 +108,10 @@ const FIELDS = [
   { fw: "rfdetr", group: "optimizer", key: "drop_path", label: "Drop path", type: "float", min: 0, max: 1 },
   { fw: "rfdetr", group: "optimizer", key: "use_ema", label: "EMA weights", type: "bool" },
 
+  { fw: "rfdetr", group: "augmentation", key: "aug_config", label: "Augmentations", type: "aug" },
+  { fw: "rfdetr", group: "augmentation", key: "augmentation_backend", label: "Augment on", type: "select", options: [["cpu", "CPU (Albumentations)"], ["auto", "GPU when available (Kornia)"], ["kornia", "GPU (Kornia)"], ["torchvision", "CPU (torchvision)"]], hint: "Kornia runs only some transforms" },
+  { fw: "rfdetr", group: "augmentation", key: "save_dataset_grids", label: "Save augmented batch grids", type: "bool" },
+
   { fw: "rfdetr", group: "stopping", key: "early_stopping", label: "Early stopping", type: "bool" },
   { fw: "rfdetr", group: "stopping", key: "early_stopping_patience", label: "Patience", type: "int", min: 0, hint: "Epochs without improvement before stopping" },
   { fw: "rfdetr", group: "stopping", key: "early_stopping_min_delta", label: "Minimum improvement", type: "float", min: 0 },
@@ -117,7 +124,6 @@ const FIELDS = [
   { fw: "rfdetr", group: "advanced", key: "multi_scale", label: "Multi-scale", type: "select", options: [["per-batch", "Per batch"], ["per-sample", "Per sample"], ["off", "Off"]] },
   { fw: "rfdetr", group: "advanced", key: "expanded_scales", label: "Wider scale range", type: "bool" },
   { fw: "rfdetr", group: "advanced", key: "eval_max_dets", label: "Detections per image (eval)", type: "int", min: 1 },
-  { fw: "rfdetr", group: "advanced", key: "save_dataset_grids", label: "Save augmented batch grids", type: "bool" },
 ];
 
 let options = null;   // GET /training/options
@@ -154,15 +160,22 @@ export const trainingOptions = () => options;
 
 const PLAIN = /^[A-Za-z_][\w.\-/]*$/;
 const RESERVED = /^(true|false|yes|no|on|off|null|~)$/i;
+const yamlKey = key => PLAIN.test(key) && !RESERVED.test(key) ? key : JSON.stringify(key);
+// flow style for what nests: `{p: 0.5, limit: [-15, 15]}`
 function yamlValue(value) {
   if (value === null || value === undefined) return "null";
   if (typeof value === "boolean" || typeof value === "number") return String(value);
-  if (Array.isArray(value)) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(yamlValue).join(", ")}]`;
+  if (typeof value === "object") return `{${Object.entries(value).map(([key, item]) => `${yamlKey(key)}: ${yamlValue(item)}`).join(", ")}}`;
   const text = String(value);
   return PLAIN.test(text) && !RESERVED.test(text) ? text : JSON.stringify(text);
 }
+// a mapping (aug_config) gets one indented line per entry
+const yamlLine = (key, value) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).length
+  ? `${key}:\n${Object.entries(value).map(([name, item]) => `  ${yamlKey(name)}: ${yamlValue(item)}`).join("\n")}`
+  : `${key}: ${yamlValue(value)}`;
 export function argsToYaml(values) {
-  return Object.entries(values).map(([key, value]) => `${key}: ${yamlValue(value)}`).join("\n") + (Object.keys(values).length ? "\n" : "");
+  return Object.entries(values).map(([key, value]) => yamlLine(key, value)).join("\n") + (Object.keys(values).length ? "\n" : "");
 }
 
 // ---------- open ----------
@@ -304,11 +317,13 @@ function renderGui() {
     ${groups().map(group => `
       <details class="stats-panel form-panel form-group" data-group="${group.id}" ${group.open || changed(group.id) ? "open" : ""}>
         <summary><h2>${esc(group.title)}</h2><span class="changed-count" data-changed="${group.id}">${changed(group.id) ? `${changed(group.id)} changed` : ""}</span></summary>
-        ${group.id === "augmentation" ? augmentationHtml(augmentationContext()) : `<div class="form-grid">${fields().filter(field => field.group === group.id).map(fieldHtml).join("")}</div>`}
+        ${group.id !== "augmentation" ? `<div class="form-grid">${fields().filter(field => field.group === group.id).map(fieldHtml).join("")}</div>`
+          : framework() === "rfdetr" ? rfAugmentationHtml(rfAugmentationContext()) : augmentationHtml(augmentationContext())}
       </details>`).join("")}
     ${extrasHtml()}`;
   const augmentation = $("form-gui").querySelector('[data-group="augmentation"]');
-  if (augmentation) mountAugmentations(augmentation);  // RF-DETR has no augmentation cards
+  if (augmentation && framework() === "rfdetr") mountRfAugmentations(augmentation);
+  else if (augmentation) mountAugmentations(augmentation);
 }
 
 const augmentationContext = () => ({
@@ -319,6 +334,16 @@ const augmentationContext = () => ({
   args: () => args,
   setArg,
   changed: () => { updateChangedCounts(); scheduleCheck(); },
+});
+
+const rfAugmentationContext = () => ({
+  category: category(),
+  args: () => args,
+  setArg,
+  resolution: () => args.resolution ?? variantInfo()?.resolution ?? 640,
+  changed: () => { updateChangedCounts(); scheduleCheck(); },
+  // the group's other fields (where augmentations run, batch grids), below the cards
+  extraHtml: () => `<div class="form-grid">${fields().filter(field => field.group === "augmentation" && field.type !== "aug").map(fieldHtml).join("")}</div>`,
 });
 
 function frameworkSwitchHtml() {
@@ -476,6 +501,7 @@ function onInput(e) {
   }
   input.closest(".field").classList.toggle("changed", input.dataset.key in args);
   augmentationArgChanged(input.dataset.key);
+  rfAugmentationArgChanged(input.dataset.key);
   updateChangedCounts();
   scheduleCheck();
 }
@@ -527,6 +553,7 @@ async function onChange(e) {
     target.closest(".field").classList.toggle("changed", target.dataset.key in args);
   } else return;
   augmentationArgChanged(target.dataset.key);
+  rfAugmentationArgChanged(target.dataset.key);
   updateChangedCounts();
   scheduleCheck();
 }
@@ -636,7 +663,7 @@ function renderCheck() {
 
 function lineKey(number) {
   const text = currentYaml().split("\n")[number - 1] || "";
-  return text.split(":")[0] || `line ${number}`;
+  return text.split(":")[0].trim() || `line ${number}`;
 }
 
 function updateSubmit() {

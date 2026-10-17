@@ -30,9 +30,11 @@ def export_ultralytics(weights: Path, spec: dict) -> Path:
 def export_rfdetr(weights: Path, spec: dict) -> Path:
     from rfdetr import RFDETR
 
-    # the input is the resolution the model was trained at (RF-DETR needs it divisible by its patch grid)
+    # the checkpoint restores the trained resolution, the default input; another one must be divisible by its patch grid
     model = RFDETR.from_checkpoint(str(weights), device="cpu")
-    return Path(model.export(output_dir=str(weights.parent / "onnx"), output_name=weights.stem, dynamic_batch=bool(spec.get("dynamic")), verbose=False))
+    imgsz = spec.get("imgsz")
+    shape = None if not imgsz else (imgsz, imgsz) if isinstance(imgsz, int) else (imgsz[0], imgsz[1])
+    return Path(model.export(output_dir=str(weights.parent / "onnx"), output_name=weights.stem, shape=shape, dynamic_batch=bool(spec.get("dynamic")), verbose=False))
 
 
 def main(spec_path: str) -> int:

@@ -4,7 +4,9 @@ callback, the training manager's handling of RF-DETR runs, and RF-DETR predictio
 No GPU and no training here except the opt-in smoke test; the schema test imports rfdetr (several
 seconds) to check the server's static copy of its TrainConfig."""
 
+import asyncio
 import enum
+import io
 import json
 import os
 import time
@@ -17,7 +19,7 @@ import pytest
 import yaml
 from PIL import Image
 
-from yolo_workbench import frameworks
+from yolo_workbench import frameworks, rfdetr_augment
 from yolo_workbench.dataset import Dataset
 from yolo_workbench.frameworks import (
     RFDETR,
@@ -35,7 +37,7 @@ from yolo_workbench.rfdetr_runner import WorkbenchCallback, build_view, train_ar
 from yolo_workbench.train_runner import Reporter, RunKilled
 from yolo_workbench.training import TrainingManager, best_epoch, read_epochs_jsonl
 
-from test_training import FakeLauncher, make_dataset, make_manager
+from test_training import FakeExporter, FakeLauncher, client_for, make_dataset, make_manager
 
 RF_ARGS = "model: rfdetr-nano\nepochs: 5\nbatch_size: 2\n"
 
@@ -85,7 +87,6 @@ def test_rfdetr_argument_errors_have_lines(tmp_path):
     assert validate("model: rfdetr-nano\nbatch_size: auto\ndevice: 0\n")["errors"] == []
     assert "Multi-GPU" in messages(validate("model: rfdetr-nano\ndevice: 0,1\n"))
     assert "Unknown RF-DETR variant" in messages(validate("model: rfdetr-xxl\n"))
-    assert "rfdetr[augment]" in messages(validate("model: rfdetr-nano\naug_config: {HorizontalFlip: {p: 0.5}}\n"))
     warnings = validate("model: rfdetr-nano\ncheckpoint_interval: 1\n")["warnings"]
     assert warnings and "every epoch" in warnings[0]["message"]
 
@@ -545,6 +546,134 @@ def test_discovery_lists_rfdetr_runs_once(tmp_path):
     assert [(item["name"], item["source"]) for item in items] == [("RF one · best (RF-DETR)", "run")]
 
 
+# ---------- augmentations (aug_config) ----------
+
+
+def test_aug_config_is_built_like_rfdetr_does(monkeypatch):
+    text = (
+        "model: rfdetr-nano\naug_config:\n  HorizontalFlip: {p: 0.4}\n  Rotat: {limit: 15}\n  Affine: {scale: [0.8, 1.2], p: 2}\n"
+        "  ColorJitter: {brightness: 0.2, contrst: 0.1}\n  RandomResizedCrop: {}\n  Morphological: {}\n"
+        "  OneOf: {transforms: [{Blur: {p: 1}}, {MotionBlur: {}}]}\n"
+    )
+    by_line = {item["line"]: item["message"] for item in validate(text)["errors"]}
+    assert "did you mean `Rotate`" in by_line[4]
+    assert "`p`: Input should be less than or equal to 1" in by_line[5] and "RF-DETR would skip it" in by_line[5]
+    assert "no parameter `contrst` (did you mean `contrast`?)" in by_line[6]
+    assert "`size`: Field required" in by_line[7]
+    assert set(by_line) == {4, 5, 6, 7}  # Morphological and the OneOf group are fine
+    assert validate("model: rfdetr-nano\naug_config: {HorizontalFlip: {}, Transpose: {}}\n")["errors"] == []
+    kinds = {item["name"]: item["kind"] for item in rfdetr_augment.catalog()["transforms"]}
+    assert kinds["Rotate"] == "geometric" and kinds["ColorJitter"] == kinds["CoarseDropout"] == "pixel"
+    # the GPU (Kornia) backend runs only some transforms
+    gpu = "model: rfdetr-nano\naug_config: {HorizontalFlip: {}, MotionBlur: {}}\naugmentation_backend: "
+    assert "cannot run MotionBlur" in messages(validate(gpu + "kornia\n"))
+    result = validate(gpu + "auto\n")
+    assert result["errors"] == [] and "cannot run MotionBlur" in result["warnings"][0]["message"] and result["warnings"][0]["line"] == 3
+    for preset in rfdetr_augment.PRESETS.values():
+        assert rfdetr_augment.check(preset) == ([], [])
+    # {} (no augmentation) needs no Albumentations; anything else does
+    real = frameworks.importlib.util.find_spec
+    monkeypatch.setattr(frameworks.importlib.util, "find_spec", lambda name, *rest: None if name == "albumentations" else real(name, *rest))
+    assert validate("model: rfdetr-nano\naug_config: {}\n")["errors"] == []
+    assert "rfdetr[augment]" in messages(validate("model: rfdetr-nano\naug_config: {HorizontalFlip: {p: 0.5}}\n"))
+
+
+def test_aug_copies_match_the_installed_rfdetr():
+    """Presets, the geometric set and the Kornia registry are static copies (importing rfdetr takes seconds)."""
+    from rfdetr.datasets import aug_configs, kornia_transforms, transforms
+
+    for name in rfdetr_augment.PRESETS:
+        assert rfdetr_augment.PRESETS[name] == json.loads(json.dumps(getattr(aug_configs, f"AUG_{name.upper()}"))), name  # tuples as lists
+    assert rfdetr_augment.DEFAULT_EQUIVALENT == aug_configs.AUG_CONFIG
+    assert rfdetr_augment.GEOMETRIC == transforms.GEOMETRIC_TRANSFORMS
+    assert rfdetr_augment.KORNIA == set(kornia_transforms._REGISTRY)
+
+
+def preview(dataset, aug, index=None, seed=0, labels=False):
+    from yolo_workbench.web import class_color
+
+    result = rfdetr_augment.render(dataset, aug, index, 0, seed, 64, 64, labels, class_color)
+    return np.asarray(Image.open(io.BytesIO(result.jpeg)).convert("RGB"), dtype=np.int16), result.note
+
+
+@pytest.mark.parametrize("category", ["detection", "segmentation"])
+def test_aug_previews(tmp_path, category):
+    dataset = make_dataset(tmp_path)
+    for path in dataset.root.rglob("images/*/*.jpg"):  # an off-centre bright square, so flips are visible
+        image = Image.new("RGB", (80, 60), "navy")
+        image.paste((255, 255, 0), (8, 6, 32, 30))
+        image.save(path)
+    if category == "segmentation":
+        for label in dataset.root.rglob("labels/*/*.txt"):
+            label.write_text(f"{label.read_text().split()[0]} 0.1 0.1 0.4 0.1 0.4 0.5 0.1 0.5\n")
+    dataset = Dataset(dataset.yaml_path, category)
+    original, note = preview(dataset, None, index=-1)
+    assert original.shape == (64, 64, 3) and "1 of" in note  # the square training input
+    flipped, _ = preview(dataset, {"HorizontalFlip": {"p": 0.0}}, index=0, seed=1)  # one transform alone is always applied
+    assert np.abs(flipped - original[:, ::-1]).mean() < 6
+    assert np.abs(preview(dataset, {}, seed=3)[0] - original).mean() < 2  # no augmentation
+    # the whole pipeline draws each transform at its chance
+    assert np.abs(preview(dataset, {"VerticalFlip": {"p": 1}}, seed=5)[0] - original[::-1]).mean() < 6
+    assert np.abs(preview(dataset, {"VerticalFlip": {"p": 0}}, seed=5)[0] - original).mean() < 2
+    rotate = {"Rotate": {"limit": 40}}
+    first, second = preview(dataset, rotate, index=0, seed=1)[0], preview(dataset, rotate, index=0, seed=2)[0]
+    assert np.abs(first - second).mean() > 1 and np.array_equal(first, preview(dataset, rotate, index=0, seed=1)[0])  # seeded
+    # a crop that loses the object says so
+    _, note = preview(dataset, {"Crop": {"x_min": 48, "y_min": 40, "x_max": 64, "y_max": 64}}, index=0, seed=1, labels=True)
+    assert "0 of 1 objects kept" in note and "16×24 px" in note
+    with pytest.raises(Exception, match="not an Albumentations transform"):
+        preview(dataset, {"Nope": {}}, index=0)
+
+
+def test_aug_preview_api(tmp_path):
+    from yolo_workbench.media_cache import MediaCache
+    from yolo_workbench.web import create_app
+
+    dataset = make_dataset(tmp_path)
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media"), training=make_manager(dataset, tmp_path))
+
+    async def check():
+        async with client_for(app) as client:
+            catalog = (await client.get("/api/v1/training/augment/rfdetr/catalog")).json()
+            assert catalog["available"] and catalog["presets"]["aggressive"]["Rotate"] == {"limit": 45, "p": 0.5}
+            names = {item["name"]: item for item in catalog["transforms"]}
+            assert {"HorizontalFlip", "Affine", "ColorJitter", "CoarseDropout"} <= set(names) and "Lambda" not in names
+            assert names["Affine"]["kind"] == "geometric" and names["ColorJitter"]["kind"] == "pixel"
+            border = next(param for param in names["Affine"]["params"] if param["name"] == "border_mode")
+            assert border["advanced"] and border["default"] == 0 and [0, "constant"] in border["choices"]
+            assert next(param for param in names["Rotate"]["params"] if param["name"] == "limit") == {"name": "limit", "default": [-90, 90]}
+            params = {"aug": json.dumps({"Rotate": {"limit": 15}}), "index": 0, "seed": 1, "size": 64}
+            response = await client.get("/api/v1/training/augment/rfdetr", params=params)
+            assert response.status_code == 200 and response.headers["content-type"] == "image/jpeg"
+            assert (await client.get("/api/v1/training/augment/rfdetr", params={"size": 64})).status_code == 200  # RF-DETR's default
+            response = await client.get("/api/v1/training/augment/rfdetr", params={"aug": json.dumps({"Rotate": {"limit": "x"}}), "index": 0})
+            assert response.status_code == 400 and "limit" in response.json()["detail"]
+            assert (await client.get("/api/v1/training/augment/rfdetr", params={"aug": "[1]"})).status_code == 400
+
+    asyncio.run(check())
+
+
+def test_rfdetr_export_resolution(tmp_path, monkeypatch):
+    monkeypatch.setattr("yolo_workbench.training.EXPORT_POLL", 0)
+    dataset = make_dataset(tmp_path)
+    exporter = FakeExporter()
+    launcher = FakeLauncher()
+    manager = TrainingManager.for_dataset(dataset, jobs=JobManager(synchronous=True), launcher=launcher, weights_dir=tmp_path / "weights", exporter=exporter)
+    manager.attach(dataset)
+    run = manager.enqueue(None, dataset, "rf", "", RF_ARGS + "resolution: 448\n")["run"]
+    runner_trains_rfdetr(Path(run["path"]))
+    launcher.handle.code = 0
+    # the trained resolution unless another one is asked for: a multiple of the variant's patch size × windows
+    manager.export_onnx(None, run["id"], dynamic=True)
+    assert exporter.specs[-1]["framework"] == "rfdetr" and exporter.specs[-1]["imgsz"] == 448 and exporter.specs[-1]["dynamic"]
+    assert "simplify" not in exporter.specs[-1]
+    manager.export_onnx(None, run["id"], imgsz=[384, 640])
+    assert exporter.specs[-1]["imgsz"] == [384, 640]
+    assert manager.best_weights(None, run["id"], onnx=True)[1].startswith("ds-rf-384x640-rfdetr-nano-")
+    with pytest.raises(Exception, match="multiple of 32"):
+        manager.export_onnx(None, run["id"], imgsz=600)
+
+
 # ---------- real training (opt-in) ----------
 
 
@@ -559,7 +688,7 @@ def test_real_rfdetr_training_smoke(tmp_path, category, model):
         dataset = Dataset(dataset.yaml_path, "segmentation")
     manager = TrainingManager.for_dataset(dataset, jobs=JobManager(synchronous=True), weights_dir=Path.home() / ".cache" / "yolo-workbench" / "weights")
     manager.attach(dataset)
-    run = manager.enqueue(None, dataset, "smoke", "", f"model: {model}\nepochs: 2\nbatch_size: 2\nnum_workers: 0\ndevice: cpu\n", confirm=True)["run"]
+    run = manager.enqueue(None, dataset, "smoke", "", f"model: {model}\nepochs: 2\nbatch_size: 2\nnum_workers: 0\ndevice: cpu\naug_config:\n  HorizontalFlip: {{p: 0.5}}\n  Affine: {{scale: [0.9, 1.1], rotate: [-10, 10], p: 0.5}}\n", confirm=True)["run"]
     deadline = time.time() + 900
     while time.time() < deadline and manager.run_detail(None, run["id"])["active"]:
         time.sleep(1)

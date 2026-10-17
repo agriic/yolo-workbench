@@ -327,15 +327,22 @@ The best weights changed after this export; export again for the current ones.` 
 function onnxOptionsText(options) {
   if (!options) return "";
   const imgsz = Array.isArray(options.imgsz) ? options.imgsz.join("×") : options.imgsz;
-  return [imgsz && `imgsz ${imgsz}`, options.dynamic && "dynamic", options.simplify && "simplified", options.nms && "with NMS"].filter(Boolean).join(", ");
+  return [imgsz && `${isRfdetr(detail) ? "resolution" : "imgsz"} ${imgsz}`, options.dynamic && "dynamic", options.simplify && "simplified", options.nms && "with NMS"].filter(Boolean).join(", ");
 }
 
-function openExportDialog() {
+async function openExportDialog() {
   const run = detail;
   const rfdetr = isRfdetr(run);
+  if (rfdetr && !trainingOptions()) await loadTrainingOptions().catch(() => null);  // the variants' resolution steps
   const previous = run.onnx?.options || {};
-  $("run-export-intro").innerHTML = `Writes <code>${esc(run.onnx.file)}</code> next to ${run.active ? "the best weights so far" : "the best weights"}${rfdetr && run.imgsz ? `, at the resolution the model was trained at (${esc(run.imgsz)} px)` : ""}.`;
+  $("run-export-intro").innerHTML = `Writes <code>${esc(run.onnx.file)}</code> next to ${run.active ? "the best weights so far" : "the best weights"}.`;
   $("run-export-ultralytics").hidden = rfdetr;
+  const step = rfdetrStep(run);
+  $("run-export-imgsz-label").textContent = rfdetr ? "Resolution" : "Image size";
+  $("run-export-imgsz-hint").textContent = rfdetr
+    ? `The model's fixed input size${run.imgsz ? `; trained at ${run.imgsz} px, which is what it does best` : ""}${step ? `. A multiple of ${step}` : ""}`
+    : "The model's fixed input size, unless the shape is dynamic";
+  $("run-export-imgsz").placeholder = rfdetr ? `${run.imgsz ?? 640}, or height,width` : "640, or height,width";
   $("run-export-nms-row").hidden = category === "classification";
   $("run-export-dynamic-label").textContent = rfdetr ? "Dynamic batch size" : "Dynamic batch and image size";
   const imgsz = previous.imgsz ?? run.imgsz;
@@ -350,15 +357,22 @@ function openExportDialog() {
 // the dialog's values as the export request, or null when the image size is not one or two whole numbers
 function exportOptions() {
   const options = { dynamic: $("run-export-dynamic").checked };
-  if (isRfdetr(detail)) return options;
+  const rfdetr = isRfdetr(detail);
+  const step = rfdetr ? rfdetrStep(detail) : null;
   const text = $("run-export-imgsz").value.trim();
   const sides = text ? text.split(/[\s,x×]+/).filter(Boolean).map(Number) : [];
-  const valid = sides.length <= 2 && sides.every(side => Number.isInteger(side) && side >= 32 && side <= 8192);
-  $("run-export-imgsz").setCustomValidity(valid ? "" : "One size, or height,width: whole pixels from 32 to 8192");
+  const whole = sides.length <= 2 && sides.every(side => Number.isInteger(side) && side >= 32 && side <= 8192);
+  const valid = whole && (!step || sides.every(side => side % step === 0));
+  $("run-export-imgsz").setCustomValidity(valid ? "" : whole ? `A multiple of ${step} for this model (e.g. ${Math.floor(sides[0] / step) * step || step})` : "One size, or height,width: whole pixels from 32 to 8192");
   $("run-export-imgsz").reportValidity();
   if (!valid) return null;
-  return { ...options, imgsz: sides.length ? (sides.length === 1 ? sides[0] : sides) : null, simplify: $("run-export-simplify").checked, nms: $("run-export-nms").checked && category !== "classification" };
+  const imgsz = sides.length ? (sides.length === 1 ? sides[0] : sides) : null;
+  if (rfdetr) return { ...options, imgsz };
+  return { ...options, imgsz, simplify: $("run-export-simplify").checked, nms: $("run-export-nms").checked && category !== "classification" };
 }
+
+// RF-DETR's resolution rule for the run's variant (patch size × windows), when the run names one
+const rfdetrStep = run => trainingOptions()?.frameworks?.find(item => item.id === "rfdetr")?.pretrained?.find(item => item.name === run.variant)?.step ?? null;
 
 async function startExport() {
   if (!detail) return;

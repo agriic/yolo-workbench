@@ -360,7 +360,8 @@ const originalUrl = size => apiUrl(`/training/augment/original?${query({ sample,
 const previewUrl = (key, side, size) => apiUrl(`/training/augment/preview?${query({ key, side, sample, size, args: previewArgs(key) })}`);
 const sampleUrl = (index, size) => apiUrl(`/training/augment/sample?${query({ sample: sample + index, seed: resample * SAMPLE_COUNT + index, size, args: previewArgs(null) })}`);
 
-async function loadImage(img, url, noteEl) {
+/** Fetch a preview into `img` (as a blob, for its X-Preview-Note header); the note goes to `noteEl`. Shared with rfaugments.js. */
+export async function loadImage(img, url, noteEl) {
   const previous = loaders.get(img);
   if (previous?.source === url && !previous.failed) return null;  // already showing (or loading) this image
   previous?.controller.abort();
@@ -431,9 +432,20 @@ function zoomDialog() {
   return dialog;
 }
 
-function openZoom(key, index) {
+/** The enlarged previews dialog: `tiles` are [id, url, caption], side by side. Shared with rfaugments.js. */
+export function showZoom(title, tiles) {
   const dialog = zoomDialog();
   const body = dialog.querySelector("[data-zoom-body]");
+  dialog.querySelector("[data-zoom-title]").textContent = title;
+  body.style.setProperty("--zoom-count", tiles.length);
+  body.innerHTML = tiles.map(([side, , caption]) => `
+    <figure class="aug-tile"><div class="aug-img loading"><img alt="" data-zoom-img="${esc(side)}"></div>
+      <figcaption><span>${esc(caption)}</span><span class="tile-note" data-zoom-note="${esc(side)}"></span></figcaption></figure>`).join("");
+  for (const [side, url] of tiles) loadImage(body.querySelector(`[data-zoom-img="${side}"]`), url, side === "original" ? null : body.querySelector(`[data-zoom-note="${side}"]`));
+  if (!dialog.open) dialog.showModal();
+}
+
+function openZoom(key, index) {
   let tiles;
   if (key === "original") tiles = [["original", originalUrl(ZOOM_SIZE), root.querySelector("[data-aug-sample-name]").textContent]];
   else if (key === "sample") tiles = [["sample", sampleUrl(index, ZOOM_SIZE), `Training sample ${index + 1}`]];
@@ -444,11 +456,5 @@ function openZoom(key, index) {
       return [side, side === "original" ? originalUrl(ZOOM_SIZE) : previewUrl(key, side, ZOOM_SIZE), card.querySelector(`[data-aug-caption="${side}"]`).textContent];
     });
   }
-  dialog.querySelector("[data-zoom-title]").textContent = key === "original" ? "Preview image" : key === "sample" ? "Training sample" : `${spec(key).label} (${key})`;
-  body.style.setProperty("--zoom-count", tiles.length);
-  body.innerHTML = tiles.map(([side, , caption]) => `
-    <figure class="aug-tile"><div class="aug-img loading"><img alt="" data-zoom-img="${side}"></div>
-      <figcaption><span>${esc(caption)}</span><span class="tile-note" data-zoom-note="${side}"></span></figcaption></figure>`).join("");
-  for (const [side, url] of tiles) loadImage(body.querySelector(`[data-zoom-img="${side}"]`), url, side === "original" ? null : body.querySelector(`[data-zoom-note="${side}"]`));
-  if (!dialog.open) dialog.showModal();
+  showZoom(key === "original" ? "Preview image" : key === "sample" ? "Training sample" : `${spec(key).label} (${key})`, tiles);
 }

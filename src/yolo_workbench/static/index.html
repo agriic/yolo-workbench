@@ -296,8 +296,8 @@
     <form method="dialog">
       <h2>Export best weights to ONNX</h2>
       <p class="modal-text muted" id="run-export-intro"></p>
+      <label class="field"><span id="run-export-imgsz-label">Image size</span><input id="run-export-imgsz" type="text" inputmode="numeric" placeholder="640, or height,width"><span class="field-hint" id="run-export-imgsz-hint">The model's fixed input size, unless the shape is dynamic</span></label>
       <div id="run-export-ultralytics">
-        <label class="field">Image size<input id="run-export-imgsz" type="text" inputmode="numeric" placeholder="640, or height,width"><span class="field-hint">The model's fixed input size, unless the shape is dynamic</span></label>
         <label class="toggle"><input type="checkbox" id="run-export-simplify" checked><span>Simplify the graph (onnxslim)</span></label>
         <label class="toggle" id="run-export-nms-row"><input type="checkbox" id="run-export-nms"><span>Include NMS: outputs final boxes</span></label>
       </div>

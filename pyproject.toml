@@ -25,8 +25,8 @@ dependencies = [
   "ultralytics>=8",
   # once imported, Ultralytics patches Image.open to load pi-heif on the first unreadable image (and pip-installs it if missing)
   "pi-heif>=0.18",
-  # RF-DETR training and prediction; the runner uses its Lightning internals, so stay on a tested minor
-  "rfdetr[train,onnx]>=1.11.2,<1.12",
+  # RF-DETR training and prediction (augment: Albumentations for custom aug_config); the runner uses its Lightning internals, so stay on a tested minor
+  "rfdetr[train,onnx,augment]>=1.11.2,<1.12",
   # ONNX export of trained weights (rfdetr[onnx] brings onnx + onnxruntime; Ultralytics simplifies with onnxslim)
   "onnxslim>=0.1.82",
   # tests

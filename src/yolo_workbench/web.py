@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import augment_preview, classes, importer, storage
+from . import augment_preview, classes, importer, rfdetr_augment, storage
 from .dataset import Dataset, DatasetError, WriteConflict
 from .imaging import upright_rgb
 from .jobs import JobManager
@@ -664,6 +664,21 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def augment_sample(args: str = "{}", sample: int = Query(0, ge=0), seed: int = Query(0, ge=0), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
         values, imgsz = augment_args(args)
         return augment_response(lambda: augment_preview.render_pipeline(session.dataset, values, ultralytics_defaults()[0], sample, seed, imgsz, size, labels, class_color))
+
+    @router.get("/training/augment/rfdetr/catalog")
+    def augment_rfdetr_catalog(session: DatasetSession = current):
+        """The Albumentations transforms RF-DETR's aug_config can name, and RF-DETR's presets."""
+        base = {"presets": rfdetr_augment.PRESETS, "default": rfdetr_augment.DEFAULT_EQUIVALENT}
+        if not rfdetr_augment.available():
+            return {**base, "available": False, "reason": 'Albumentations is not installed (uv add "rfdetr[train,augment]")'}
+        return {**base, "available": True, **rfdetr_augment.catalog()}
+
+    @router.get("/training/augment/rfdetr")
+    def augment_rfdetr(aug: str = "null", index: int | None = Query(None, ge=-1), sample: int = Query(0, ge=0), seed: int = Query(0, ge=0), resolution: int = Query(640, ge=32, le=4096), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
+        """A preview image: index -1 the image as RF-DETR's resize gives it, index N the aug_config's Nth transform
+        (always applied), no index the whole pipeline; aug `null` is RF-DETR's default augmentation."""
+        config = None if aug.strip() == "null" else rfdetr_augment.parse_config(aug)
+        return augment_response(lambda: rfdetr_augment.render(session.dataset, config, index, sample, seed, resolution, size, labels, class_color))
 
     @router.get("/training/runs")
     def training_runs(session: DatasetSession = current):

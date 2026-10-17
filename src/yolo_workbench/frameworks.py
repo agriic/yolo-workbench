@@ -71,6 +71,19 @@ def _key_line(text: str, key: str) -> int | None:
     return None
 
 
+def _nested_line(text: str, key: str, child: str) -> int | None:
+    """The line of `child:` inside the block mapping under `key:`, else the line of `key:`."""
+    parent = _key_line(text, key)
+    if parent is None:
+        return None
+    for number, line in enumerate(text.splitlines()[parent:], parent + 1):
+        if line.strip() and not line[:1].isspace():
+            break
+        if re.match(rf"^\s+{re.escape(child)}\s*:", line):
+            return number
+    return parent
+
+
 def args_to_yaml(args: dict) -> str:
     """One `key: value` line per argument (lists inline, like args.yaml)."""
     lines = []
@@ -689,8 +702,15 @@ class RFDETRFramework(Framework):
                 errors.append({"line": _key_line(text, "amp_dtype"), "message": "amp_dtype: fp8 cannot be combined with batch_size: auto"})
             if on_cpu:
                 errors.append({"line": _key_line(text, "amp_dtype"), "message": "amp_dtype: fp8 needs an NVIDIA GPU"})
-        if args.get("aug_config") is not None and importlib.util.find_spec("albumentations") is None:
-            errors.append({"line": _key_line(text, "aug_config"), "message": 'aug_config needs Albumentations: install rfdetr[augment] (uv add "rfdetr[train,augment]")'})
+        if args.get("aug_config"):  # {} (no augmentation) runs on torchvision
+            if importlib.util.find_spec("albumentations") is None:
+                errors.append({"line": _key_line(text, "aug_config"), "message": 'aug_config needs Albumentations: install rfdetr[augment] (uv add "rfdetr[train,augment]")'})
+            else:
+                from . import rfdetr_augment
+
+                problems, cautions = rfdetr_augment.check(args["aug_config"], str(args.get("augmentation_backend", "cpu")).lower())
+                for found, items in ((problems, errors), (cautions, warnings)):
+                    items.extend({"line": _nested_line(text, "aug_config", name) if name else _key_line(text, "augmentation_backend"), "message": message} for name, message in found)
         if args.get("eval_ema_only"):
             warnings.append({"line": _key_line(text, "eval_ema_only"), "message": "eval_ema_only is deprecated; use eval_base_model"})
         if args.get("fp16_eval"):

@@ -331,6 +331,7 @@ def run(spec_path: Path, spec: dict) -> int:
     threading.Thread(target=reporter.watch_kill, args=(stop_watching,), daemon=True).start()
     # pretrained weights download into the workbench's weights cache (the runner's cwd), once
     os.environ.setdefault("RF_HOME", str(Path.cwd() / RFDETR_WEIGHTS_SUBDIR))
+    os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")  # aug_config: no version check over the network
     view = workdir / VIEW_DIR
     try:
         reporter.write(force=True, phase="preparing-data")

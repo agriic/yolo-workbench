@@ -1339,6 +1339,24 @@ dialog.aug-zoom { width: min(1400px, calc(100vw - 32px)); }
   .aug-zoom-body { grid-template-columns: 1fr; max-width: none; }
   .aug-toolbar-note { margin-left: 0; }
 }
+/* RF-DETR aug_config (rfaugments.js) */
+.rfaug-presets { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.rfaug-presets .segmented span { padding: 4px 11px; font-size: 12px; }
+.rfaug-note { margin: 6px 0 12px; }
+.rfaug-kind { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--text-2); white-space: nowrap; }
+.rfaug-kind-geometric { color: var(--accent-strong); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.rfaug-kind-unmoved, .rfaug-kind-unknown { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
+.rfaug-card.rfaug-warn { border-color: color-mix(in srgb, var(--warn) 55%, var(--line)); }
+.rfaug-actions { display: flex; gap: 2px; margin-left: auto; }
+.rfaug-chance { display: grid; gap: 4px; }
+.rfaug-chance .field-label, .rfaug-presets .field-label { font-size: 12px; font-weight: 500; color: var(--text-2); }
+.rfaug-params { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px 10px; }
+.rfaug-params .field { font-size: 12px; }
+.rfaug-params .field.rfaug-required input { border-color: var(--danger); }
+.rfaug-more summary { cursor: pointer; font-size: 12px; color: var(--text-2); margin-bottom: 6px; }
+.rfaug-extra { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.rfaug-add { display: grid; gap: 10px; margin-top: 12px; }
+.rfaug-add > .field { max-width: 360px; }
 
 /* ---------- repair tools ---------- */
 .label-warning { font-size: 12px; line-height: 1.5; color: #ffd28a; background: #3a3020; border: 1px solid #5c4a26; border-radius: 6px; padding: 8px 10px; margin-bottom: 10px; }

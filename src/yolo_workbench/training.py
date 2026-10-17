@@ -816,6 +816,8 @@ class TrainingManager:
                 raise KeyError("This run's best weights have not been exported to ONNX")
             path = path.with_suffix(".onnx")
         imgsz = summary["imgsz"]
+        if onnx:
+            imgsz = (summary["onnx"].get("options") or {}).get("imgsz") or imgsz  # exported at another size
         if isinstance(imgsz, (list, tuple)):
             imgsz = "x".join(str(side) for side in imgsz)
         parts = [target.name, summary["name"], imgsz, _model_label(summary["model"]), time.strftime("%Y.%m.%d", time.localtime(written))]
@@ -855,8 +857,9 @@ class TrainingManager:
         """Export the run's best weights to ONNX next to them: a background job running export_runner.py.
 
         Ultralytics takes the input size (default: the run's imgsz), a dynamic batch and image size, onnxslim
-        simplification, and NMS inside the graph (not for classification). RF-DETR exports at its trained
-        resolution, and `dynamic` makes only its batch dynamic."""
+        simplification, and NMS inside the graph (not for classification). RF-DETR takes the input resolution
+        (default: the one it was trained at; a multiple of the variant's step), and `dynamic` makes only its
+        batch dynamic."""
         target = self.resolve(project)
         with self._lock:
             run_dir = self._require_run(target, run_id)
@@ -869,7 +872,7 @@ class TrainingManager:
             framework = frameworks.get(summary["framework"])
             best = Path(summary["weights"]["best"])
             if framework is frameworks.RFDETR:
-                options = {"dynamic": bool(dynamic)}
+                options = {"imgsz": _rfdetr_export_size(imgsz or summary["imgsz"], summary.get("variant")), "dynamic": bool(dynamic)}
             else:
                 options = {"imgsz": _export_imgsz(imgsz or summary["imgsz"]), "dynamic": bool(dynamic), "simplify": bool(simplify), "nms": bool(nms) and target.category != "classification"}
             workdir = run_dir / META_DIR
@@ -1196,6 +1199,17 @@ def _export_imgsz(imgsz):
     sides = imgsz if isinstance(imgsz, list) else [imgsz]
     if imgsz is not None and not all(isinstance(side, int) and not isinstance(side, bool) and 32 <= side <= 8192 for side in sides):
         raise DatasetError("The export image size must be whole pixels between 32 and 8192")
+    return imgsz
+
+
+def _rfdetr_export_size(imgsz, variant: str | None):
+    """An RF-DETR export resolution: one side or [height, width], each a multiple of the variant's patch size ×
+    windows (RF-DETR checks it again; a run made outside the workbench may not name its variant)."""
+    imgsz = _export_imgsz(imgsz)
+    step = frameworks.RFDETR_VARIANTS.get(variant or "", {}).get("step")
+    sides = imgsz if isinstance(imgsz, list) else [imgsz]
+    if imgsz is not None and step and any(side % step for side in sides):
+        raise DatasetError(f"The export resolution must be a multiple of {step} for {variant} (e.g. {sides[0] // step * step or step})")
     return imgsz
 
 
