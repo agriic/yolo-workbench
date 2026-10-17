@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import threading
 
+from . import libraries
 from .dataset import Dataset
 
 
@@ -82,6 +83,7 @@ class EmbeddingsManager:
 
 
 def compute_gt_viz(dataset: Dataset) -> list[dict]:
+    libraries.load("fiftyone", "fiftyone.brain")
     import fiftyone as fo
     import fiftyone.brain as fob
 

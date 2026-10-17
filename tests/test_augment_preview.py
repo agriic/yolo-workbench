@@ -2,6 +2,8 @@ import asyncio
 import io
 import json
 import random
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -106,6 +108,47 @@ def test_classification_previews(tmp_path):
     assert augment_preview.render_pipeline(dataset, {"auto_augment": None}, DEFAULTS, 0, 0, 64, 64, False, class_color).jpeg
     assert "hsv_h" in validate_args("classification", "model: yolo11n-cls.pt\nhsv_h: 0.6\n")["errors"][0]["message"]
     assert not validate_args("detection", "model: yolo11n.pt\nhsv_h: 0.6\n")["errors"]
+
+
+FIRST_USE = """
+import sys, threading
+from pathlib import Path
+from yolo_workbench import augment_preview, frameworks
+from yolo_workbench.dataset import Dataset
+
+dataset = Dataset(Path(sys.argv[1]), "detection")
+defaults = frameworks.ultralytics_defaults()[0]
+color = lambda class_id: "#ff0000"
+calls = [
+    lambda: frameworks.validate_args("detection", "model: yolo11n.pt\\nlr0: fast\\n")["errors"] or 1 / 0,  # Ultralytics' check_cfg ran
+    lambda: augment_preview.render_original(dataset, 0, 64, 64, True, color),
+    lambda: augment_preview.render_augmentation(dataset, "degrees", "max", {"degrees": 10}, defaults, 0, 64, 64, True, color),
+    lambda: augment_preview.render_pipeline(dataset, {}, defaults, 0, 1, 64, 64, True, color),
+]
+errors = []
+
+def run(call):
+    try:
+        call()
+    except BaseException as exc:
+        errors.append(repr(exc))
+
+threads = [threading.Thread(target=run, args=(call,)) for call in calls * 2]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+print("\\n".join(errors))
+sys.exit(1 if errors else 0)
+"""
+
+
+def test_first_use_from_parallel_requests(tmp_path):
+    """Opening the new-run form validates its arguments while the previews render, each on its own server thread:
+    the first imports of ultralytics/torch/cv2 must not hand a thread a partially initialized module."""
+    make_dataset(tmp_path, "detection")
+    result = subprocess.run([sys.executable, "-c", FIRST_USE, str(tmp_path / "ds" / "data.yaml")], capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr[-3000:]
 
 
 def test_augment_preview_api(tmp_path):

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import yaml
 
+from . import libraries
 from .dataset import DatasetError
 from .fsutil import replace
 
@@ -240,6 +241,7 @@ def ultralytics_defaults() -> tuple[dict, dict]:
 def _check_value(key: str, value) -> str | None:
     """Ultralytics' own type/range check for one argument (imported lazily; ~1 s once per process)."""
     try:
+        libraries.load("ultralytics.cfg")
         from ultralytics.cfg import check_cfg
     except Exception:  # ultralytics unavailable or broken: the runner reports problems instead
         return None

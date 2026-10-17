@@ -307,7 +307,17 @@ def run(spec_path: Path) -> int:
                 Path(path).unlink(missing_ok=True)
 
 
+def utf8_output() -> None:
+    """Write stdout/stderr (train.log, read back as UTF-8) as UTF-8. Redirected to a file on Windows
+    they default to the ANSI code page, where rich's box-drawing tables (RF-DETR's metrics summary)
+    raise UnicodeEncodeError and fail the run."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    utf8_output()
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) != 1:
         print("usage: python -m yolo_workbench.train_runner <run>/workbench/spec.json", file=sys.stderr)

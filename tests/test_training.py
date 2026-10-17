@@ -536,6 +536,19 @@ def test_run_files_logs_and_epochs(tmp_path):
     assert [row["epoch"] for row in epochs["items"]] == [2, 3] and epochs["best_epoch"] == 3 and epochs["state"]["status"] == "training"
 
 
+def test_runner_log_is_utf8(tmp_path):
+    # redirected to a file, Windows' stdout encodes in the ANSI code page: rich's tables (RF-DETR) crashed the run
+    import subprocess
+    import sys
+
+    log = tmp_path / "train.log"
+    script = "from yolo_workbench.train_runner import utf8_output; utf8_output(); print('\\u2502 mAP \\u2502'); print('x', file=__import__('sys').stderr)"
+    env = {key: value for key, value in os.environ.items() if key not in ("PYTHONIOENCODING", "PYTHONUTF8")}
+    with log.open("wb") as stream:
+        subprocess.run([sys.executable, "-c", script], stdout=stream, stderr=subprocess.STDOUT, env=env, check=True)
+    assert sorted(log.read_text(encoding="utf-8").splitlines()) == ["x", "│ mAP │"]
+
+
 def test_best_weights_download_name(tmp_path):
     dataset = make_dataset(tmp_path)
     launcher = FakeLauncher()

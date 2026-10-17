@@ -199,7 +199,8 @@ def launch_subprocess(spec_path: Path, run_dir: Path, cwd: Path) -> SubprocessHa
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            # UTF-8 log also from the dataloader worker processes (train_runner reconfigures its own streams)
+            env={**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8:backslashreplace"},
             **detach,
         )
     finally:

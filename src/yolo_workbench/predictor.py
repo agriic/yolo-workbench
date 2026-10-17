@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from . import frameworks
+from . import frameworks, libraries
 from .dataset import Dataset, DatasetError
 from .imaging import upright_rgb
 from .masks import drop_specks, mask_outlines
@@ -79,6 +79,7 @@ class UltralyticsBackend:
     default_conf = 0.25
 
     def __init__(self, path: Path, category: str, conf: float, iou: float):
+        libraries.load("ultralytics.models")  # what `from ultralytics import YOLO` imports
         from ultralytics import YOLO
 
         self.category = category
@@ -139,6 +140,7 @@ class RFDETRBackend:
     default_conf = 0.5  # RF-DETR's own default threshold; its scores run lower than YOLO's
 
     def __init__(self, path: Path, category: str, conf: float, iou: float):
+        libraries.load("rfdetr")
         from rfdetr import RFDETR
 
         self.category = category

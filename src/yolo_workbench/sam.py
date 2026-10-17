@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+from . import libraries
 from .dataset import DatasetError
 from .masks import drop_specks, mask_box, mask_outlines
 from .predictor import ultralytics_available
@@ -36,6 +37,7 @@ class UltralyticsSamBackend:
     """SAM 2.1 through Ultralytics' SAM2Predictor: encode() once per image, segment() per prompt."""
 
     def __init__(self, path: Path):
+        libraries.load("ultralytics.models.sam")
         from ultralytics.models.sam import SAM2Predictor
 
         self.predictor = SAM2Predictor(overrides={"model": str(path), "imgsz": 1024, "conf": 0.0, "save": False, "verbose": False})
@@ -72,6 +74,7 @@ class UltralyticsSamBackend:
 
 def _gpu_available() -> bool:
     try:
+        libraries.load("torch")
         import torch
 
         return torch.cuda.is_available() or torch.backends.mps.is_available()
@@ -84,6 +87,7 @@ WEIGHTS_DIR = Path.home() / ".cache" / "yolo-workbench" / "weights"  # shared wi
 
 def weights_path(name: str) -> Path:
     """An existing copy (ours, or Ultralytics' weights dir) or where to download it."""
+    libraries.load("ultralytics.utils")
     from ultralytics.utils import SETTINGS
 
     for directory in (WEIGHTS_DIR, Path(SETTINGS["weights_dir"])):
@@ -93,6 +97,7 @@ def weights_path(name: str) -> Path:
 
 
 def _default_factory(name: str):
+    libraries.load("ultralytics.utils.downloads")
     from ultralytics.utils.downloads import attempt_download_asset
 
     # an absolute path keeps the download out of the server's cwd

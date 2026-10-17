@@ -4,7 +4,7 @@ Detection and segmentation run Ultralytics' own transforms (`ultralytics.data.au
 is what training does, labels included (clipping, the box filter, copy-paste selection). For the range ends, every random
 draw inside that module is pinned to the low or the high end of its range for the duration of one render; pipeline samples
 seed the real random generators instead. Classification runs the torchvision operations Ultralytics composes
-(`classify_augmentations`). Imports of ultralytics/torch happen on first use.
+(`classify_augmentations`). Imports of ultralytics/torch happen on first use, through `libraries.load`.
 
 Images are rendered at `min(imgsz, WORK_SIZE)`. Every augmentation is scale-free except `perspective`, whose coefficient is
 in pixels; it is rescaled so a preview looks like the same value at the real `imgsz`.
@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image, ImageDraw
 
+from . import libraries
 from .dataset import Dataset, DatasetError
 from .models import Annotation
 
@@ -35,6 +36,7 @@ CLS_KEYS = {"hsv_h", "hsv_s", "hsv_v", "scale", "flipud", "fliplr", "erasing", "
 CLS_RATIO = (3 / 4, 4 / 3)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
+LIBRARIES = ("cv2", "torch", "torchvision.transforms", "ultralytics.data.augment", "ultralytics.utils.instance", "ultralytics.utils.ops")
 
 _render_lock = threading.Lock()  # renders patch module globals and reseed global generators
 _image_cache: OrderedDict = OrderedDict()
@@ -491,6 +493,7 @@ def _work_size(imgsz: int) -> int:
 def render_original(dataset: Dataset, sample: int, imgsz: int, size: int, draw_labels: bool, color: Callable[[int], str]) -> Preview:
     samples, total = sample_pool(dataset, sample, partners=0)
     work = _work_size(imgsz)
+    libraries.load(*LIBRARIES)
     with _render_lock:
         if dataset.category == "classification":
             image = _cls_square(_cls_base(samples[0], work), work)
@@ -506,6 +509,7 @@ def render_augmentation(dataset: Dataset, key: str, side: str, values: dict, def
         raise DatasetError(f"No preview for `{key}` in {category} training")
     samples, _ = sample_pool(dataset, sample)
     work = _work_size(imgsz)
+    libraries.load(*LIBRARIES)
     value = values.get(key, defaults.get(key))
     with _render_lock:
         if category == "classification":
@@ -525,6 +529,7 @@ def render_pipeline(dataset: Dataset, values: dict, defaults: dict, sample: int,
     """A training sample with every augmentation at once, as the dataloader would produce it."""
     samples, _ = sample_pool(dataset, sample)
     work = _work_size(imgsz)
+    libraries.load(*LIBRARIES)
     with _render_lock:
         if dataset.category == "classification":
             return Preview(_jpeg(_cls_pipeline(values, defaults, samples[0], work, seed), size))
