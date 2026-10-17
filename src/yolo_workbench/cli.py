@@ -25,7 +25,7 @@ def main(
     host: str = typer.Option("127.0.0.1", help="Address to bind"),
     port: int = typer.Option(8765, min=1, max=65535),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open a browser automatically"),
-    model: Optional[Path] = typer.Option(None, "--model", help="Ultralytics model (.pt) to preload for assisted labeling (single-dataset mode)"),
+    model: Optional[Path] = typer.Option(None, "--model", help="Ultralytics (.pt) or RF-DETR (.pth) model to preload for assisted labeling (single-dataset mode)"),
 ) -> None:
     """Start the workbench for DATASET_YAML, or for a folder of projects with --projects."""
     if (dataset_yaml is None) == (projects is None):

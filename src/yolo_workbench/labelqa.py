@@ -361,13 +361,14 @@ def _confident(finding: dict, min_conf: float) -> bool:
 
 
 def _model_name(path: Path) -> str:
-    try:
-        run_dir = path.parent.parent
-        name = json.loads((run_dir / "workbench" / "run.json").read_text(encoding="utf-8")).get("name")
+    # a training run's weights: Ultralytics keeps them in <run>/weights/, RF-DETR in the run folder itself
+    for run_dir in (path.parent.parent, path.parent):
+        try:
+            name = json.loads((run_dir / "workbench" / "run.json").read_text(encoding="utf-8")).get("name")
+        except (OSError, ValueError, AttributeError):
+            continue
         if name:
             return f"{name} · {path.name}"
-    except (OSError, ValueError, AttributeError):
-        pass
     return path.name
 
 

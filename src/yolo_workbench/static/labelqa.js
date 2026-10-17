@@ -81,7 +81,7 @@ async function loadModelChoices() {
   if (loaded && !items.some(item => item.path === loaded)) items.unshift({ path: loaded, name: loaded.split("/").pop(), loaded: true });
   $("qa-model").innerHTML = items.length
     ? items.map(item => `<option value="${esc(item.path)}" ${item.loaded ? "selected" : ""} title="${esc(item.path)}">${esc(item.name)}${item.trained ? " · trained here" : ""}${item.loaded ? " · loaded" : ""}</option>`).join("")
-    : `<option value="">No .pt models found — train one in the Training tab, or load one in the Annotation tab</option>`;
+    : `<option value="">No models found — train one in the Training tab, or load one in the Annotation tab</option>`;
   renderSetup();
 }
 
@@ -168,7 +168,7 @@ function renderSetup() {
   let text;
   if (status.predictor.status === "unavailable") text = "Label QA needs ultralytics (run 'uv sync').";
   else if (running) text = `Analyzing ${job.done.toLocaleString()} / ${job.total.toLocaleString()} images…`;
-  else if (!loadedChosen && choice) text = "Load the model, then analyze. The best.pt of a training run on this dataset works well.";
+  else if (!loadedChosen && choice) text = "Load the model, then analyze. The best weights of a training run on this dataset work well.";
   else if (result) {
     const when = new Date(result.created).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
     text = `Results of ${result.model_name} on ${result.images.toLocaleString()} image${result.images === 1 ? "" : "s"} (${result.split}) · ${when}`;
@@ -247,7 +247,7 @@ function renderFindings() {
   $("qa-total").textContent = result ? `${qa.total.toLocaleString()} finding${qa.total === 1 ? "" : "s"} in ${(qa.images || 0).toLocaleString()} image${qa.images === 1 ? "" : "s"}${stale}` : "";
   $("qa-more").hidden = qa.items.length >= qa.total;
   if (!result) {
-    $("qa-grid").innerHTML = `<div class="empty">No analysis yet. Load a model trained on similar data (a training run's best.pt is ideal) and press Analyze.</div>`;
+    $("qa-grid").innerHTML = `<div class="empty">No analysis yet. Load a model trained on similar data (a training run's best weights are ideal) and press Analyze.</div>`;
     return;
   }
   $("qa-grid").innerHTML = qa.items.map(item => {

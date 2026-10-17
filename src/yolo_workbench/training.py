@@ -1,8 +1,10 @@
-"""Ultralytics training runs: run history, a persistent single-GPU queue, and the dataset lock.
+"""Training runs (Ultralytics YOLO or RF-DETR): run history, a persistent single-GPU queue, and the dataset lock.
 
 A run is a directory under the dataset's runs root (`<project>/runs/` or `<dataset dir>/runs/`):
-Ultralytics' own output plus `workbench/` (see train_runner.py for the files the subprocess writes).
-Runs made outside the app (e.g. `yolo train`) are listed too, from their args.yaml/results.csv.
+the trainer's own output plus `workbench/` (see train_runner.py for the files the subprocess writes).
+What depends on the trainer (arguments, weights, results files) is asked of its `frameworks.Framework`.
+Runs made outside the app are listed too: `yolo train` runs from their args.yaml/results.csv, RF-DETR
+runs from their training_config.json/metrics.csv.
 
 `TrainingManager` owns the queue (`queue.json` under its state dir): one active run, launched as a
 detached subprocess (own session, so it survives server restarts and Ctrl+C), the rest FIFO.
@@ -15,10 +17,7 @@ makes every write path raise `DatasetLocked` (HTTP 409).
 
 from __future__ import annotations
 
-import csv
-import difflib
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -34,20 +33,27 @@ from typing import Callable
 
 import yaml
 
+from . import frameworks
 from .dataset import Dataset, DatasetError, DatasetLocked  # noqa: F401  (DatasetLocked is part of this module's API)
+from .frameworks import (  # noqa: F401  (re-exported: the Ultralytics argument helpers used to live here)
+    MANAGED_KEYS,
+    TASKS,
+    _read_json,
+    _read_yaml,
+    _write_json,
+    args_to_yaml,
+    fitness,
+    read_results_csv,
+    ultralytics_defaults,
+    validate_args,
+)
 from .fsutil import WINDOWS, replace
 from .jobs import JobManager
 
 META_DIR = "workbench"
-MANAGED_KEYS = ("data", "project", "name", "exist_ok", "resume", "mode", "task", "save_dir")
 ACTIVE_STATES = {"starting", "preparing", "training", "validating", "testing"}
 TERMINAL_STATES = {"completed", "paused", "failed", "stopped", "interrupted"}
 RESUMABLE_STATES = {"paused", "failed", "stopped", "interrupted"}
-TASKS = {"detection": "detect", "segmentation": "segment", "classification": "classify"}
-MODEL_SUFFIX = {"detection": "", "segmentation": "-seg", "classification": "-cls"}
-PRETRAINED_FAMILIES = (("yolo26", "YOLO26"), ("yolo11", "YOLO11"), ("yolov8", "YOLOv8"))
-PRETRAINED_SIZES = "nsmlx"
-PRETRAINED_PATTERN = re.compile(r"^(yolo(?:v8|11|26))([nsmlx])(-seg|-cls|-pose|-obb)?\.(pt|yaml)$")
 PLOT_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 LOG_TAIL = 64 * 1024
 SCAN_DEPTH = 3
@@ -77,58 +83,7 @@ def runs_root_for(yaml_path: Path) -> Path:
     return (yaml_path if yaml_path.is_dir() else yaml_path.parent) / "runs"
 
 
-# ---------- small file helpers ----------
-
-
-def _read_json(path: Path):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-
-def _write_json(path: Path, data) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    replace(temporary, path)
-
-
-def _read_yaml(path: Path):
-    try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError):
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _number(value):
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if number == number and abs(number) != float("inf") else None
-
-
-def read_results_csv(path: Path) -> list[dict]:
-    """Ultralytics' results.csv as rows of floats (older versions pad the header with spaces)."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
-    rows = []
-    for raw in csv.DictReader(text.splitlines()):
-        row = {}
-        for key, value in raw.items():
-            if key is None:
-                continue
-            number = _number(value)
-            if number is not None:
-                row[key.strip()] = number
-        if "epoch" in row:
-            row["epoch"] = int(row["epoch"])
-            rows.append(row)
-    return rows
+# ---------- results ----------
 
 
 def read_epochs_jsonl(path: Path) -> list[dict]:
@@ -148,24 +103,18 @@ def read_epochs_jsonl(path: Path) -> list[dict]:
     return [by_epoch[epoch] for epoch in sorted(by_epoch)]
 
 
-def fitness(row: dict, category: str) -> float | None:
-    """Ultralytics 8.4's fitness per task (used for runs without the runner's own fitness column)."""
-    if category == "classification":
-        top1, top5 = row.get("metrics/accuracy_top1"), row.get("metrics/accuracy_top5")
-        return None if top1 is None or top5 is None else (top1 + top5) / 2
-    box = row.get("metrics/mAP50-95(B)")
-    if category == "segmentation":
-        mask = row.get("metrics/mAP50-95(M)")
-        return None if box is None or mask is None else box + mask
-    return box
-
-
-def best_epoch(rows: list[dict], category: str) -> dict | None:
-    """The epoch best.pt holds: Ultralytics rewrites best.pt whenever fitness ties the best, so the last tie wins."""
+def best_epoch(rows: list[dict], category: str, framework: frameworks.Framework = frameworks.ULTRALYTICS) -> dict | None:
+    """The epoch the best weights hold. Ultralytics rewrites best.pt whenever fitness ties the best, so the
+    last tie wins; RF-DETR saves only on a strict improvement (and not in its skip_best_epochs), so its
+    runner marks the epochs (`is_best`) and the last marked one wins."""
+    if framework is frameworks.RFDETR:
+        marked = [row for row in rows if row.get("is_best")]
+        if marked:
+            return marked[-1]
     best, best_value = None, None
     for row in rows:
-        value = row.get("fitness") if row.get("fitness") is not None else fitness(row, category)
-        if value is not None and (best_value is None or value >= best_value):
+        value = row.get("fitness") if row.get("fitness") is not None else framework.fitness(row, category)
+        if value is not None and (best_value is None or value > best_value or value == best_value and framework is not frameworks.RFDETR):
             best, best_value = row, value
     return best
 
@@ -177,123 +126,6 @@ def collapse_progress(text: str) -> str:
     """Plain text of a console log: ANSI colors dropped, only the last carriage-return segment of each line (tqdm redraws)."""
     text = ANSI_ESCAPE.sub("", text)
     return "\n".join(line.rsplit("\r", 1)[-1] if "\r" in line.rstrip("\r") else line.rstrip("\r") for line in text.split("\n"))
-
-
-# ---------- Ultralytics argument defaults ----------
-
-_defaults_cache: tuple[dict, dict] | None = None
-
-
-def ultralytics_defaults() -> tuple[dict, dict]:
-    """(defaults, help) from Ultralytics' cfg/default.yaml, read without importing ultralytics (or torch)."""
-    global _defaults_cache
-    if _defaults_cache is None:
-        spec = importlib.util.find_spec("ultralytics")
-        if spec is None or not spec.origin:
-            raise DatasetError("ultralytics is not installed")
-        path = Path(spec.origin).parent / "cfg" / "default.yaml"
-        text = path.read_text(encoding="utf-8")
-        defaults = yaml.safe_load(text) or {}
-        help_text = {}
-        for line in text.splitlines():
-            match = re.match(r"^([a-z_0-9]+):[^#]*#\s*(.*)$", line)
-            if match:
-                help_text[match.group(1)] = match.group(2).strip()
-        _defaults_cache = (defaults, help_text)
-    return _defaults_cache
-
-
-def _key_line(text: str, key: str) -> int | None:
-    for number, line in enumerate(text.splitlines(), 1):
-        if re.match(rf"^\s*{re.escape(key)}\s*:", line):
-            return number
-    return None
-
-
-def _check_value(key: str, value) -> str | None:
-    """Ultralytics' own type/range check for one argument (imported lazily; ~1 s once per process)."""
-    try:
-        from ultralytics.cfg import check_cfg
-    except Exception:  # ultralytics unavailable or broken: the runner reports problems instead
-        return None
-    try:
-        check_cfg({key: value}, hard=True)
-    except (TypeError, ValueError) as exc:
-        return str(exc).strip()
-    return None
-
-
-def validate_args(category: str, text: str) -> dict:
-    """Parse raw YAML training arguments: {args, errors: [{line, message}], warnings}."""
-    errors: list[dict] = []
-    warnings: list[dict] = []
-    try:
-        data = yaml.safe_load(text) if text.strip() else {}
-    except yaml.YAMLError as exc:
-        mark = getattr(exc, "problem_mark", None)
-        return {"args": {}, "errors": [{"line": mark.line + 1 if mark else None, "message": f"Invalid YAML: {getattr(exc, 'problem', None) or exc}"}], "warnings": []}
-    if data is None:
-        data = {}
-    if not isinstance(data, dict):
-        return {"args": {}, "errors": [{"line": 1, "message": "Arguments must be `key: value` lines"}], "warnings": []}
-    defaults, _ = ultralytics_defaults()
-    args: dict = {}
-    for key, value in data.items():
-        key = str(key)
-        line = _key_line(text, key)
-        if key in MANAGED_KEYS:
-            errors.append({"line": line, "message": f"`{key}` is set by the workbench and cannot be changed"})
-            continue
-        if key not in defaults:
-            close = difflib.get_close_matches(key, list(defaults), n=1)
-            errors.append({"line": line, "message": f"Unknown argument `{key}`" + (f" (did you mean `{close[0]}`?)" if close else "")})
-            continue
-        problem = _check_value(key, value)
-        if problem:
-            errors.append({"line": line, "message": problem})
-            continue
-        args[key] = value
-    cache = args.get("cache")
-    if isinstance(cache, str) and cache.lower() == "disk":
-        errors.append({"line": _key_line(text, "cache"), "message": "cache: disk writes .npy files next to every image in the dataset; use `ram` or `false`"})
-    hue = args.get("hsv_h")
-    if category == "classification" and isinstance(hue, (int, float)) and hue > 0.5:
-        errors.append({"line": _key_line(text, "hsv_h"), "message": "hsv_h must be at most 0.5 for classification (torchvision's ColorJitter hue range)"})
-    device = args.get("device")
-    if isinstance(device, list) and len(device) > 1 or isinstance(device, str) and "," in device:
-        errors.append({"line": _key_line(text, "device"), "message": "Multi-GPU training is not supported here (no live progress with DDP); pick one device"})
-    model = args.get("model")
-    if not model:
-        errors.append({"line": _key_line(text, "model") or 1, "message": "`model` is required (a pretrained name such as yolo11n.pt, or a previous run's weights)"})
-    else:
-        model = str(model)
-        args["model"] = model
-        match = PRETRAINED_PATTERN.match(model)
-        if match:
-            suffix = match.group(3) or ""
-            if suffix != MODEL_SUFFIX[category]:
-                errors.append({"line": _key_line(text, "model"), "message": f"{model} is not a {category} model; use a name like {match.group(1)}{match.group(2)}{MODEL_SUFFIX[category]}.pt"})
-        elif "/" in model or os.sep in model:
-            if not Path(model).expanduser().is_file():
-                errors.append({"line": _key_line(text, "model"), "message": f"Model file not found: {model}"})
-        elif not model.endswith((".pt", ".yaml", ".yml")):
-            errors.append({"line": _key_line(text, "model"), "message": "`model` must be a .pt weights file or a model .yaml"})
-    if args.get("time"):
-        warnings.append({"line": _key_line(text, "time"), "message": "`time` overrides `epochs`: the epoch count changes while training"})
-    ordered = {"model": args.pop("model")} if "model" in args else {}
-    ordered.update(args)
-    return {"args": ordered, "errors": errors, "warnings": warnings}
-
-
-def args_to_yaml(args: dict) -> str:
-    """One `key: value` line per argument (lists inline, like args.yaml)."""
-    lines = []
-    for key, value in args.items():
-        if isinstance(value, list) and all(not isinstance(item, (list, dict)) for item in value):
-            lines.append(f"{key}: {json.dumps(value)}\n")
-        else:
-            lines.append(yaml.safe_dump({key: value}, sort_keys=False, default_flow_style=False, allow_unicode=True))
-    return "".join(lines)
 
 
 # ---------- processes ----------
@@ -583,16 +415,23 @@ class TrainingManager:
     def _launch(self, entry: dict, target: TrainingTarget, run_dir: Path) -> None:
         workdir = run_dir / META_DIR
         spec = _read_json(workdir / "spec.json") or {}
+        framework = frameworks.get(spec.get("framework"))
         try:
             dataset = target.dataset()
             with dataset._lock:  # in-flight writes finish before the guard flips
-                plan = self._data_plan(target, dataset)
+                plan = self._data_plan(target, dataset, framework)
                 if plan["errors"]:
                     raise DatasetError("; ".join(plan["errors"]))
-                data = self._write_data(target, plan, workdir)
-                spec["args"] = {**spec.get("args", {}), "data": data["data"], "project": str(target.runs_root), "name": run_dir.name, "exist_ok": True}
-                spec["test_eval"] = {"data": data["data"]} if plan["has_test"] else None
-                spec["cache_files"] = plan["cache_files"]
+                if framework is frameworks.RFDETR:
+                    # the runner builds an RF-DETR dataset folder from this snapshot (see rfdetr_runner.py)
+                    _write_json(workdir / "splits.json", self._rfdetr_splits(dataset, plan))
+                    spec["data"] = "splits.json"
+                    spec["test_eval"] = plan["has_test"]
+                else:
+                    data = self._write_data(target, plan, workdir)
+                    spec["args"] = {**spec.get("args", {}), "data": data["data"], "project": str(target.runs_root), "name": run_dir.name, "exist_ok": True}
+                    spec["test_eval"] = {"data": data["data"]} if plan["has_test"] else None
+                    spec["cache_files"] = plan["cache_files"]
                 _write_json(workdir / "spec.json", spec)
                 meta = _read_json(workdir / "run.json") or {}
                 meta["dataset"] = {"fingerprint": plan["fingerprint"], "splits": plan["counts"], "names": plan["names"], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -615,10 +454,10 @@ class TrainingManager:
             self._save_queue()
             self._refresh_lock()
 
-    # ---------- dataset → Ultralytics data ----------
+    # ---------- dataset → training data ----------
 
-    def _data_plan(self, target: TrainingTarget, dataset: Dataset) -> dict:
-        """What Ultralytics will train on, plus blocking errors and confirmable warnings."""
+    def _data_plan(self, target: TrainingTarget, dataset: Dataset, framework: frameworks.Framework = frameworks.ULTRALYTICS) -> dict:
+        """What the run will train on, plus blocking errors and confirmable warnings."""
         errors: list[str] = []
         warnings: list[str] = []
         notes: list[str] = []
@@ -629,7 +468,7 @@ class TrainingManager:
         if not names:
             errors.append("The dataset has no classes")
         elif sorted(names) != list(range(len(names))):
-            errors.append("Class IDs must be contiguous from 0 (Ultralytics requirement); reorder or remove classes first")
+            errors.append(f"Class IDs must be contiguous from 0 ({framework.label} requirement); reorder or remove classes first")
         if not counts["train"]:
             errors.append("The train split has no images")
         if target.category == "classification":
@@ -644,20 +483,18 @@ class TrainingManager:
             has_test = bool(counts["test"]) and bool(counts["val"])
         else:
             if not counts["val"]:
-                errors.append("The val split has no images; Ultralytics validates on it every epoch")
+                errors.append(f"The val split has no images; {framework.label} validates on it every epoch")
             has_test = bool(counts["test"])
-            mismatched = 0
-            for record in records:
-                expected = Path(_ultralytics_label_path(str(record.path)))
-                if expected != record.label_path:
-                    mismatched += 1
+            # RF-DETR trains on a folder the runner builds, so only Ultralytics needs the labels where it looks
+            mismatched = 0 if framework is frameworks.RFDETR else sum(1 for record in records if Path(_ultralytics_label_path(str(record.path))) != record.label_path)
             if mismatched:
                 errors.append(f"Ultralytics would not find the labels of {mismatched} image(s): their labels are next to the images inside an images/ folder; move them to the parallel labels/ folder")
         if not has_test:
             notes.append("No test split: the run is evaluated on val only")
         issue_errors = sum(1 for issue in dataset.issues() if issue.get("severity") == "error")
         if issue_errors:
-            warnings.append(f"{issue_errors} validation error(s) in the dataset (Ultralytics skips or repairs broken labels; see the Validation tab)")
+            skipped = "broken lines are left out" if framework is frameworks.RFDETR else "Ultralytics skips or repairs broken labels"
+            warnings.append(f"{issue_errors} validation error(s) in the dataset ({skipped}; see the Validation tab)")
         if target.category == "classification":
             present = {record.annotations[0].class_id for record in splits["train"] if record.annotations}
         else:
@@ -669,7 +506,7 @@ class TrainingManager:
         for split in ("train", "val", "test"):
             for record in splits[split]:
                 digest.update(f"{split}\0{record.path}\0{dataset._mtimes.get(record.label_path)}\n".encode())
-        cache_files = sorted({str(record.label_path.parent.with_suffix(".cache")) for record in records}) if target.category != "classification" else []
+        cache_files = sorted({str(record.label_path.parent.with_suffix(".cache")) for record in records}) if target.category != "classification" and framework is frameworks.ULTRALYTICS else []
         return {
             "errors": errors,
             "warnings": warnings,
@@ -698,6 +535,17 @@ class TrainingManager:
         data_path.write_text(header + yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8", newline="\n")
         return {"data": str(data_path)}
 
+    @staticmethod
+    def _rfdetr_splits(dataset: Dataset, plan: dict) -> dict:
+        """The images per split with their parsed labels (broken lines already left out), for the RF-DETR runner."""
+        records = {str(record.path): record for record in dataset.images.values()}
+        splits = {
+            split: [[path, [[annotation.class_id, *annotation.points] for annotation in records[path].annotations]] for path in paths]
+            for split, paths in plan["splits"].items()
+            if paths
+        }
+        return {"version": 1, "category": dataset.category, "names": plan["names"], "splits": splits}
+
     # ---------- runs ----------
 
     @staticmethod
@@ -708,7 +556,7 @@ class TrainingManager:
         found: list[Path] = []
 
         def walk(directory: Path, depth: int, keep) -> None:
-            if (directory / META_DIR / "run.json").is_file() or (directory / "args.yaml").is_file():
+            if (directory / META_DIR / "run.json").is_file() or frameworks.is_external_run(directory):
                 if keep(directory):
                     found.append(directory)
                 return
@@ -726,7 +574,7 @@ class TrainingManager:
         dataset_paths = {target.yaml_path.resolve(), target.dataset_root.resolve()}
 
         def belongs(directory: Path) -> bool:
-            data = (_read_yaml(directory / "args.yaml") or {}).get("data")
+            data = (_read_yaml(directory / "args.yaml") or {}).get("data") or ((_read_json(directory / "training_config.json") or {}).get("train_config") or {}).get("dataset_dir")
             if not data:
                 return False
             path = Path(str(data))
@@ -758,13 +606,15 @@ class TrainingManager:
             self._file_cache[key] = loader(path)
         return self._file_cache[key]
 
-    def _epochs(self, run_dir: Path, category: str) -> list[dict]:
+    def _epochs(self, run_dir: Path, category: str, framework: frameworks.Framework | None = None) -> list[dict]:
+        framework = framework or frameworks.of_run(run_dir)
         rows = self._cached(run_dir / META_DIR / "epochs.jsonl", read_epochs_jsonl)
         if not rows:
-            rows = self._cached(run_dir / "results.csv", read_results_csv) or []
+            results = run_dir / ("metrics.csv" if framework is frameworks.RFDETR else "results.csv")
+            rows = self._cached(results, lambda _: framework.results(run_dir)) or []
         for row in rows:
             if row.get("fitness") is None:
-                row["fitness"] = fitness(row, category)
+                row["fitness"] = framework.fitness(row, category)
         return rows
 
     def _queue_position(self, target: TrainingTarget, run_dir: Path) -> int | None:
@@ -783,9 +633,11 @@ class TrainingManager:
         source = meta.get("source") or ("workbench" if (workdir / "spec.json").is_file() else "external")
         state = _read_json(workdir / "state.json") or {}
         spec = _read_json(workdir / "spec.json") or {}
-        args = self._cached(run_dir / "args.yaml", _read_yaml) or spec.get("args") or {}
-        rows = self._epochs(run_dir, target.category)
-        best = best_epoch(rows, target.category)
+        recorded = meta.get("framework") or spec.get("framework")
+        framework = frameworks.get(recorded) if recorded else frameworks.of_run(run_dir)
+        args = self._run_args(framework, run_dir, spec)
+        rows = self._epochs(run_dir, target.category, framework)
+        best = best_epoch(rows, target.category, framework)
         status = state.get("status")
         active = self._is_active(target, run_dir)
         position = self._queue_position(target, run_dir)
@@ -799,6 +651,14 @@ class TrainingManager:
         val = _read_json(workdir / "val.json")
         epochs = state.get("epochs") or args.get("epochs")
         created = meta.get("created") or time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(run_dir.stat().st_mtime))
+        weights = framework.weights(run_dir)
+        if framework is frameworks.RFDETR:
+            variant = frameworks.RFDETR_VARIANTS.get(str(args.get("model") or ""))
+            imgsz, batch = args.get("resolution") or (variant or {}).get("resolution"), args.get("batch_size", 4)
+            if not epochs and source == "external":
+                epochs = framework.defaults(target.category)["epochs"]
+        else:
+            imgsz, batch = args.get("imgsz"), args.get("batch")
         return {
             "id": self.run_id(run_dir),
             "dir": (run_dir.relative_to(target.runs_root) if run_dir.is_relative_to(target.runs_root) else run_dir).as_posix(),
@@ -806,6 +666,7 @@ class TrainingManager:
             "name": meta.get("name") or run_dir.name,
             "notes": meta.get("notes", ""),
             "source": source,
+            "framework": framework.id,
             "status": status,
             "phase": state.get("phase"),
             "active": active,
@@ -814,8 +675,9 @@ class TrainingManager:
             "created": created,
             # a resume rewrites args.yaml's model to the run's own last.pt; show what the run started from
             "model": meta.get("base_model") or args.get("model"),
-            "imgsz": args.get("imgsz"),
-            "batch": args.get("batch"),
+            "variant": args.get("model") if framework is frameworks.RFDETR else None,
+            "imgsz": imgsz,
+            "batch": batch,
             "epochs": epochs,
             "epochs_done": rows[-1]["epoch"] if rows else 0,
             "epoch": state.get("epoch") if active else (rows[-1]["epoch"] if rows else 0),
@@ -827,13 +689,14 @@ class TrainingManager:
             "stopped_early": bool(state.get("stopped_early")),
             "error": state.get("error"),
             "test_error": state.get("test_error"),
-            "resumable": self._resumable(source, status, state, run_dir, rows, active, position),
-            "has_weights": {"best": (run_dir / "weights" / "best.pt").is_file(), "last": (run_dir / "weights" / "last.pt").is_file()},
+            "resumable": self._resumable(framework, source, status, state, run_dir, rows, active, position),
+            "weights": {kind: path.as_posix() for kind, path in weights.items()},
+            "has_weights": {kind: kind in weights for kind in ("best", "last")},
             "dataset": meta.get("dataset"),
         }
 
     @staticmethod
-    def _resumable(source, status, state, run_dir, rows, active, position) -> bool:
+    def _resumable(framework, source, status, state, run_dir, rows, active, position) -> bool:
         # final_eval() strips the optimizer from last.pt, after which Ultralytics refuses to resume
         return (
             source == "workbench"
@@ -842,8 +705,13 @@ class TrainingManager:
             and position is None
             and not state.get("final_eval")
             and bool(rows)
-            and (run_dir / "weights" / "last.pt").is_file()
+            and framework.resume_checkpoint(run_dir) is not None
         )
+
+    def _run_args(self, framework: frameworks.Framework, run_dir: Path, spec: dict) -> dict:
+        if framework is frameworks.ULTRALYTICS:
+            return self._cached(run_dir / "args.yaml", _read_yaml) or spec.get("args") or {}
+        return framework.run_args(run_dir, spec)
 
     def list_runs(self, project: str | None) -> dict:
         self.tick()
@@ -865,7 +733,7 @@ class TrainingManager:
             run_dir = self._require_run(target, run_id)
             summary = self._summary(target, run_dir)
         workdir = run_dir / META_DIR
-        args = _read_yaml(run_dir / "args.yaml") or (_read_json(workdir / "spec.json") or {}).get("args") or {}
+        args = frameworks.get(summary["framework"]).run_args(run_dir, _read_json(workdir / "spec.json") or {})
         plots = []
         for directory, prefix in ((run_dir, ""), (run_dir / "test", "test/")):
             if directory.is_dir():
@@ -883,8 +751,9 @@ class TrainingManager:
     def epochs(self, project: str | None, run_id: str, since: int = 0) -> dict:
         target = self.resolve(project)
         run_dir = self._require_run(target, run_id)
-        rows = self._epochs(run_dir, target.category)
-        best = best_epoch(rows, target.category)
+        framework = frameworks.of_run(run_dir)
+        rows = self._epochs(run_dir, target.category, framework)
+        best = best_epoch(rows, target.category, framework)
         state = _read_json(run_dir / META_DIR / "state.json") or {}
         return {"items": [row for row in rows if row["epoch"] > since], "best_epoch": best["epoch"] if best else None, "state": state if self._is_active(target, run_dir) else None}
 
@@ -914,22 +783,22 @@ class TrainingManager:
         return path
 
     def best_weights(self, project: str | None, run_id: str) -> tuple[Path, str]:
-        """best.pt and its download name: <dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD of best.pt>.pt."""
+        """The best weights and their download name: <dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD written>.pt (.pth for RF-DETR)."""
         target = self.resolve(project)
         with self._lock:
             run_dir = self._require_run(target, run_id)
             summary = self._summary(target, run_dir)
-        path = run_dir / "weights" / "best.pt"
+        path = Path(summary["weights"].get("best") or run_dir / "weights" / "best.pt")
         try:
             written = path.stat().st_mtime
         except OSError:
-            raise KeyError("This run has no best.pt") from None
+            raise KeyError("This run has no best weights") from None
         imgsz = summary["imgsz"]
         if isinstance(imgsz, (list, tuple)):
             imgsz = "x".join(str(side) for side in imgsz)
         parts = [target.name, summary["name"], imgsz, _model_label(summary["model"]), time.strftime("%Y.%m.%d", time.localtime(written))]
         parts = [_filename_part(part) for part in parts if part not in (None, "")]
-        return path, "-".join(part for part in parts if part) + ".pt"
+        return path, "-".join(part for part in parts if part) + path.suffix
 
     def update_run(self, project: str | None, run_id: str, name: str | None = None, notes: str | None = None) -> dict:
         target = self.resolve(project)
@@ -976,8 +845,7 @@ class TrainingManager:
         return {"deleted": run_id, "bytes": size}
 
     def _started_from(self, run_dir: Path) -> str | None:
-        """The name of the active or a queued run whose model is this run's weights (a resume loads its own last.pt)."""
-        weights = (run_dir / "weights").resolve()
+        """The name of the active or a queued run that fine-tunes from this run's weights (a resume loads its own checkpoint)."""
         entries = ([self._queue["active"]] if self._queue["active"] else []) + self._queue["queue"]
         for entry in entries:
             try:
@@ -985,8 +853,7 @@ class TrainingManager:
             except KeyError:
                 continue
             spec = _read_json(other / META_DIR / "spec.json") or {}
-            model = str((spec.get("args") or {}).get("model") or "")
-            if model and not spec.get("resume") and Path(model).expanduser().resolve().parent == weights:
+            if other != run_dir and not spec.get("resume") and frameworks.get(spec.get("framework")).started_from(spec.get("args") or {}, run_dir):
                 return (_read_json(other / META_DIR / "run.json") or {}).get("name") or other.name
         return None
 
@@ -994,39 +861,40 @@ class TrainingManager:
         """A run's arguments for a new run: managed keys and Ultralytics defaults stripped."""
         target = self.resolve(project)
         run_dir = self._require_run(target, run_id)
-        args = _read_yaml(run_dir / "args.yaml") or (_read_json(run_dir / META_DIR / "spec.json") or {}).get("args") or {}
-        defaults, _ = ultralytics_defaults()
-        kept = {key: value for key, value in args.items() if key not in MANAGED_KEYS and (key == "model" or key not in defaults or (defaults[key] != value and not (defaults[key] is None and value == "")))}
-        kept = {key: value for key, value in kept.items() if key in defaults}  # keys from other Ultralytics versions
-        ordered = {"model": kept.pop("model")} if "model" in kept else {}
-        ordered.update(kept)
-        return {"args": ordered, "yaml": args_to_yaml(ordered), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
+        framework = frameworks.of_run(run_dir)
+        args = self._run_args(framework, run_dir, _read_json(run_dir / META_DIR / "spec.json") or {})
+        ordered = framework.copy_args(args, target.category)
+        return {"args": ordered, "framework": framework.id, "yaml": args_to_yaml(ordered), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
 
     # ---------- options and validation ----------
 
     def options(self, project: str | None, dataset: Dataset) -> dict:
         target = self.resolve(project)
-        defaults, help_text = ultralytics_defaults()
-        suffix = MODEL_SUFFIX[target.category]
-        pretrained = []
-        for family, label in PRETRAINED_FAMILIES:
-            for size in PRETRAINED_SIZES:
-                name = f"{family}{size}{suffix}.pt"
-                pretrained.append({"name": name, "family": label, "size": size, "cached": (self.weights_dir / name).is_file()})
         names = [dataset.names[class_id] for class_id in sorted(dataset.names)]
         previous = []
         for summary in self.list_runs(project)["items"]:
-            weights = {kind: f"{summary['path']}/weights/{kind}.pt" for kind, present in summary["has_weights"].items() if present}
-            if weights:
+            if summary["weights"]:
                 run_names = (summary.get("dataset") or {}).get("names")
-                previous.append({"id": summary["id"], "name": summary["name"], "weights": weights, "best_metrics": summary["best_metrics"], "names_match": None if run_names is None else run_names == names})
+                previous.append({"id": summary["id"], "name": summary["name"], "framework": summary["framework"], "variant": summary["variant"], "weights": summary["weights"], "best_metrics": summary["best_metrics"], "names_match": None if run_names is None else run_names == names})
+        available = {}
+        for framework in frameworks.FRAMEWORKS.values():
+            if target.category not in framework.categories:
+                continue
+            reason = framework.unavailable()
+            entry = {"id": framework.id, "label": framework.label, "available": reason is None, "reason": reason}
+            if reason is None:
+                entry.update(defaults=framework.defaults(target.category), help=framework.help(), managed=list(framework.managed), pretrained=framework.pretrained(target.category, self.weights_dir))
+            available[framework.id] = entry
+        ultralytics = available.get("ultralytics", {})
         return {
             "category": target.category,
             "task": TASKS[target.category],
-            "defaults": {key: value for key, value in defaults.items() if key not in MANAGED_KEYS},
-            "help": help_text,
-            "managed": list(MANAGED_KEYS),
-            "pretrained": pretrained,
+            # the Ultralytics entry's fields at the top level, as before RF-DETR
+            "defaults": ultralytics.get("defaults", {}),
+            "help": ultralytics.get("help", {}),
+            "managed": ultralytics.get("managed", list(MANAGED_KEYS)),
+            "pretrained": ultralytics.get("pretrained", []),
+            "frameworks": list(available.values()),
             "runs": previous,
             "devices": self.devices(),
             "weights_dir": self.weights_dir.as_posix(),
@@ -1051,31 +919,34 @@ class TrainingManager:
 
     def validate(self, project: str | None, text: str) -> dict:
         target = self.resolve(project)
-        result = validate_args(target.category, text)
+        result = frameworks.validate(target.category, text)
         result["yaml"] = args_to_yaml(result["args"]) if not result["errors"] else text
         return result
 
     def preflight(self, project: str | None, dataset: Dataset, args: dict | None = None) -> dict:
         target = self.resolve(project)
+        framework = frameworks.for_args(args or {})
         with dataset._lock:
-            plan = self._data_plan(target, dataset)
+            plan = self._data_plan(target, dataset, framework)
         warnings = list(plan["warnings"])
-        model = str((args or {}).get("model") or "")
-        if model:
-            # Path comparison: the weights path comes back POSIX-style from options(), run folders are OS-native
-            model_dir = Path(model).expanduser().resolve().parent
+        errors = list(plan["errors"])
+        if framework is frameworks.RFDETR and (args or {}).get("batch_size") == "auto" and frameworks.rfdetr_device((args or {}).get("device")) in (None, "cuda") and not self.devices():
+            errors.append("batch_size: auto needs a CUDA GPU, and nvidia-smi found none; set a number")
+        if args:
+            # resolved paths: the weights path comes back POSIX-style from options(), run folders are OS-native
             for run_dir in self._scan(target):
-                if model_dir == (run_dir / "weights").resolve():
+                if framework.started_from(args, run_dir):
                     run_names = ((_read_json(run_dir / META_DIR / "run.json") or {}).get("dataset") or {}).get("names")
                     if run_names is not None and run_names != plan["names"]:
                         warnings.append("The base run was trained with different classes; its class head is re-initialized")
-        return {"errors": plan["errors"], "warnings": warnings, "notes": plan["notes"], "splits": plan["counts"]}
+        return {"errors": errors, "warnings": warnings, "notes": plan["notes"], "splits": plan["counts"]}
 
     # ---------- queue operations ----------
 
     def enqueue(self, project: str | None, dataset: Dataset, name: str, notes: str, text: str, confirm: bool = False) -> dict:
         target = self.resolve(project)
-        parsed = validate_args(target.category, text)
+        parsed = frameworks.validate(target.category, text)
+        framework = frameworks.get(parsed["framework"])
         if parsed["errors"]:
             raise DatasetError("; ".join(f"line {error['line']}: {error['message']}" if error.get("line") else error["message"] for error in parsed["errors"]))
         check = self.preflight(project, dataset, parsed["args"])
@@ -1092,8 +963,8 @@ class TrainingManager:
             workdir = run_dir / META_DIR
             workdir.mkdir(parents=True)
             now = time.strftime("%Y-%m-%dT%H:%M:%S")
-            _write_json(workdir / "run.json", {"version": 1, "name": display, "notes": notes or "", "created": now, "source": "workbench", "category": target.category, "task": TASKS[target.category], "base_model": parsed["args"]["model"]})
-            _write_json(workdir / "spec.json", {"version": 1, "args": parsed["args"], "resume": False})
+            _write_json(workdir / "run.json", {"version": 1, "name": display, "notes": notes or "", "created": now, "source": "workbench", "framework": framework.id, "category": target.category, "task": TASKS[target.category], "base_model": framework.base_model(parsed["args"])})
+            _write_json(workdir / "spec.json", {"version": 1, "framework": framework.id, "args": parsed["args"], "resume": False})
             self._write_state(run_dir, replace=True, status="queued", phase="queued", queued_at=time.time())
             self._queue["queue"].append({"project": project, "dir": directory})
             self._save_queue()
@@ -1242,9 +1113,12 @@ def _model_label(model) -> str:
     fallback = ""
     while model:
         path = Path(str(model).replace("\\", "/"))
-        if path.parent.name != "weights":
+        if path.parent.name == "weights":
+            run_dir = path.parent.parent
+        elif (path.parent / META_DIR / "run.json").is_file() or (path.parent / "training_config.json").is_file():
+            run_dir = path.parent  # RF-DETR keeps its weights in the run folder itself
+        else:
             return path.stem
-        run_dir = path.parent.parent
         fallback = fallback or run_dir.name
         if run_dir in seen:
             break

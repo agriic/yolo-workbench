@@ -2,6 +2,8 @@
 
 Runs one Ultralytics training (or resume) and reports through files in <run>/workbench/, which the
 server polls; nothing here talks to the server directly, so a run survives server restarts.
+RF-DETR runs (`spec.json` framework "rfdetr") are handed to rfdetr_runner.py, which reports through
+the same files with the same `Reporter`.
 
   state.json    rewritten atomically (≤1/s): status, phase, epoch/batch progress, best epoch, error
   epochs.jsonl  one row per completed epoch (the results.csv columns plus fitness/is_best/timing)
@@ -12,7 +14,7 @@ Kill: on POSIX the server also sends SIGTERM. Windows cannot deliver a catchable
 process, so a watcher thread turns control.json's "kill" into a SIGTERM raised in the main thread;
 either way `Reporter.on_sigterm` handles it and defers it past checkpoint writes.
 
-Only the standard library and ultralytics are imported, so the server process never pays for torch.
+Only the standard library and ultralytics (or rfdetr) are imported, so the server process never pays for torch.
 """
 
 from __future__ import annotations
@@ -65,9 +67,13 @@ def _number(value):
 
 
 class Reporter:
-    """Ultralytics callbacks that mirror training progress into the run's workbench/ files."""
+    """Ultralytics callbacks that mirror training progress into the run's workbench/ files.
 
-    def __init__(self, workdir: Path, resume: bool):
+    `raise_on_kill=False` (RF-DETR): a kill only sets `kill_requested`; the Lightning callback raises at
+    the next batch boundary, where no checkpoint is being written.
+    """
+
+    def __init__(self, workdir: Path, resume: bool, raise_on_kill: bool = True):
         self.workdir = workdir
         self.state_path = workdir / "state.json"
         self.epochs_path = workdir / "epochs.jsonl"
@@ -82,6 +88,7 @@ class Reporter:
         # which rewrites both), a kill only sets a flag and is honored right after the write.
         self.critical = False
         self.kill_requested = False
+        self.raise_on_kill = raise_on_kill
         self.epoch_started = time.time()
         self.epoch_times: list[float] = []  # recent epoch durations (train + val) for the ETA
         self.write(force=True)
@@ -107,7 +114,10 @@ class Reporter:
         """Thread body: a "kill" in control.json becomes a SIGTERM in the main thread (see on_sigterm)."""
         while not stop.wait(interval):
             if self.control() == "kill":
-                _thread.interrupt_main(signal.SIGTERM)
+                if self.raise_on_kill:
+                    _thread.interrupt_main(signal.SIGTERM)
+                else:
+                    self.kill_requested = True
                 return
 
     # ---------- callbacks ----------
@@ -148,7 +158,7 @@ class Reporter:
         if self.kill_requested:  # both the signal and the control.json watcher deliver a kill on POSIX
             return
         self.kill_requested = True
-        if not self.critical:
+        if self.raise_on_kill and not self.critical:
             raise RunKilled()
 
     def on_train_epoch_end(self, trainer) -> None:
@@ -242,9 +252,13 @@ def _test_eval(spec: dict, run_dir: Path, workdir: Path, reporter: Reporter) -> 
 
 
 def run(spec_path: Path) -> int:
+    spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    if spec.get("framework") == "rfdetr":
+        from .rfdetr_runner import run as run_rfdetr
+
+        return run_rfdetr(spec_path, spec)
     from ultralytics import YOLO
 
-    spec = json.loads(spec_path.read_text(encoding="utf-8"))
     workdir = spec_path.parent
     run_dir = workdir.parent
     resume = bool(spec.get("resume"))

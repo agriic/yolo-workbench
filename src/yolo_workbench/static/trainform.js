@@ -1,6 +1,8 @@
 // New-run form of the Training tab. One args object is the source of truth: GUI fields edit it
-// (a value equal to the Ultralytics default is dropped, so only real choices are kept), and the
+// (a value equal to the framework's default is dropped, so only real choices are kept), and the
 // raw YAML mode round-trips through the server's validator (POST /training/args/validate).
+// The framework (Ultralytics YOLO or RF-DETR) follows `model:` — an RF-DETR variant such as
+// rfdetr-medium — and decides the fields, the defaults and the model picker.
 import { $, api, esc, debounce } from "./api.js";
 import { state } from "./state.js";
 import { augmentationArgChanged, augmentationHtml, mountAugmentations } from "./augments.js";
@@ -16,14 +18,24 @@ const SUFFIX = { detection: "", segmentation: "-seg", classification: "-cls" };
 const PRETRAINED = /^(yolo(?:v8|11|26))([nsmlx])(-seg|-cls|-pose|-obb)?\.pt$/;
 const DET_SEG = ["detection", "segmentation"];
 const CLS = ["classification"];
+const RFDETR_MODEL = /^rfdetr-/;
+const LABELS = { ultralytics: "Ultralytics YOLO", rfdetr: "RF-DETR" };
 
-const GROUPS = [
-  { id: "basics", title: "Basics", open: true },
-  { id: "optimizer", title: "Optimizer" },
-  { id: "augmentation", title: "Augmentation" },
-  { id: "advanced", title: "Advanced" },
-];
-// `cats` limits a field to dataset categories; everything else is reachable in raw YAML.
+const GROUPS = {
+  ultralytics: [
+    { id: "basics", title: "Basics", open: true },
+    { id: "optimizer", title: "Optimizer" },
+    { id: "augmentation", title: "Augmentation" },
+    { id: "advanced", title: "Advanced" },
+  ],
+  rfdetr: [
+    { id: "basics", title: "Basics", open: true },
+    { id: "optimizer", title: "Optimizer" },
+    { id: "stopping", title: "Stopping & checkpoints" },
+    { id: "advanced", title: "Advanced" },
+  ],
+};
+// `cats` limits a field to dataset categories, `fw` to a framework (default Ultralytics); everything else is reachable in raw YAML.
 // The augmentation group renders as preview cards (augments.js); its entries here keep counts and raw YAML in step.
 const FIELDS = [
   { group: "basics", key: "epochs", label: "Epochs", type: "int", min: 1 },
@@ -75,6 +87,37 @@ const FIELDS = [
   { group: "advanced", key: "deterministic", label: "Deterministic", type: "bool" },
   { group: "advanced", key: "val", label: "Validate every epoch", type: "bool" },
   { group: "advanced", key: "plots", label: "Save plots", type: "bool" },
+
+  { fw: "rfdetr", group: "basics", key: "epochs", label: "Epochs", type: "int", min: 1 },
+  { fw: "rfdetr", group: "basics", key: "batch_size", label: "Batch", type: "batch", hint: "auto = the largest that fits (CUDA only)" },
+  { fw: "rfdetr", group: "basics", key: "grad_accum_steps", label: "Gradient accumulation", type: "int", min: 1, hint: "Effective batch = batch × this" },
+  { fw: "rfdetr", group: "basics", key: "resolution", label: "Resolution", type: "int", min: 12 },
+  { fw: "rfdetr", group: "basics", key: "device", label: "Device", type: "device" },
+  { fw: "rfdetr", group: "basics", key: "num_workers", label: "Dataloader workers", type: "int", min: 0 },
+  { fw: "rfdetr", group: "basics", key: "seed", label: "Seed", type: "int" },
+
+  { fw: "rfdetr", group: "optimizer", key: "lr", label: "Learning rate", type: "float", min: 0 },
+  { fw: "rfdetr", group: "optimizer", key: "lr_encoder", label: "Backbone learning rate", type: "float", min: 0 },
+  { fw: "rfdetr", group: "optimizer", key: "weight_decay", label: "Weight decay", type: "float", min: 0 },
+  { fw: "rfdetr", group: "optimizer", key: "warmup_epochs", label: "Warmup epochs", type: "float", min: 0 },
+  { fw: "rfdetr", group: "optimizer", key: "lr_scheduler", label: "LR schedule", type: "select", options: [["step", "Step"], ["cosine", "Cosine"]] },
+  { fw: "rfdetr", group: "optimizer", key: "clip_max_norm", label: "Gradient clipping", type: "float", min: 0 },
+  { fw: "rfdetr", group: "optimizer", key: "drop_path", label: "Drop path", type: "float", min: 0, max: 1 },
+  { fw: "rfdetr", group: "optimizer", key: "use_ema", label: "EMA weights", type: "bool" },
+
+  { fw: "rfdetr", group: "stopping", key: "early_stopping", label: "Early stopping", type: "bool" },
+  { fw: "rfdetr", group: "stopping", key: "early_stopping_patience", label: "Patience", type: "int", min: 0, hint: "Epochs without improvement before stopping" },
+  { fw: "rfdetr", group: "stopping", key: "early_stopping_min_delta", label: "Minimum improvement", type: "float", min: 0 },
+  { fw: "rfdetr", group: "stopping", key: "skip_best_epochs", label: "Ignore first N epochs", type: "int", min: 0, hint: "For the best weights and early stopping" },
+  { fw: "rfdetr", group: "stopping", key: "eval_interval", label: "Validate every N epochs", type: "int", min: 1 },
+  { fw: "rfdetr", group: "stopping", key: "checkpoint_interval", label: "Full checkpoint every N epochs", type: "int", min: 1, empty: "off", hint: "Each is weights + optimizer state (hundreds of MB); last.ckpt is always kept" },
+  { fw: "rfdetr", group: "stopping", key: "best_model_metric", label: "Best weights by", type: "select", options: [["map", "mAP"], ["mar", "mAR"]] },
+
+  { fw: "rfdetr", group: "advanced", key: "amp_dtype", label: "Mixed precision", type: "select", options: [["auto", "Auto"], ["bf16", "bf16"], ["fp16", "fp16"], ["fp8", "fp8 (NVIDIA)"], [null, "Off (FP32)"]] },
+  { fw: "rfdetr", group: "advanced", key: "multi_scale", label: "Multi-scale", type: "select", options: [["per-batch", "Per batch"], ["per-sample", "Per sample"], ["off", "Off"]] },
+  { fw: "rfdetr", group: "advanced", key: "expanded_scales", label: "Wider scale range", type: "bool" },
+  { fw: "rfdetr", group: "advanced", key: "eval_max_dets", label: "Detections per image (eval)", type: "int", min: 1 },
+  { fw: "rfdetr", group: "advanced", key: "save_dataset_grids", label: "Save augmented batch grids", type: "bool" },
 ];
 
 let options = null;   // GET /training/options
@@ -86,8 +129,19 @@ let checkToken = 0;
 let queueAhead = 0;
 
 const category = () => options.category;
-const fields = () => FIELDS.filter(field => !field.cats || field.cats.includes(category()));
-const storageKey = () => `yolo-workbench:train-args:${state.project ?? state.meta.yaml}`;
+const frameworkOf = values => RFDETR_MODEL.test(String(values?.model ?? "")) ? "rfdetr" : "ultralytics";
+const framework = () => frameworkOf(args);
+const fwOptions = (id = framework()) => options.frameworks?.find(item => item.id === id) ?? { id, label: LABELS[id], available: id === "ultralytics", defaults: options.defaults, help: options.help, pretrained: options.pretrained };
+const defaults = () => fwOptions().defaults ?? {};
+const groups = () => GROUPS[framework()];
+const fields = () => FIELDS.filter(field => (field.fw ?? "ultralytics") === framework() && (!field.cats || field.cats.includes(category())));
+const runsOf = id => options.runs.filter(run => (run.framework ?? "ultralytics") === id);
+// the RF-DETR variant the args name (its default resolution and the resolution step)
+const variantInfo = () => framework() === "rfdetr" ? fwOptions().pretrained?.find(item => item.name === args.model) : null;
+// Ultralytics args keep the original key; RF-DETR's get their own
+const storageKey = (id = "ultralytics") => `yolo-workbench:train-args:${state.project ?? state.meta.yaml}${id === "ultralytics" ? "" : `:${id}`}`;
+const frameworkKey = () => `yolo-workbench:train-framework:${state.project ?? state.meta.yaml}`;
+const argsByFramework = {};  // the other framework's args while the form is open, so switching back keeps them
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
 export async function loadTrainingOptions() {
@@ -124,6 +178,7 @@ export async function openRunForm(source = {}) {
     queueAhead = (queue.active ? 1 : 0) + queue.queued.length;
     let name = loaded.next_name;
     let notes = "";
+    Object.keys(argsByFramework).forEach(key => delete argsByFramework[key]);
     if (source.runId) {
       const copied = await api(`/training/runs/${encodeURIComponent(source.runId)}/args`);
       args = { ...copied.args };
@@ -131,16 +186,21 @@ export async function openRunForm(source = {}) {
       if (source.from === "finetune") {
         const run = loaded.runs.find(item => item.id === source.runId);
         const weights = run?.weights.best ?? run?.weights.last;
-        if (weights) args = { model: weights, ...withoutKey(args, "model") };
+        if (weights && run.framework === "rfdetr") {
+          args = { model: run.variant ?? args.model, pretrain_weights: weights, ...withoutKey(withoutKey(args, "model"), "pretrain_weights") };
+        } else if (weights) {
+          args = { model: weights, ...withoutKey(args, "model") };
+        }
         name = `${copied.name.replace(/-\d+$/, "")}-ft`;
         notes = `Fine-tuned from ${run?.name ?? "a previous run"}`;
       }
     } else {
-      args = readLastArgs() ?? { model: defaultModel() };
+      const last = readLastFramework();
+      args = readLastArgs(last) ?? { model: defaultModel(last) };
     }
-    if (!args.model) args = { model: defaultModel(), ...args };
+    if (!args.model) args = { model: defaultModel(framework()), ...args };
     mode = "gui";
-    modelSource = detectModelSource(args.model);
+    modelSource = detectModelSource(args);
     renderForm(name, notes, source);
     scheduleCheck(0);
   } catch (error) {
@@ -149,21 +209,36 @@ export async function openRunForm(source = {}) {
 }
 
 const withoutKey = (object, key) => Object.fromEntries(Object.entries(object).filter(([name]) => name !== key));
-const defaultModel = () => `${FAMILIES[0][0]}n${SUFFIX[category()]}.pt`;
+const defaultModel = (id = "ultralytics") => id === "rfdetr" ? fwOptions("rfdetr").pretrained?.[0]?.name ?? "rfdetr-nano" : `${FAMILIES[0][0]}n${SUFFIX[category()]}.pt`;
+const usable = id => fwOptions(id).available && options.frameworks?.some(item => item.id === id) !== false;
 
-function readLastArgs() {
+function readLastFramework() {
   try {
-    const saved = JSON.parse(localStorage.getItem(storageKey()) || "null");
-    return saved && typeof saved === "object" && !Array.isArray(saved) ? saved : null;
+    const saved = localStorage.getItem(frameworkKey());
+    return saved && usable(saved) ? saved : "ultralytics";
+  } catch { return "ultralytics"; }
+}
+function readLastArgs(id = "ultralytics") {
+  try {
+    const saved = JSON.parse(localStorage.getItem(storageKey(id)) || "null");
+    return saved && typeof saved === "object" && !Array.isArray(saved) && frameworkOf(saved) === id ? saved : null;
   } catch { return null; }
 }
 function saveLastArgs() {
-  try { localStorage.setItem(storageKey(), JSON.stringify(args)); } catch { /* a convenience only */ }
+  try {
+    localStorage.setItem(storageKey(framework()), JSON.stringify(args));
+    localStorage.setItem(frameworkKey(), framework());
+  } catch { /* a convenience only */ }
 }
 
-function detectModelSource(model) {
+function detectModelSource(values) {
+  if (frameworkOf(values) === "rfdetr") {
+    if (values.pretrain_weights) return runsOf("rfdetr").some(run => Object.values(run.weights).includes(values.pretrain_weights)) ? "run" : "custom";
+    return fwOptions("rfdetr").pretrained?.some(item => item.name === values.model) ? "pretrained" : "custom";
+  }
+  const model = values.model;
   if (PRETRAINED.test(model || "")) return "pretrained";
-  if (options.runs.some(run => Object.values(run.weights).includes(model))) return "run";
+  if (runsOf("ultralytics").some(run => Object.values(run.weights).includes(model))) return "run";
   return "custom";
 }
 
@@ -174,7 +249,7 @@ function renderForm(name, notes, source) {
   $("run-detail").innerHTML = `
     <form id="run-form" class="run-form" autocomplete="off" novalidate>
       <div class="run-head">
-        <div class="run-title"><h1>${esc(title)}</h1><p class="section-subtitle">${esc(category())} · Ultralytics ${esc(options.task)} · values left empty use the Ultralytics default (shown greyed)</p></div>
+        <div class="run-title"><h1>${esc(title)}</h1><p class="section-subtitle" id="run-form-subtitle">${subtitleText()}</p></div>
         <div class="segmented" role="radiogroup" aria-label="Editor">
           <label><input type="radio" name="form-mode" value="gui" checked><span>Form</span></label>
           <label><input type="radio" name="form-mode" value="raw"><span>Raw YAML</span></label>
@@ -189,7 +264,7 @@ function renderForm(name, notes, source) {
       <div id="form-gui"></div>
       <div id="form-raw" hidden>
         <div class="stats-panel form-panel">
-          <div class="panel-head"><h2>Arguments</h2><span class="muted">One <code>key: value</code> per line, as in <code>args.yaml</code>. <code>data</code>, <code>project</code> and <code>name</code> are set by the workbench.</span></div>
+          <div class="panel-head"><h2>Arguments</h2><span class="muted" id="raw-help">${rawHelp()}</span></div>
           <textarea id="raw-args" class="raw-args" spellcheck="false" rows="16" aria-label="Training arguments (YAML)"></textarea>
         </div>
       </div>
@@ -209,40 +284,91 @@ function renderForm(name, notes, source) {
   updateSubmit();
 }
 
+function subtitleText() {
+  const engine = framework() === "rfdetr" ? "RF-DETR" : `Ultralytics ${esc(options.task)}`;
+  return `${esc(category())} · ${engine} · values left empty use the ${framework() === "rfdetr" ? "RF-DETR" : "Ultralytics"} default (shown greyed)`;
+}
+const rawHelp = () => framework() === "rfdetr"
+  ? "One <code>key: value</code> per line: RF-DETR's training arguments, plus <code>model</code> (the variant), <code>pretrain_weights</code>, <code>resolution</code> and <code>device</code>. <code>dataset_dir</code> and <code>output_dir</code> are set by the workbench."
+  : "One <code>key: value</code> per line, as in <code>args.yaml</code>. <code>data</code>, <code>project</code> and <code>name</code> are set by the workbench.";
+
 function renderGui() {
   const changed = group => fields().filter(field => field.group === group && field.key in args).length;
+  if ($("run-form-subtitle")) $("run-form-subtitle").innerHTML = subtitleText();
+  if ($("raw-help")) $("raw-help").innerHTML = rawHelp();
   $("form-gui").innerHTML = `
     <div class="stats-panel form-panel">
-      <div class="panel-head"><h2>Model</h2></div>
+      <div class="panel-head"><h2>Model</h2>${frameworkSwitchHtml()}</div>
       ${modelHtml()}
     </div>
-    ${GROUPS.map(group => `
+    ${groups().map(group => `
       <details class="stats-panel form-panel form-group" data-group="${group.id}" ${group.open || changed(group.id) ? "open" : ""}>
         <summary><h2>${esc(group.title)}</h2><span class="changed-count" data-changed="${group.id}">${changed(group.id) ? `${changed(group.id)} changed` : ""}</span></summary>
         ${group.id === "augmentation" ? augmentationHtml(augmentationContext()) : `<div class="form-grid">${fields().filter(field => field.group === group.id).map(fieldHtml).join("")}</div>`}
       </details>`).join("")}
     ${extrasHtml()}`;
-  mountAugmentations($("form-gui").querySelector('[data-group="augmentation"]'));
+  const augmentation = $("form-gui").querySelector('[data-group="augmentation"]');
+  if (augmentation) mountAugmentations(augmentation);  // RF-DETR has no augmentation cards
 }
 
 const augmentationContext = () => ({
   category: category(),
-  defaults: options.defaults,
-  help: options.help,
+  defaults: defaults(),
+  help: fwOptions().help ?? {},
   fields: fields(),
   args: () => args,
   setArg,
   changed: () => { updateChangedCounts(); scheduleCheck(); },
 });
 
+function frameworkSwitchHtml() {
+  const choices = options.frameworks ?? [];
+  if (choices.length < 2) return "";
+  return `<div class="segmented framework-switch" role="radiogroup" aria-label="Framework">
+    ${choices.map(item => `<label title="${esc(item.available ? item.label : item.reason || "Not available")}"><input type="radio" name="framework" value="${esc(item.id)}" ${item.id === framework() ? "checked" : ""} ${item.available ? "" : "disabled"}><span>${esc(item.label)}</span></label>`).join("")}
+  </div>`;
+}
+
+function rfdetrModelHtml() {
+  const variants = fwOptions().pretrained ?? [];
+  const runs = runsOf("rfdetr");
+  const current = variants.find(item => item.name === args.model) ?? variants[0];
+  const selectedRun = runs.find(run => Object.values(run.weights).includes(args.pretrain_weights));
+  const weightKind = selectedRun ? Object.entries(selectedRun.weights).find(([, path]) => path === args.pretrain_weights)?.[0] : "best";
+  const sources = [["pretrained", "Pretrained"], ["run", `Previous run${runs.length ? "" : " (none yet)"}`]];
+  if (modelSource === "custom") sources.push(["custom", "Custom"]);
+  const sizes = `<div class="field"><span class="field-label">Size</span><div class="segmented" role="radiogroup" aria-label="RF-DETR size">
+      ${variants.map(item => `<label title="${esc(item.name)} · ${item.resolution} px"><input type="radio" name="rfdetr-variant" value="${esc(item.name)}" ${item === current ? "checked" : ""}><span>${esc(item.label)}</span></label>`).join("")}
+    </div></div>`;
+  return `
+    <div class="segmented model-source" role="radiogroup" aria-label="Base model source">
+      ${sources.map(([value, label]) => `<label><input type="radio" name="model-source" value="${value}" ${modelSource === value ? "checked" : ""} ${value === "run" && !runs.length ? "disabled" : ""}><span>${esc(label)}</span></label>`).join("")}
+    </div>
+    ${modelSource === "pretrained" ? `
+      <div class="model-row">
+        ${sizes}
+        <div class="model-note"><code>${esc(current?.name ?? args.model)}</code> · ${esc(current?.resolution ?? "?")} px ${current?.cached ? `<span class="ok-text">✓ downloaded</span>` : `<span class="muted">downloads on first use</span>`}</div>
+      </div>` : modelSource === "run" ? `
+      <div class="model-row">
+        <label class="field grow">Run<select id="model-run">${runs.map(run => `<option value="${esc(run.id)}" ${run === selectedRun ? "selected" : ""}>${esc(run.name)}${run.variant ? ` · ${esc(run.variant)}` : ""}${run.best_metrics && Object.keys(run.best_metrics).length ? ` — ${esc(bestSummary(run.best_metrics))}` : ""}</option>`).join("")}</select></label>
+        <div class="field"><span class="field-label">Weights</span><div class="segmented" role="radiogroup" aria-label="Weights file">
+          ${["best", "last"].map(kind => `<label><input type="radio" name="model-weights" value="${kind}" ${kind === weightKind ? "checked" : ""} ${(selectedRun ?? runs[0])?.weights[kind] ? "" : "disabled"}><span>${kind}</span></label>`).join("")}
+        </div></div>
+      </div>
+      ${selectedRun?.names_match === false ? `<p class="warn-text">This run was trained with different classes; its class head will be re-initialized.</p>` : ""}
+      <p class="panel-note">Fine-tuning starts a new <code>${esc(args.model)}</code> run from these weights; to continue an interrupted run use Resume instead.</p>` : `
+      <div class="model-row"><code class="model-custom">${esc(args.model)}${args.pretrain_weights ? ` ← ${esc(args.pretrain_weights)}` : ""}</code><span class="muted">Set in raw YAML; pick a source above to replace it.</span></div>`}`;
+}
+
 function modelHtml() {
+  if (framework() === "rfdetr") return rfdetrModelHtml();
   const model = args.model || "";
   const match = PRETRAINED.exec(model);
   const family = match?.[1] ?? FAMILIES[0][0];
   const size = match?.[2] ?? "n";
   const pretrainedName = `${family}${size}${SUFFIX[category()]}.pt`;
-  const cached = options.pretrained.find(item => item.name === pretrainedName)?.cached;
-  const runs = options.runs;
+  const cached = (fwOptions().pretrained ?? []).find(item => item.name === pretrainedName)?.cached;
+  const runs = runsOf("ultralytics");
   const selectedRun = runs.find(run => Object.values(run.weights).includes(model));
   const weightKind = selectedRun ? Object.entries(selectedRun.weights).find(([, path]) => path === model)?.[0] : "best";
   const sources = [["pretrained", "Pretrained"], ["run", `Previous run${runs.length ? "" : " (none yet)"}`]];
@@ -276,8 +402,14 @@ function bestSummary(metrics) {
 }
 
 function fieldHtml(field) {
-  const def = options.defaults[field.key];
-  const help = options.help[field.key] || "";
+  let def = defaults()[field.key];
+  let step = field.step;
+  if (field.key === "resolution" && framework() === "rfdetr") {
+    // the variant's own size, and RF-DETR's rule: a multiple of patch size × windows
+    def = variantInfo()?.resolution ?? def;
+    step = variantInfo()?.step ?? step;
+  }
+  const help = (fwOptions().help ?? {})[field.key] || "";
   const set = field.key in args;
   const value = args[field.key];
   const changed = set ? "changed" : "";
@@ -300,14 +432,17 @@ function fieldHtml(field) {
       ${set && !known ? `<option value="${esc(current)}" selected>${esc(String(value))}</option>` : ""}
     </select>${describe}</label>`;
   }
-  const step = field.step ?? (field.type === "int" ? 1 : "any");
+  if (field.type === "batch") {
+    return `<label class="field ${changed}">${esc(field.label)}<input aria-label="${esc(field.label)}" title="${esc(title)}" type="text" data-key="${field.key}" data-type="batch" value="${esc(set ? value : "")}" placeholder="${esc(def ?? "")}" inputmode="numeric" spellcheck="false">${describe}</label>`;
+  }
+  step = step ?? (field.type === "int" ? 1 : "any");
   const shown = set ? (Array.isArray(value) ? JSON.stringify(value) : value) : "";
   const isList = set && Array.isArray(value);
-  return `<label class="field ${changed}">${esc(field.label)}<input aria-label="${esc(field.label)}" title="${esc(title)}" ${isList ? 'type="text" readonly' : `type="number" step="${step}"`} data-key="${field.key}" data-type="${field.type}" value="${esc(shown)}" placeholder="${esc(def ?? "")}" ${field.min !== undefined ? `min="${field.min}"` : ""} ${field.max !== undefined ? `max="${field.max}"` : ""} inputmode="decimal">${isList ? `<span class="field-hint">A list — edit in raw YAML</span>` : describe}</label>`;
+  return `<label class="field ${changed}">${esc(field.label)}<input aria-label="${esc(field.label)}" title="${esc(title)}" ${isList ? 'type="text" readonly' : `type="number" step="${step}"`} data-key="${field.key}" data-type="${field.type}" value="${esc(shown)}" placeholder="${esc(def ?? field.empty ?? "")}" ${field.min !== undefined ? `min="${field.min}"` : ""} ${field.max !== undefined ? `max="${field.max}"` : ""} inputmode="decimal">${isList ? `<span class="field-hint">A list — edit in raw YAML</span>` : describe}</label>`;
 }
 
 function extrasHtml() {
-  const covered = new Set(["model", ...fields().map(field => field.key)]);
+  const covered = new Set(["model", "pretrain_weights", ...fields().map(field => field.key)]);
   const extras = Object.entries(args).filter(([key]) => !covered.has(key));
   if (!extras.length) return "";
   return `<div class="stats-panel form-panel"><div class="panel-head"><h2>Other arguments</h2><span class="muted">Not in the form — edit them in raw YAML</span></div>
@@ -317,19 +452,24 @@ function extrasHtml() {
 // ---------- events ----------
 
 function setArg(key, value) {
-  if (value === undefined || same(value, options.defaults[key])) delete args[key];
+  if (value === undefined || same(value, defaults()[key])) delete args[key];
   else args[key] = value;
 }
 
 function onInput(e) {
-  const input = e.target.closest("input[data-key][type=number]");
+  const input = e.target.closest("input[data-key][type=number], input[data-key][data-type=batch]");
   if (!input) {
     if (e.target.id === "raw-args") scheduleCheck();
     return;
   }
   const raw = input.value.trim();
   if (raw === "") setArg(input.dataset.key, undefined);
-  else {
+  else if (input.dataset.type === "batch") {
+    // a number, or "auto"; anything else waits until it is one
+    if (raw.toLowerCase() === "auto") setArg(input.dataset.key, "auto");
+    else if (/^\d+$/.test(raw)) setArg(input.dataset.key, Number(raw));
+    else return;
+  } else {
     const number = Number(raw);
     if (!Number.isFinite(number)) return;
     setArg(input.dataset.key, input.dataset.type === "int" ? Math.trunc(number) : number);
@@ -343,11 +483,24 @@ function onInput(e) {
 async function onChange(e) {
   const target = e.target;
   if (target.name === "form-mode") return switchMode(target.value, target);
+  if (target.name === "framework") return switchFramework(target.value);
+  if (target.name === "model-source" && framework() === "rfdetr") {
+    modelSource = target.value;
+    if (modelSource === "pretrained") args = withoutKey(args, "pretrain_weights");
+    const run = runsOf("rfdetr")[0];
+    if (modelSource === "run" && run) args = { ...args, model: run.variant ?? args.model, pretrain_weights: run.weights.best ?? run.weights.last };
+    return refreshModel();
+  }
+  if (target.name === "rfdetr-variant") {
+    args = { ...args, model: target.value };
+    if (args.resolution !== undefined && variantInfo()?.step && args.resolution % variantInfo().step) delete args.resolution;
+    return refreshModel();
+  }
   if (target.name === "model-source") {
     modelSource = target.value;
     if (modelSource === "pretrained") args.model = PRETRAINED.test(args.model) ? args.model : defaultModel();
-    if (modelSource === "run" && options.runs.length) {
-      const run = options.runs[0];
+    if (modelSource === "run" && runsOf("ultralytics").length) {
+      const run = runsOf("ultralytics")[0];
       args.model = run.weights.best ?? run.weights.last;
     }
     return refreshModel();
@@ -361,7 +514,9 @@ async function onChange(e) {
   if (target.id === "model-run" || target.name === "model-weights") {
     const run = options.runs.find(item => item.id === $("model-run").value);
     const kind = target.name === "model-weights" ? target.value : (run.weights.best ? "best" : "last");
-    args.model = run.weights[kind] ?? run.weights.best ?? run.weights.last;
+    const weights = run.weights[kind] ?? run.weights.best ?? run.weights.last;
+    if (framework() === "rfdetr") args = { ...args, model: run.variant ?? args.model, pretrain_weights: weights };
+    else args.model = weights;
     return refreshModel();
   }
   if (target.matches("input[type=checkbox][data-key]")) {
@@ -392,8 +547,18 @@ function refreshModel() {
   scheduleCheck();
 }
 
+// each framework has its own arguments: switching keeps what was set for the other one while the form is open
+function switchFramework(next) {
+  if (next === framework() || !usable(next)) return;
+  argsByFramework[framework()] = args;
+  args = argsByFramework[next] ?? readLastArgs(next) ?? { model: defaultModel(next) };
+  modelSource = detectModelSource(args);
+  renderGui();
+  scheduleCheck(0);
+}
+
 function updateChangedCounts() {
-  for (const group of GROUPS) {
+  for (const group of groups()) {
     const count = fields().filter(field => field.group === group.id && field.key in args).length;
     const el = $("form-gui").querySelector(`[data-changed="${group.id}"]`);
     if (el) el.textContent = count ? `${count} changed` : "";
@@ -415,7 +580,7 @@ async function switchMode(next, radio) {
       return;
     }
     args = result.args;
-    modelSource = detectModelSource(args.model);
+    modelSource = detectModelSource(args);
     mode = "gui";
     renderGui();
   }

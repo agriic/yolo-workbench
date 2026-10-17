@@ -1,6 +1,6 @@
 # YOLO Dataset Workbench
 
-A local, browser-based workbench for YOLO datasets: annotate, explore, validate and repair labels, manage classes and splits, import images, and train Ultralytics models — for **detection**, **segmentation** and **classification** datasets.
+A local, browser-based workbench for YOLO datasets: annotate, explore, validate and repair labels, manage classes and splits, import images, and train Ultralytics YOLO and RF-DETR models — for **detection**, **segmentation** and **classification** datasets.
 
 It runs as a small web server on your machine (FastAPI + a plain-JavaScript frontend, no Node.js or build step) and edits your dataset files in place, safely: every write is atomic, conflict-checked, backed up once per session, and undoable.
 
@@ -59,7 +59,7 @@ The browser opens `http://127.0.0.1:8765` automatically. Options:
 | `--no-browser` | do not open a browser (headless machines) |
 | `--port 8765` | port to listen on |
 | `--host 127.0.0.1` | address to bind; `0.0.0.0` makes it reachable from your network (there is no authentication — only do this on a trusted network) |
-| `--model best.pt` | preload a model for assisted labeling (single-dataset mode) |
+| `--model best.pt` | preload a model (Ultralytics `.pt` or RF-DETR `.pth`) for assisted labeling (single-dataset mode) |
 
 Windows paths work as usual, e.g. `uv run yolo-workbench D:\data\cars\data.yaml --category detection`.
 
@@ -74,7 +74,7 @@ Images: `.jpg .jpeg .png .webp .bmp .tif .tiff`.
 
 - **Annotation** — a virtualized gallery of the whole dataset with filters (split, class, review status, validation issues, object count, search) and a canvas editor for boxes and polygons (keyboard shortcuts are listed in the editor). Select images with checkboxes (Shift-click for a range) or by dragging a rectangle across the gallery, then mark them reviewed, move them to another split or folder, or delete them into the dataset trash.
 - **Review passes** — mark images **done** or **needs work** (D / W in the editor marks and moves to the next image; U jumps to the next unreviewed one). With the gallery's Review filter on *Unreviewed*, reviewed images drop out as you go. Statuses are kept in `.yolo-workbench/review.json`, follow images that move, and are not part of undo.
-- **Model-assisted labeling** — load an Ultralytics `.pt`/`.onnx` model (or a run's `best.pt`), predict on selected images, and accept or reject predictions individually or above a confidence threshold. Model classes are mapped to dataset classes by name; predictions stay in memory until accepted.
+- **Model-assisted labeling** — load an Ultralytics `.pt`/`.onnx` model, RF-DETR weights (`.pth`), or a training run's best weights, predict on selected images, and accept or reject predictions individually or above a confidence threshold. Model classes are mapped to dataset classes by name; predictions stay in memory until accepted.
 - **Smart annotation** — in the editor, turn on **Smart annotation** (S) and click an object: [SAM 2.1](https://docs.ultralytics.com/models/sam-2/) outlines it. Right-click (or Shift+click) marks background, dragging gives a rough box, ⏎ adds the result in the draw class (a box for detection, a polygon for segmentation). Uses SAM 2.1 large on a GPU and base otherwise (or when large fails to load); the weights download on first use. Once you have used it, images are encoded as soon as they open so the first click is instant.
 - **Exploration** — every object as a crop, filterable by class and split; select objects to relabel or delete them in bulk.
 - **Statistics** — class balance, annotations per image, box sizes, aspect ratios, class co-occurrence, split comparison, and likely outliers to review.
@@ -92,12 +92,13 @@ The projects page lists every project in the folder. A project is a YOLO dataset
 
 ### Training
 
-The Training tab trains Ultralytics YOLO models on the open dataset (detect, segment or classify, following its category), in both modes.
+The Training tab trains Ultralytics YOLO models on the open dataset (detect, segment or classify, following its category), in both modes, and [RF-DETR](https://github.com/roboflow/rf-detr) models on detection and segmentation datasets.
 
 - **New run:** a form for the common options (epochs, image size, batch, device, optimizer, …) and a Raw YAML mode for any Ultralytics argument. The **Augmentation** group previews each augmentation at both ends of its range on your own images, using Ultralytics' own transforms. The base model is an official pretrained one (YOLO26 / YOLO11 / YOLOv8, downloaded on first use to `~/.cache/yolo-workbench/weights/`) or a previous run's weights. **Duplicate** and **Fine-tune** prefill the form from an earlier run.
+- **RF-DETR:** switch the form's **Framework** to RF-DETR and pick a size (Nano–Large for detection, Nano–2XLarge for segmentation; Roboflow's PML-licensed detection XL/2XL are not offered) or a previous RF-DETR run to fine-tune. Its arguments are RF-DETR's own (`lr`, `batch_size`, `resolution`, `early_stopping`, …; `batch_size: auto` needs a CUDA GPU). RF-DETR reads only folders, so each run builds a temporary dataset folder in `<run>/workbench/data/` (hardlinks to your images, EXIF-rotated photos re-encoded upright, labels as the workbench parsed them) and removes it when the run ends; this also lets datasets whose labels sit next to the images train. Weights download to `~/.cache/yolo-workbench/weights/rfdetr/` (or `RF_HOME`). A run keeps `last.ckpt` (for Resume) and its best weights (`checkpoint_best_total.pth`); periodic full checkpoints are off unless you set `checkpoint_interval`. mAP from RF-DETR (COCO evaluation) and from Ultralytics are computed differently, so compare them with care.
 - **Live view:** epoch and batch progress, ETA, best epoch so far, loss and metric charts, and the per-epoch table. **Pause** (resumable), **Finish early** (runs the final evaluation), or **Kill**.
 - **Results:** final validation of `best.pt` and, when the dataset has a test split, a test-split evaluation, both per class, plus the Ultralytics plots and the log.
-- **History and comparison:** every run in the dataset's `runs/` folder, including runs made with `yolo train`. Rename runs, add notes, and tick runs to compare their curves, results, and the arguments that differ. **Use for labeling** loads a run's `best.pt` as the Annotation tab's model; **Download best.pt** saves it as `<dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD>.pt` (the date `best.pt` was written; a fine-tune names the pretrained model it descends from).
+- **History and comparison:** every run in the dataset's `runs/` folder, including runs made with `yolo train` or RF-DETR's own `train()` (`training_config.json` + `metrics.csv`). Rename runs, add notes, and tick runs to compare their curves, results, and the arguments that differ. **Use for labeling** loads a run's `best.pt` as the Annotation tab's model; **Download best.pt** saves it as `<dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD>.pt` (the date `best.pt` was written; a fine-tune names the pretrained model it descends from; `.pth` for RF-DETR).
 - **Queue:** a run is a separate process that keeps going if the server stops (the server picks it up again on restart). One run trains at a time; the rest wait in a reorderable queue, shared by all projects in projects mode. While a run trains, its dataset is read-only.
 
 Runs are stored in `<project>/runs/<run>/`, or in single-dataset mode in `runs/` next to the dataset YAML. Delete a run by deleting its folder.
@@ -132,7 +133,7 @@ Everything else works without it; the Embeddings tab then reports that it is una
 | `<dataset>/.yolo-workbench/imports.jsonl` | import log |
 | `<dataset>/runs/` or `<project>/runs/` | training runs |
 | `~/.cache/yolo-workbench/media/` | rendered thumbnails and crops (pruned past 512 MB; honors `XDG_CACHE_HOME`) |
-| `~/.cache/yolo-workbench/weights/` | downloaded pretrained weights (training) and SAM 2.1 weights (smart annotation; a copy in Ultralytics' weights dir is used instead when present) |
+| `~/.cache/yolo-workbench/weights/` | downloaded pretrained weights (training; RF-DETR's in `rfdetr/`) and SAM 2.1 weights (smart annotation; a copy in Ultralytics' weights dir is used instead when present) |
 
 Label and YAML files are written with LF line endings on every platform.
 
@@ -146,4 +147,4 @@ The server is meant for one user on one machine. It binds to `127.0.0.1`, reject
 uv run pytest
 ```
 
-Tests build isolated temporary datasets and never modify a real one. `WORKBENCH_SLOW_TESTS=1 uv run pytest -k real_training` additionally trains a tiny real model (downloads `yolo11n.pt`).
+Tests build isolated temporary datasets and never modify a real one. `WORKBENCH_SLOW_TESTS=1 uv run pytest -k real_training` additionally trains a tiny real model (downloads `yolo11n.pt`); `-k real_rfdetr` trains RF-DETR Nano and Seg Nano on CPU (downloads about 480 MB of weights).

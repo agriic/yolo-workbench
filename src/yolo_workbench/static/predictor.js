@@ -34,7 +34,7 @@ export function renderModelMenu() {
     <button type="button" class="model-option ${item.loaded ? "active" : ""}" data-path="${esc(item.path)}" title="${esc(item.path)}">
       <span class="model-option-name">${esc(item.name)}${item.source === "recent" ? ' <span class="model-recent">recent</span>' : ""}${item.trained ? ' <span class="model-recent">trained here</span>' : ""}${item.loaded ? ' <span class="model-recent">loaded</span>' : ""}</span>
       <span class="model-option-meta">${esc(shortDir(item.path))} · ${formatSize(item.size)}</span>
-    </button>`).join("") || `<p class="empty-note">No .pt files found near the dataset — type a path instead.</p>`;
+    </button>`).join("") || `<p class="empty-note">No .pt or .pth (RF-DETR) files found near the dataset — type a path instead.</p>`;
 }
 
 const shortDir = path => {

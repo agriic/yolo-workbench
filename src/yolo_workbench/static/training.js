@@ -5,7 +5,7 @@ import { $, api, apiUrl, esc, formatBytes } from "./api.js";
 import { state } from "./state.js";
 import { LineChart, formatValue } from "./charts.js";
 import { configureRunForm, loadTrainingOptions, openRunForm, trainingOptions } from "./trainform.js";
-import { MAX_COMPARE, destroyCompare, renderCompare } from "./compare.js";
+import { MAX_COMPARE, bestEpochRow, destroyCompare, renderCompare, shortModel } from "./compare.js";
 
 let deps;
 export function configureTraining(dependencies) {
@@ -29,9 +29,11 @@ const STATUS_LABEL = {
   testing: "Testing", completed: "Completed", paused: "Paused", stopped: "Stopped", interrupted: "Interrupted",
   failed: "Failed", external: "External",
 };
-// fixed categorical slots (validated in both themes): color follows the loss component / metric, never its rank
+// fixed categorical slots (validated in both themes): color follows the loss component / metric, never its rank.
+// RF-DETR's terms: bbox (L1) and giou are box losses, ce the classification loss, mask_* the mask head; loss is their weighted total
 const LOSS_SLOTS = { box_loss: 1, seg_loss: 4, cls_loss: 2, dfl_loss: 3, loss: 1 };
-const LOSS_ORDER = ["box_loss", "seg_loss", "cls_loss", "dfl_loss", "loss"];
+const RFDETR_LOSS_SLOTS = { bbox_loss: 1, ce_loss: 2, giou_loss: 3, mask_ce_loss: 4, mask_dice_loss: 5, loss: 6 };
+const LOSS_ORDER = ["box_loss", "seg_loss", "cls_loss", "dfl_loss", "bbox_loss", "giou_loss", "ce_loss", "mask_ce_loss", "mask_dice_loss", "loss"];
 const METRIC_GROUPS = [
   { key: "precision", label: "P", slot: 1 },
   { key: "recall", label: "R", slot: 2 },
@@ -64,6 +66,9 @@ const visible = () => $("training").classList.contains("active");
 const pill = status => `<span class="run-status status-${esc(status)}">${ACTIVE.has(status) ? '<span class="live-dot" aria-hidden="true"></span>' : ""}${esc(STATUS_LABEL[status] ?? status)}</span>`;
 const primaryMetric = () => category === "classification" ? "metrics/accuracy_top1" : category === "segmentation" ? "metrics/mAP50-95(M)" : "metrics/mAP50-95(B)";
 const primaryLabel = () => category === "classification" ? "top-1" : category === "segmentation" ? "mask mAP50-95" : "mAP50-95";
+const isRfdetr = run => run?.framework === "rfdetr";
+// what the best weights are called in this run (Ultralytics' best.pt; RF-DETR's checkpoint_best_*.pth)
+const bestName = run => isRfdetr(run) ? "best weights" : "best.pt";
 
 function duration(seconds) {
   if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return "–";
@@ -74,11 +79,7 @@ function duration(seconds) {
 }
 
 // a resumed or fine-tuned run's model is a weights path; the file name and its run folder say enough
-const modelName = model => {
-  if (!model) return "?";
-  const parts = String(model).split(/[\\/]/);
-  return parts.length > 2 && parts[parts.length - 2] === "weights" ? `${parts[parts.length - 3]}/${parts[parts.length - 1]}` : parts[parts.length - 1];
-};
+const modelName = model => model ? shortModel(model) : "?";
 
 function relativeTime(iso) {
   const then = Date.parse(iso);
@@ -167,7 +168,7 @@ const rank = run => run.active ? 0 : run.status === "queued" ? 1 + (run.queue_po
 function renderRunList() {
   $("run-count").textContent = runs.length ? runs.length : "";
   if (!runs.length) {
-    $("run-list").innerHTML = `<p class="empty-note">No training runs yet. Runs started here and runs made with <code>yolo train</code> in this folder show up in this list.</p>`;
+    $("run-list").innerHTML = `<p class="empty-note">No training runs yet. Runs started here, and runs made with <code>yolo train</code> or RF-DETR in this folder, show up in this list.</p>`;
     return;
   }
   $("run-list").innerHTML = runs.map(run => {
@@ -221,9 +222,9 @@ async function openCompare() {
   clearTimeout(logTimer);
   destroyCharts();
   $("run-list").querySelectorAll(".run-item").forEach(item => { item.classList.remove("selected"); item.setAttribute("aria-current", "false"); });
-  const defaults = trainingOptions()?.defaults ?? (await loadTrainingOptions().catch(() => null))?.defaults ?? null;
+  const frameworks = trainingOptions()?.frameworks ?? (await loadTrainingOptions().catch(() => null))?.frameworks ?? null;
   await renderCompare($("run-detail"), {
-    ids: [...compareIds], slots: compareSlots, category, defaults,
+    ids: [...compareIds], slots: compareSlots, category, frameworks,
     onClose: () => { compareOpen = false; destroyCompare(); loadRuns(); },
     onOpen: id => selectRun(id),
   });
@@ -432,7 +433,9 @@ function renderDetailSkeleton() {
   destroyCharts();
   const run = detail;
   const created = run.created ? new Date(run.created).toLocaleString() : "";
-  const facts = [modelName(run.model), run.imgsz && `imgsz ${run.imgsz}`, run.batch !== undefined && run.batch !== null && `batch ${run.batch}`, created].filter(Boolean);
+  // a fine-tuned RF-DETR run's model is the previous run's weights: its variant says which architecture
+  const variant = isRfdetr(run) && run.variant && modelName(run.model) !== run.variant ? run.variant : null;
+  const facts = [modelName(run.model), variant, run.imgsz && `${isRfdetr(run) ? "resolution" : "imgsz"} ${run.imgsz}`, run.batch !== undefined && run.batch !== null && `batch ${run.batch}`, created].filter(Boolean);
   $("run-detail").innerHTML = `
     <div class="run-head">
       <div class="run-title">
@@ -450,8 +453,8 @@ function renderDetailSkeleton() {
       <article class="stats-panel"><h2>Losses</h2><p class="panel-note">Train solid, val dashed</p><div id="chart-loss"></div></article>
       <article class="stats-panel"><h2>${category === "classification" ? "Accuracy" : "Validation metrics"}</h2><p class="panel-note">${category === "segmentation" ? "Box solid, mask dashed" : "Per epoch on the val split"}</p><div id="chart-metrics"></div></article>
       <article class="stats-panel stats-wide"><h2>Epochs <span id="epoch-count" class="muted"></span></h2><div id="epoch-table" class="table-scroll epoch-table"></div></article>
-      <article class="stats-panel" id="val-panel"><h2>Validation <span class="muted">best.pt · val split</span></h2><div id="val-results"></div></article>
-      <article class="stats-panel" id="test-panel"><h2>Test <span class="muted">best.pt · test split</span></h2><div id="test-results"></div></article>
+      <article class="stats-panel" id="val-panel"><h2>Validation <span class="muted">${esc(bestName(run))} · val split</span></h2><div id="val-results"></div></article>
+      <article class="stats-panel" id="test-panel"><h2>Test <span class="muted">${esc(bestName(run))} · test split</span></h2><div id="test-results"></div></article>
       <article class="stats-panel stats-wide" id="plots-panel"><h2>Plots</h2><div id="run-plots" class="plot-grid"></div></article>
       <article class="stats-panel"><h2>Arguments</h2><div id="run-args">${argsHtml(run.args)}</div></article>
       <article class="stats-panel"><details id="log-details" ${run.status === "failed" || run.status === "interrupted" ? "open" : ""}><summary><h2>Log</h2></summary><pre id="run-log" class="run-log">Loading…</pre></details></article>
@@ -468,20 +471,21 @@ function renderDetailSkeleton() {
 }
 
 const argValue = value => value === null || value === undefined ? "null" : typeof value === "object" ? JSON.stringify(value) : String(value);
-const MANAGED = new Set(["data", "project", "name", "exist_ok", "resume", "mode", "task", "save_dir"]);
 
-// what was chosen for this run (differs from the Ultralytics default), then everything Ultralytics recorded
+// what was chosen for this run (differs from its framework's default), then everything the trainer recorded
 function argsHtml(args) {
   const entries = Object.entries(args || {});
   if (!entries.length) return `<p class="empty-note">No arguments recorded.</p>`;
-  const defaults = trainingOptions()?.defaults;
-  if (!defaults) {
+  const framework = trainingOptions()?.frameworks?.find(item => item.id === (detail?.framework || "ultralytics"));
+  const defaults = framework?.defaults;
+  const managed = new Set(framework?.managed ?? []);
+  if (!trainingOptions()) {
     loadTrainingOptions().then(() => { if ($("run-args") && detail) $("run-args").innerHTML = argsHtml(detail.args); }).catch(() => {});
-    return `<pre class="run-args">${esc(entries.map(([key, value]) => `${key}: ${argValue(value)}`).join("\n"))}</pre>`;
   }
+  if (!defaults) return `<pre class="run-args">${esc(entries.map(([key, value]) => `${key}: ${argValue(value)}`).join("\n"))}</pre>`;
   // Ultralytics records an unset option as '' in args.yaml (e.g. device for auto)
   const isDefault = (key, value) => JSON.stringify(defaults[key]) === JSON.stringify(value) || (defaults[key] === null && value === "");
-  const chosen = entries.filter(([key, value]) => !MANAGED.has(key) && (key === "model" || (key in defaults && !isDefault(key, value))));
+  const chosen = entries.filter(([key, value]) => !managed.has(key) && (key === "model" || (key in defaults && !isDefault(key, value))));
   return `<pre class="run-args">${esc(chosen.map(([key, value]) => `${key}: ${argValue(value)}`).join("\n")) || "(all defaults)"}</pre>
     ${entries.length > chosen.length ? `<details class="all-args"><summary>All ${entries.length} arguments</summary><pre class="run-args">${entries.map(([key, value]) => {
       const changed = chosen.some(([name]) => name === key);
@@ -499,11 +503,13 @@ function renderActions() {
   }
   if (run.resumable) buttons.push(`<button class="primary-btn" data-resume>Resume</button>`);
   if (run.status === "queued") buttons.push(`<button class="secondary" data-cancel>Remove from queue</button>`);
-  if (run.has_weights?.best) buttons.push(`<button class="secondary" data-download-best title="Download ${run.active ? "the best weights so far" : "the best weights"} (best.pt), named dataset-run-imgsz-model-date.pt">Download best.pt</button>`);
-  if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-use-model title="Load this run's ${run.has_weights.best ? "best" : "last"}.pt as the prediction model in the Annotation tab">Use for labeling</button>`);
+  const weightsFile = kind => run.weights?.[kind]?.split("/").pop() ?? `${kind}.pt`;
+  const extension = isRfdetr(run) ? "pth" : "pt";
+  if (run.has_weights?.best) buttons.push(`<button class="secondary" data-download-best title="Download ${run.active ? "the best weights so far" : "the best weights"} (${esc(weightsFile("best"))}), named dataset-run-imgsz-model-date.${extension}">Download ${esc(bestName(run))}</button>`);
+  if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-use-model title="Load this run's ${esc(weightsFile(run.has_weights.best ? "best" : "last"))} as the prediction model in the Annotation tab">Use for labeling</button>`);
   buttons.push(`<button class="secondary" data-duplicate title="Start a new run with the same arguments">Duplicate</button>`);
   buttons.push(`<button class="icon-btn" data-edit-run title="Rename / notes" aria-label="Rename or add notes"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>`);
-  if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-finetune title="Start a new run from this run's ${run.has_weights.best ? "best" : "last"}.pt">Fine-tune</button>`);
+  if (run.has_weights?.best || run.has_weights?.last) buttons.push(`<button class="secondary" data-finetune title="Start a new run from this run's ${esc(weightsFile(run.has_weights.best ? "best" : "last"))}">Fine-tune</button>`);
   if (!run.active && run.status !== "queued") buttons.push(`<button class="icon-btn danger-btn" data-delete-run title="Delete run" aria-label="Delete this run"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg></button>`);
   $("run-actions").innerHTML = buttons.join("");
 }
@@ -550,8 +556,7 @@ async function onDetailClick(e) {
       link.download = "";
       link.click();
     } else if (e.target.closest("[data-use-model]")) {
-      const kind = detail.has_weights.best ? "best" : "last";
-      await deps.useModel(`${detail.path}/weights/${kind}.pt`);
+      await deps.useModel(detail.weights.best ?? detail.weights.last);
     } else if (e.target.closest("[data-duplicate]")) {
       openForm({ from: "duplicate", runId: id });
     } else if (e.target.closest("[data-finetune]")) {
@@ -579,15 +584,7 @@ function renderLive() {
   renderEpochTable(best);
 }
 
-function bestRow() {
-  // Ultralytics rewrites best.pt whenever fitness ties the best, so the last tie is the best epoch
-  let best = null;
-  for (const row of epochRows) {
-    if (row.fitness === null || row.fitness === undefined) continue;
-    if (!best || row.fitness >= best.fitness) best = row;
-  }
-  return best;
-}
+const bestRow = () => bestEpochRow(epochRows, detail?.framework);
 
 function renderProgress(best) {
   const el = $("run-progress");
@@ -603,7 +600,7 @@ function renderProgress(best) {
   el.innerHTML = `<div class="stats-panel run-progress">
     <div class="run-progress-row">
       <span class="run-progress-epoch"><strong>${pending ? "–" : epoch}</strong><span class="muted">/ ${esc(epochs || "?")} epochs</span></span>
-      <span class="run-progress-phase">${pill(s.status)} ${esc(pending ? "Loading the model and scanning the dataset…" : phase)}${s.resumed ? ' <span class="muted">(resumed)</span>' : ""}</span>
+      <span class="run-progress-phase">${pill(s.status)} ${esc(pending ? pendingText(s) : phase)}${s.resumed ? ' <span class="muted">(resumed)</span>' : ""}</span>
       <span class="run-progress-facts">
         <span><span class="muted">Elapsed</span> ${duration(elapsed)}</span>
         <span><span class="muted">ETA</span> ${s.status === "training" ? duration(s.eta) : "–"}</span>
@@ -617,6 +614,11 @@ function renderProgress(best) {
     </div>` : ""}
     ${detail.state?.stopped_early || s.stopped_early ? `<p class="panel-note">Finishing early: final validation and test evaluation follow.</p>` : ""}
   </div>`;
+}
+
+function pendingText(s) {
+  if (s.phase === "preparing-data") return s.prepare_total ? `Preparing RF-DETR's dataset folder (${s.prepared ?? 0}/${s.prepare_total} images)…` : "Preparing RF-DETR's dataset folder…";
+  return isRfdetr(detail) ? "Loading RF-DETR and its weights…" : "Loading the model and scanning the dataset…";
 }
 
 function renderKpis(best) {
@@ -658,13 +660,14 @@ function renderCharts(best) {
   const marker = best?.epoch ?? null;
 
   const lossSeries = [];
+  const slots = isRfdetr(detail) ? RFDETR_LOSS_SLOTS : LOSS_SLOTS;
   for (const component of LOSS_ORDER) {
     const name = component.replace(/_loss$/, "") || component;
     for (const [split, dashed] of [["train", false], ["val", true]]) {
       if (!keys.has(`${split}/${component}`)) continue;
       lossSeries.push({
         key: `${split}/${component}`, label: `${split} ${name}`, group: component, groupLabel: name,
-        color: slotColor(LOSS_SLOTS[component]), dashed, values: seriesFor([`${split}/`], component),
+        color: slotColor(slots[component]), dashed, values: seriesFor([`${split}/`], component),
       });
     }
   }
@@ -737,7 +740,7 @@ function renderEpochTable(best) {
     : "";
   const rows = [...epochRows].reverse().map(row => {
     const isBest = best && row.epoch === best.epoch;
-    return `<tr class="${isBest ? "best-row" : ""}"><td>${isBest ? '<span class="best-star" title="Best epoch (best.pt)">★</span> ' : ""}${row.epoch}</td>${columns.map(key => `<td>${cell(row, key)}</td>`).join("")}</tr>`;
+    return `<tr class="${isBest ? "best-row" : ""}"><td>${isBest ? `<span class="best-star" title="Best epoch (${esc(bestName(detail))})">★</span> ` : ""}${row.epoch}</td>${columns.map(key => `<td>${cell(row, key)}</td>`).join("")}</tr>`;
   }).join("");
   $("epoch-table").innerHTML = `<table class="stats-table"><thead><tr><th>Epoch</th>${columns.map(key => `<th title="${esc(key)}">${esc(columnLabel(key))}</th>`).join("")}</tr></thead><tbody>${running}${rows}</tbody></table>`;
 }
@@ -760,7 +763,7 @@ function renderResults() {
   const val = resultsTable(detail.val);
   const test = resultsTable(detail.test);
   const done = !detail.active && detail.status !== "queued";
-  $("val-results").innerHTML = val ?? `<p class="empty-note">${done ? "No final validation (the run did not finish)." : "Runs after training on best.pt."}</p>`;
+  $("val-results").innerHTML = val ?? `<p class="empty-note">${done ? "No final validation (the run did not finish)." : `Runs after training on ${esc(bestName(detail))}.`}</p>`;
   $("test-results").innerHTML = test ?? `<p class="empty-note">${detail.source === "external" ? "Not recorded for runs made outside the workbench." : done ? "No test results (the dataset has no test split, or the run did not finish)." : "Runs after training when the dataset has a test split."}</p>`;
 }
 

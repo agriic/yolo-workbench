@@ -1,4 +1,4 @@
-"""Model-assisted labeling: run an Ultralytics model, hold predictions in memory until accepted."""
+"""Model-assisted labeling: run an Ultralytics or RF-DETR model, hold predictions in memory until accepted."""
 
 from __future__ import annotations
 
@@ -7,7 +7,13 @@ import json
 import threading
 from pathlib import Path
 
+import numpy as np
+from PIL import Image
+
+from . import frameworks
 from .dataset import Dataset, DatasetError
+from .imaging import upright_rgb
+from .masks import drop_specks, mask_outlines
 from .models import ImageRecord
 
 
@@ -15,7 +21,11 @@ def ultralytics_available() -> bool:
     return importlib.util.find_spec("ultralytics") is not None
 
 
-MODEL_EXTENSIONS = {".pt"}
+def rfdetr_available() -> bool:
+    return importlib.util.find_spec("rfdetr") is not None
+
+
+MODEL_EXTENSIONS = {".pt", ".pth"}
 SCAN_DEPTH = 4
 SCAN_LIMIT = 50
 DEDUP_IOU = 0.6  # predictions matching an existing same-class annotation at or above this IoU are dropped
@@ -65,6 +75,9 @@ def _same_file(a: str, b: str) -> bool:
 class UltralyticsBackend:
     """Thin wrapper so PredictorManager only depends on names + predict()."""
 
+    framework = "ultralytics"
+    default_conf = 0.25
+
     def __init__(self, path: Path, category: str, conf: float, iou: float):
         from ultralytics import YOLO
 
@@ -98,6 +111,79 @@ class UltralyticsBackend:
         return predictions
 
 
+def _nms(boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray, iou: float) -> list[int]:
+    """Indices kept by greedy per-class non-maximum suppression, highest score first."""
+    order = list(np.argsort(-scores))
+    areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    kept: list[int] = []
+    while order:
+        best = order.pop(0)
+        kept.append(int(best))
+        rest = np.array(order, dtype=int)
+        if not len(rest):
+            break
+        width = np.clip(np.minimum(boxes[rest, 2], boxes[best, 2]) - np.maximum(boxes[rest, 0], boxes[best, 0]), 0, None)
+        height = np.clip(np.minimum(boxes[rest, 3], boxes[best, 3]) - np.maximum(boxes[rest, 1], boxes[best, 1]), 0, None)
+        overlap = width * height / np.maximum(areas[rest] + areas[best] - width * height, 1e-12)
+        order = [int(index) for index, value, same in zip(rest, overlap, classes[rest] == classes[best]) if not (same and value >= iou)]
+    return kept
+
+
+class RFDETRBackend:
+    """RF-DETR weights (a training run's checkpoint_best_total.pth, or RF-DETR's pretrained ones) behind
+    the same names + predict() as UltralyticsBackend. RF-DETR ignores EXIF orientation, so it is given the
+    upright image. A DETR has no NMS of its own; at low thresholds (Label QA) its queries overlap, so the
+    predictor's IoU setting is applied as per-class NMS."""
+
+    framework = "rfdetr"
+    default_conf = 0.5  # RF-DETR's own default threshold; its scores run lower than YOLO's
+
+    def __init__(self, path: Path, category: str, conf: float, iou: float):
+        from rfdetr import RFDETR
+
+        self.category = category
+        self.conf = conf
+        self.iou = iou
+        self.model = RFDETR.from_checkpoint(str(path))
+        if category == "segmentation" and not self.model.model_config.segmentation_head:
+            raise DatasetError("This RF-DETR model only detects boxes; a segmentation dataset needs an RF-DETR segmentation model (rfdetr-seg-…)")
+        custom = getattr(self.model.model, "class_names", None)
+        if custom:
+            names = dict(enumerate(custom))
+        else:  # RF-DETR's COCO-pretrained weights predict COCO's own (sparse) category ids
+            from rfdetr.assets.coco_classes import COCO_CLASSES
+
+            names = COCO_CLASSES
+        self.names = {int(key): str(value) for key, value in names.items()}
+
+    def predict(self, image_path: Path, conf: float | None = None) -> list[dict]:
+        with Image.open(image_path) as opened:
+            image = upright_rgb(opened)
+        width, height = image.size
+        detections = self.model.predict(image, threshold=self.conf if conf is None else conf, include_source_image=False)
+        if not len(detections):
+            return []
+        boxes = np.asarray(detections.xyxy, dtype=float)
+        scores = np.asarray(detections.confidence, dtype=float)
+        classes = np.asarray(detections.class_id, dtype=int)
+        masks = detections.mask if self.category == "segmentation" else None
+        predictions: list[dict] = []
+        for index in _nms(boxes, scores, classes, self.iou):
+            if masks is not None:
+                outlines = mask_outlines(drop_specks(masks[index]))
+                if not outlines or len(outlines[0]) < 6:
+                    continue
+                points = outlines[0]
+            else:
+                left, top = _clamp(boxes[index, 0] / width), _clamp(boxes[index, 1] / height)
+                right, bottom = _clamp(boxes[index, 2] / width), _clamp(boxes[index, 3] / height)
+                if right - left <= 0 or bottom - top <= 0:
+                    continue
+                points = [(left + right) / 2, (top + bottom) / 2, right - left, bottom - top]
+            predictions.append({"class_id": int(classes[index]), "confidence": float(scores[index]), "points": points})
+        return predictions
+
+
 class PredictorManager:
     """Loads a model on demand and keeps per-image predictions in memory until accepted.
 
@@ -108,7 +194,7 @@ class PredictorManager:
     def __init__(self, dataset: Dataset, backend_factory=None):
         self.dataset = dataset
         self._backend_factory = backend_factory or self._default_factory
-        self._available = (backend_factory is not None or ultralytics_available()) and dataset.category != "classification"
+        self._available = (backend_factory is not None or ultralytics_available() or rfdetr_available()) and dataset.category != "classification"
         self._lock = threading.Lock()
         # one inference at a time on the shared model (batch runs, the editor's predict, Label QA)
         self.backend_lock = threading.Lock()
@@ -164,6 +250,10 @@ class PredictorManager:
 
     @staticmethod
     def _default_factory(path: Path, category: str, conf: float, iou: float):
+        if frameworks.weights_framework(path) == "rfdetr":
+            if not rfdetr_available():
+                raise DatasetError('These are RF-DETR weights, and rfdetr is not installed (uv add "rfdetr[train]")')
+            return RFDETRBackend(path, category, conf, iou)
         return UltralyticsBackend(path, category, conf, iou)
 
     def payload(self) -> dict:
@@ -172,7 +262,7 @@ class PredictorManager:
             return {
                 "status": self.status,
                 "error": self.error,
-                "model": {"path": self.model_path, "names": self.backend.names if self.backend else {}},
+                "model": {"path": self.model_path, "names": self.backend.names if self.backend else {}, "framework": getattr(self.backend, "framework", None)},
                 "conf": self.conf,
                 "iou": self.iou,
                 "mapping": {str(key): value for key, value in self.mapping.items()},
@@ -199,8 +289,13 @@ class PredictorManager:
                 raise DatasetError(f"{self.external_busy}; wait for it to finish before loading a model")
             self.status = "loading"
             self.error = None
+        previous = getattr(self.backend, "framework", None)
         try:
             backend = self._backend_factory(model_path, self.dataset.category, conf if conf is not None else self.conf, iou if iou is not None else self.iou)
+            if conf is None and getattr(backend, "framework", None) != previous and getattr(backend, "default_conf", None) is not None:
+                # switching between YOLO and RF-DETR: their scores are calibrated differently, so start from the model's own default
+                conf = backend.default_conf
+                backend.conf = conf
         except Exception as exc:
             with self._lock:
                 self.status = "error"
@@ -244,21 +339,26 @@ class PredictorManager:
             pass  # recents are a convenience; failing to persist them must never break loading
 
     def _trained_models(self) -> dict[Path, str]:
-        """best.pt of the dataset's training runs (newest first) -> "<run name> · best.pt"."""
+        """The best weights of the dataset's training runs (newest first) -> "<run name> · best.pt" (· best (RF-DETR))."""
         from .training import runs_root_for
 
         root = runs_root_for(self.dataset.yaml_path)
         found: list[tuple[float, Path, str]] = []
         if root.is_dir():
             # workbench runs sit directly in runs/; `yolo train` runs one level deeper (runs/detect/train2)
-            for weights in [*root.glob("*/weights/best.pt"), *root.glob("*/*/weights/best.pt")]:
-                run_dir = weights.parent.parent
+            for run_dir in [*root.glob("*/"), *root.glob("*/*/")]:
+                if run_dir.name.startswith(".") or not run_dir.is_dir():
+                    continue
+                framework = frameworks.of_run(run_dir)
+                weights = framework.weights(run_dir).get("best")
+                if weights is None:
+                    continue
                 try:
                     name = json.loads((run_dir / "workbench" / "run.json").read_text(encoding="utf-8")).get("name") or run_dir.name
                     mtime = weights.stat().st_mtime
                 except (OSError, ValueError, AttributeError):
                     name, mtime = run_dir.name, 0.0
-                found.append((mtime, weights.resolve(), f"{name} · best.pt"))
+                found.append((mtime, weights.resolve(), f"{name} · {'best (RF-DETR)' if framework is frameworks.RFDETR else 'best.pt'}"))
         return {path: label for _, path, label in sorted(found, key=lambda item: item[0], reverse=True)}
 
     def discover_models(self) -> dict:
@@ -275,6 +375,8 @@ class PredictorManager:
             resolved = path.resolve()
             if resolved in seen or resolved.suffix.lower() not in MODEL_EXTENSIONS:
                 return
+            if source == "found" and (resolved.parent / "training_config.json").is_file():
+                return  # an RF-DETR run's other weights (EMA, last): its best is listed as the run's
             try:
                 stat = resolved.stat()
             except OSError:

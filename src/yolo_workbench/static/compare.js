@@ -6,6 +6,33 @@ import { LineChart, formatValue } from "./charts.js";
 
 export const MAX_COMPARE = 8;  // validated categorical slots (--series-1..8)
 const MANAGED = new Set(["data", "project", "name", "exist_ok", "resume", "mode", "task", "save_dir"]);
+const FRAMEWORK_LABEL = { ultralytics: "Ultralytics YOLO", rfdetr: "RF-DETR" };
+
+/** A run's model, short: a previous run's weights by run folder + file (Ultralytics keeps them in weights/, RF-DETR in the run folder). */
+export const shortModel = model => {
+  const parts = String(model ?? "?").split(/[\\/]/);
+  const file = parts[parts.length - 1];
+  if (parts.length > 2 && parts[parts.length - 2] === "weights") return `${parts[parts.length - 3]}/${file}`;
+  if (parts.length > 1 && /\.(pth|ckpt)$/i.test(file)) return `${parts[parts.length - 2]}/${file}`;
+  return file;
+};
+
+/**
+ * The epoch the best weights hold. Ultralytics rewrites best.pt whenever fitness ties the best (the last
+ * tie wins); RF-DETR saves only on a strict improvement, which its runner marks (`is_best`).
+ */
+export function bestEpochRow(rows, framework) {
+  if (framework === "rfdetr") {
+    const marked = rows.filter(row => row.is_best);
+    if (marked.length) return marked[marked.length - 1];
+  }
+  let best = null;
+  for (const row of rows) {
+    if (row.fitness === null || row.fitness === undefined) continue;
+    if (!best || row.fitness > best.fitness || (row.fitness === best.fitness && framework !== "rfdetr")) best = row;
+  }
+  return best;
+}
 
 let charts = [];
 let loaded = [];      // [{run, rows, slot}]
@@ -27,7 +54,7 @@ function metricLabel(key) {
 
 /**
  * @param {HTMLElement} container
- * @param {{ids: string[], slots: Map<string, number>, category: string, defaults: object|null, onClose: () => void, onOpen: (id) => void}} options
+ * @param {{ids: string[], slots: Map<string, number>, category: string, frameworks: object[]|null, onClose: () => void, onOpen: (id) => void}} options
  */
 export async function renderCompare(container, options) {
   destroyCompare();
@@ -50,20 +77,25 @@ export async function renderCompare(container, options) {
     ["Other", keys.filter(key => key === "fitness" || key.startsWith("lr/"))],
   ].filter(([, items]) => items.length);
   const primary = primaryMetric(options.category);
-  const valLoss = keys.find(key => key === "val/box_loss") ?? keys.find(key => key.startsWith("val/")) ?? keys.find(key => key.startsWith("train/"));
+  const valLoss = keys.find(key => key === "val/box_loss") ?? keys.find(key => key.startsWith("val/")) ?? keys.find(key => key === "train/loss") ?? keys.find(key => key.startsWith("train/"));
   picks = [keys.includes(picks[0]) ? picks[0] : keys.includes(primary) ? primary : keys[0], keys.includes(picks[1]) ? picks[1] : valLoss ?? keys[1]];
   const select = index => `<select data-compare-metric="${index}" aria-label="Metric for chart ${index + 1}">${groups.map(([title, items]) =>
     `<optgroup label="${esc(title)}">${items.map(key => `<option value="${esc(key)}" ${key === picks[index] ? "selected" : ""}>${esc(metricLabel(key))}</option>`).join("")}</optgroup>`).join("")}</select>`;
 
+  const used = [...new Set(loaded.map(item => item.run.framework || "ultralytics"))];
+  const mixed = used.length > 1
+    ? `<p class="panel-note warn-text">These runs come from ${used.map(id => FRAMEWORK_LABEL[id] ?? id).join(" and ")}: each computes mAP with its own evaluator (RF-DETR the COCO one), so close numbers are not a ranking.</p>`
+    : "";
+  const defaultsFor = framework => (options.frameworks || []).find(item => item.id === (framework || "ultralytics"))?.defaults ?? null;
   container.innerHTML = `
     <div class="run-head">
-      <div class="run-title"><h1>Compare ${loaded.length} runs</h1><p class="section-subtitle">Same metric per run on each chart; the table lists only arguments that differ.</p></div>
+      <div class="run-title"><h1>Compare ${loaded.length} runs</h1><p class="section-subtitle">Same metric per run on each chart; the table lists only arguments that differ.</p>${mixed}</div>
       <div class="run-actions"><button type="button" class="secondary" data-compare-close>Close</button></div>
     </div>
     <div class="stats-grid run-grid">
       ${[0, 1].map(index => `<article class="stats-panel"><div class="panel-head"><h2>Chart ${index + 1}</h2>${select(index)}</div><div id="compare-chart-${index}"></div></article>`).join("")}
       <article class="stats-panel stats-wide"><h2>Results</h2><div class="table-scroll">${resultsTable(options.category)}</div></article>
-      <article class="stats-panel stats-wide"><h2>Arguments that differ</h2><div class="table-scroll">${argsDiff(options.defaults)}</div></article>
+      <article class="stats-panel stats-wide"><h2>Arguments that differ</h2><div class="table-scroll">${argsDiff(defaultsFor)}</div></article>
     </div>`;
   charts = [0, 1].map(index => new LineChart(container.querySelector(`#compare-chart-${index}`), { label: `Comparison chart ${index + 1}` }));
   drawCharts();
@@ -92,17 +124,6 @@ function drawCharts() {
   });
 }
 
-const shortModel = model => {
-  const parts = String(model ?? "?").split(/[\\/]/);
-  return parts.length > 2 && parts[parts.length - 2] === "weights" ? `${parts[parts.length - 3]}/${parts[parts.length - 1]}` : parts[parts.length - 1];
-};
-
-function bestRow(rows) {
-  let best = null;
-  for (const row of rows) if (row.fitness !== null && row.fitness !== undefined && (!best || row.fitness >= best.fitness)) best = row;
-  return best;
-}
-
 function resultsTable(category) {
   const metric = primaryMetric(category);
   const label = metricLabel(metric);
@@ -116,7 +137,7 @@ function resultsTable(category) {
   };
   return `<table class="stats-table compare-table"><thead><tr><th>Run</th><th>Model</th><th>Epochs</th><th>Best epoch</th><th>Best ${esc(label)} (val)</th><th>Final val ${esc(label)}</th><th>Test ${esc(label)}</th><th>Data (train/val/test)</th></tr></thead><tbody>
     ${loaded.map(({ run, rows, slot }) => {
-      const best = bestRow(rows);
+      const best = bestEpochRow(rows, run.framework);
       return `<tr>
         <td><button type="button" class="link-btn compare-run" data-open-run="${esc(run.id)}"><svg width="16" height="8" aria-hidden="true"><line x1="0" y1="4" x2="16" y2="4" stroke="var(--series-${slot})" stroke-width="2.5" stroke-linecap="round"/></svg>${esc(run.name)}</button></td>
         <td title="${esc(run.model ?? "")}">${esc(shortModel(run.model))}</td>
@@ -130,22 +151,25 @@ function resultsTable(category) {
     }).join("")}</tbody></table>`;
 }
 
-function argsDiff(defaults) {
-  const normalized = (key, args) => {
-    const value = args?.[key];
+// each run against its own framework's defaults (Ultralytics and RF-DETR name their arguments differently)
+function argsDiff(defaultsFor) {
+  const normalized = (key, item) => {
+    const value = item.run.args?.[key];
+    const defaults = defaultsFor(item.run.framework);
     if (value === undefined || value === "" || value === null) return defaults && key in defaults ? defaults[key] : null;
     return value;
   };
   // the base model (a resume rewrites args.yaml's model to the run's own last.pt)
   for (const item of loaded) item.run.args = { ...(item.run.args || {}), model: shortModel(item.run.model) };
   const keys = [...new Set(loaded.flatMap(item => Object.keys(item.run.args || {})))].filter(key => !MANAGED.has(key));
-  const differing = keys.filter(key => new Set(loaded.map(item => JSON.stringify(normalized(key, item.run.args)))).size > 1);
+  const differing = keys.filter(key => new Set(loaded.map(item => JSON.stringify(normalized(key, item)))).size > 1);
   if (!differing.length) return `<p class="empty-note">All runs used the same arguments.</p>`;
   const show = value => value === null || value === undefined ? "–" : typeof value === "object" ? JSON.stringify(value) : String(value);
   return `<table class="stats-table compare-table args-diff"><thead><tr><th>Argument</th>${loaded.map(({ run, slot }) => `<th><svg width="12" height="6" aria-hidden="true"><line x1="0" y1="3" x2="12" y2="3" stroke="var(--series-${slot})" stroke-width="2.5"/></svg> ${esc(run.name)}</th>`).join("")}</tr></thead><tbody>
     ${differing.map(key => `<tr><td><code>${esc(key)}</code></td>${loaded.map(item => {
-      const value = normalized(key, item.run.args);
+      const value = normalized(key, item);
+      const defaults = defaultsFor(item.run.framework);
       const isDefault = defaults && key in defaults && JSON.stringify(value) === JSON.stringify(defaults[key]);
-      return `<td class="${isDefault ? "muted" : ""}" title="${isDefault ? "Ultralytics default" : ""}">${esc(show(value))}</td>`;
+      return `<td class="${isDefault ? "muted" : ""}" title="${isDefault ? `${FRAMEWORK_LABEL[item.run.framework || "ultralytics"]} default` : ""}">${esc(show(value))}</td>`;
     }).join("")}</tr>`).join("")}</tbody></table>`;
 }
