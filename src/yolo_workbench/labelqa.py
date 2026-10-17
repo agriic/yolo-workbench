@@ -14,7 +14,8 @@ label makes its finding disappear without re-running the model:
 Pairing is greedy by confidence × box IoU (segmentation polygons use their bounding boxes); see
 compute_findings. The tolerance is chosen per listing, so changing it needs no new analysis.
 Applying a finding's fix goes through Dataset.replace_annotations, so backups, undo, conflict
-detection, and the training lock apply. Dismissing one ("the label is right") is remembered.
+detection, and the training lock apply. Segmentation polygons are paired and keyed as the model
+drew them; what is listed, drawn and applied is simplified to the predictor's point limit. Dismissing one ("the label is right") is remembered.
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ class LabelQAManager:
                 "available": self.available,
                 "category": self.dataset.category,
                 "job": dict(self.job),
-                "predictor": {"status": predictor.status, "model": predictor.model_path},
+                "predictor": {"status": predictor.status, "model": predictor.model_path, "max_points": predictor.max_points},
                 "result": summary,
             }
 
@@ -307,7 +308,7 @@ class LabelQAManager:
                 "images": len({finding["image_id"] for finding in items}),
                 "stale": stale,
                 "counts": counts,
-                "items": [dict(finding) for finding in items[offset : offset + limit]],
+                "items": [self._shaped(finding, self.dataset.images[finding["image_id"]]) for finding in items[offset : offset + limit]],
             }
 
     def _finding(self, image_id: str, key: str) -> tuple[ImageRecord, dict, str]:
@@ -327,6 +328,7 @@ class LabelQAManager:
         with self.dataset._lock:
             with self._lock:
                 record, finding, _ = self._finding(image_id, key)
+            finding = self._shaped(finding, record)
             annotations = [annotation.as_dict() for annotation in record.annotations]
             label, prediction = finding["label"], finding["prediction"]
             if finding["kind"] == "missing_label":
@@ -352,7 +354,15 @@ class LabelQAManager:
     def crop(self, image_id: str, key: str, color) -> bytes:
         with self.dataset._lock, self._lock:
             record, finding, _ = self._finding(image_id, key)
+            finding = self._shaped(finding, record)
         return render_finding(record.path, self.dataset.category, finding, color)
+
+    def _shaped(self, finding: dict, record: ImageRecord) -> dict:
+        """A copy of the finding with the model's polygon as the predictor's point limit makes it (keys stay as found)."""
+        finding = dict(finding)
+        if finding["prediction"] is not None:
+            finding["prediction"] = {**finding["prediction"], "points": self.predictor.shape(record, finding["prediction"]["points"])}
+        return finding
 
 
 def _confident(finding: dict, min_conf: float) -> bool:

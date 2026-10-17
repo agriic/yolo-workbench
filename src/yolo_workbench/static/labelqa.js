@@ -35,6 +35,7 @@ export function bindLabelQA() {
     $("qa-tolerance-value").textContent = `${$("qa-tolerance").value} px`;
     reloadFindingsSoon();
   };
+  $("qa-max-points").oninput = qaMaxPointsChanged;
   $("qa-filter-split").onchange = () => loadFindings();
   $("qa-kinds").addEventListener("click", e => {
     const chip = e.target.closest("[data-qa-kind]");
@@ -177,6 +178,26 @@ function renderSetup() {
   $("qa-status").textContent = text;
   $("qa-status").title = text;
   $("qa-filters").hidden = !result;
+  $("qa-points-field").hidden = state.meta.category !== "segmentation";
+  if (document.activeElement !== $("qa-max-points")) $("qa-max-points").value = status.predictor.max_points ?? "";
+}
+
+let maxPointsTimer = null;
+
+// the predictor's polygon point limit: shared with the editor, applied to what is listed and applied here
+function qaMaxPointsChanged() {
+  clearTimeout(maxPointsTimer);
+  const text = $("qa-max-points").value.trim();
+  const value = text === "" ? null : Math.round(+text);
+  if (value !== null && !(value >= 3 && value <= 10000)) return;
+  maxPointsTimer = setTimeout(async () => {
+    if (value === (qa.status?.predictor.max_points ?? null)) return;
+    try {
+      applyPredictorState(await api("/predictor/options", { method: "PUT", body: JSON.stringify({ max_points: value }) }));
+      qa.status.predictor.max_points = value;
+      await loadFindings({ keep: true });
+    } catch (error) { deps.toast(error.message, "error"); }
+  }, 300);
 }
 
 /* ---------- findings ---------- */
@@ -233,7 +254,9 @@ function fixLabel(item) {
   switch (item.kind) {
     case "missing_label": return ["Add label", "Add the model's object as a label"];
     case "wrong_class": return [`Make it ${className(item.prediction.class_id)}`, "Change the label's class to the model's"];
-    case "box_mismatch": return ["Use model box", "Replace the label's geometry with the model's"];
+    case "box_mismatch": return state.meta.category === "segmentation"
+      ? ["Use outline", "Replace the label's polygon with the model's"]
+      : ["Use model box", "Replace the label's geometry with the model's"];
     default: return ["Delete label", "Delete this label"];
   }
 }
@@ -254,7 +277,7 @@ function renderFindings() {
     const [fix, fixHint] = fixLabel(item);
     return `<article class="card qa-card" data-qa-key="${esc(item.key)}" data-qa-image="${esc(item.image_id)}">
       <div class="thumb" title="Solid: the label · dashed: the model's prediction · click to open in the editor">
-        <img loading="lazy" src="${apiUrl(`/qa/images/${item.image_id}/findings/${item.key}/crop`)}" alt="">
+        <img loading="lazy" src="${apiUrl(`/qa/images/${item.image_id}/findings/${item.key}/crop?points=${qa.status.predictor.max_points ?? ""}`)}" alt="">
         <span class="qa-kind ${item.kind}">${esc(KINDS[item.kind].title)}</span>
         <span class="qa-score" title="How suspicious this looks (higher first)">${percent(item.score)}</span>
       </div>

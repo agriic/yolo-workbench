@@ -603,7 +603,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def qa_crop(request: Request, image_id: str, key: str, session: DatasetSession = current):
         record = require_image(session, image_id)
         # the finding key encodes both shapes and their classes, so it names the picture
-        cache_key = cache.key("qa", record.path, image_mtime(record), key, PALETTE_VERSION)
+        cache_key = cache.key("qa", record.path, image_mtime(record), key, session.predictor.max_points, PALETTE_VERSION)
         if request.headers.get("if-none-match") == f'"{cache_key}"':
             return Response(status_code=304)
         content = cache.get_or_render(cache_key, lambda: labelqa(session).crop(image_id, key, class_color))

@@ -1,5 +1,6 @@
 import asyncio
 import io
+import math
 import time
 
 import pytest
@@ -251,3 +252,58 @@ def test_tolerance_is_a_listing_option(tmp_path):
     loose = next(item for item in qa.findings()["items"] if item["kind"] == "box_mismatch")
     qa.findings(tolerance=25)
     assert qa.apply(image_id, loose["key"])["kind"] == "box_mismatch"
+
+
+# ---------- segmentation: the predictor's polygon point limit ----------
+
+CIRCLE = [round(value, 6) for i in range(64) for value in (0.5 + 0.2 * math.cos(i * math.pi / 32), 0.5 + 0.2 * math.sin(i * math.pi / 32))]
+
+
+class FakeSegBackend(FakeBackend):
+    def predict(self, image_path, conf=None):
+        return [{"class_id": 0, "confidence": 0.9, "points": list(CIRCLE)}]
+
+
+def make_seg_qa(tmp_path):
+    (tmp_path / "train").mkdir()
+    Image.new("RGB", (200, 160), "white").save(tmp_path / "train" / "a.jpg")
+    (tmp_path / "train" / "a.txt").write_text("")
+    (tmp_path / "data.yaml").write_text(yaml.safe_dump({"path": ".", "train": "train", "names": {0: "zero", 1: "one"}}))
+    dataset = Dataset(tmp_path / "data.yaml", "segmentation")
+    predictor = PredictorManager(dataset, backend_factory=FakeSegBackend)
+    (tmp_path / "model.pt").write_bytes(b"fake")
+    predictor.load(str(tmp_path / "model.pt"))
+    qa = LabelQAManager(dataset, predictor)
+    qa.start()
+    wait(qa)
+    return dataset, predictor, qa
+
+
+def test_segmentation_findings_follow_the_point_limit(tmp_path):
+    dataset, predictor, qa = make_seg_qa(tmp_path)
+    image_id = next(iter(dataset.images))
+    [found] = qa.findings()["items"]
+    assert found["kind"] == "missing_label" and len(found["prediction"]["points"]) == 128
+
+    predictor.set_options(8)
+    [limited] = qa.findings()["items"]
+    assert limited["key"] == found["key"]  # keyed as the model drew it: dismissals survive a new limit
+    assert len(limited["prediction"]["points"]) <= 16
+    assert qa.payload()["predictor"]["max_points"] == 8
+
+    qa.apply(image_id, found["key"])
+    [annotation] = dataset.images[image_id].annotations
+    assert annotation.points == limited["prediction"]["points"]
+
+
+def test_segmentation_loose_outline_takes_the_limited_polygon(tmp_path):
+    dataset, predictor, qa = make_seg_qa(tmp_path)
+    label = tmp_path / "train" / "a.txt"
+    label.write_text("0 0.25 0.25 0.65 0.25 0.65 0.65 0.25 0.65\n")  # a square, off from the model's circle
+    dataset.rescan()
+    image_id = next(iter(dataset.images))
+    predictor.set_options(6)
+    [found] = qa.findings()["items"]
+    assert found["kind"] == "box_mismatch"
+    qa.apply(image_id, found["key"])
+    assert len(dataset.images[image_id].annotations[0].points) <= 12

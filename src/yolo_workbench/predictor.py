@@ -362,11 +362,12 @@ class PredictorManager:
             for image_id, items in self.predictions.items():
                 record = self.dataset.images.get(image_id)
                 for item in items:
-                    item["points"] = self._shape(record, item["raw_points"])
+                    item["points"] = self.shape(record, item["raw_points"])
         self._save_settings(max_points=max_points)
         return self.payload()
 
-    def _shape(self, record: ImageRecord | None, points: list[float]) -> list[float]:
+    def shape(self, record: ImageRecord | None, points: list[float]) -> list[float]:
+        """A model's polygon as it is shown and accepted: simplified to max_points (segmentation only)."""
         if self.dataset.category != "segmentation" or not self.max_points:
             return points
         width, height = (record.width, record.height) if record else (1, 1)
@@ -562,7 +563,7 @@ class PredictorManager:
             "model_class_name": self.backend.names.get(model_class_id, str(model_class_id)),
             "class_id": self.mapping.get(model_class_id),
             "confidence": float(item["confidence"]),
-            "points": self._shape(record, points),
+            "points": self.shape(record, points),
             "raw_points": points,  # kept server-side so a changed point limit starts from the model's polygon
             "raw_count": len(points) // 2,
         }

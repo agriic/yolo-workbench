@@ -208,6 +208,7 @@
         <div class="field"><span class="field-label">Show</span><div id="qa-kinds" class="chip-row"></div></div>
         <label class="field" title="Findings about a missing label, wrong class, or loose box need the model at least this sure"><span class="field-label">Model confidence ≥ <span id="qa-conf-value" class="muted">50%</span></span><input id="qa-conf" type="range" min="0.1" max="0.95" step="0.05" value="0.5"></label>
         <label class="field" title="A label and the model's box whose edges are at most this many pixels apart (or 5% of the object's size, if more) are the same box: not a loose box"><span class="field-label">Box tolerance <span id="qa-tolerance-value" class="muted">3 px</span></span><input id="qa-tolerance" type="range" min="0" max="30" step="1" value="3"></label>
+        <label class="field qa-points" id="qa-points-field" hidden title="Simplify the model's polygons to at most this many points (empty: keep the model's outline). The same setting as the editor's Max points per polygon; it is what applying a finding writes.">Max points per polygon<input id="qa-max-points" type="number" min="3" max="10000" step="1" placeholder="all" inputmode="numeric"></label>
         <label class="field">Split<select id="qa-filter-split"><option value="all">All splits</option></select></label>
         <div id="qa-total" class="total"></div>
       </div>
