@@ -301,11 +301,11 @@ const boxOf = points => state.meta.category === "detection"
   ? [points[0] - points[2] / 2, points[1] - points[3] / 2, points[0] + points[2] / 2, points[1] + points[3] / 2]
   : [Math.min(...points.filter((_, i) => i % 2 === 0)), Math.min(...points.filter((_, i) => i % 2)), Math.max(...points.filter((_, i) => i % 2 === 0)), Math.max(...points.filter((_, i) => i % 2))];
 
-// The editor selects the label (if any), shows both shapes, and outlines the model's box dashed.
+// The editor selects the label (if any), shows both shapes, and outlines the model's shape dashed.
 function openFinding(item) {
   if (!item.prediction) return deps.openEditor(item.image_id, item.label.annotation_id);
-  const hint = boxOf(item.prediction.points);
-  const label = item.label ? boxOf(item.label.points) : hint;
-  const box = [Math.min(label[0], hint[0]), Math.min(label[1], hint[1]), Math.max(label[2], hint[2]), Math.max(label[3], hint[3])];
-  deps.openEditor(item.image_id, { annotation: item.label?.annotation_id ?? null, box, hint });
+  const model = boxOf(item.prediction.points);
+  const label = item.label ? boxOf(item.label.points) : model;
+  const box = [Math.min(label[0], model[0]), Math.min(label[1], model[1]), Math.max(label[2], model[2]), Math.max(label[3], model[3])];
+  deps.openEditor(item.image_id, { annotation: item.label?.annotation_id ?? null, box, hint: item.prediction.points });
 }

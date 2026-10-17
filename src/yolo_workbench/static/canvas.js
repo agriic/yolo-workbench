@@ -44,7 +44,7 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   deps.loadEditorPredictions(id);
   deps.samImageOpened();
   // focus: an annotation id to select and zoom to, or { annotation, box, hint }: select an annotation,
-  // zoom to a normalized [l, t, r, b] box, outline another box (where Label QA's model saw an object)
+  // zoom to a normalized [l, t, r, b] box, outline a shape's points (what Label QA's model saw there)
   const focusId = typeof focus === "string" ? focus : focus?.annotation ?? null;
   state.selected = focusId;
   state.focusHint = focus?.hint ?? null;
@@ -349,16 +349,15 @@ export function drawPreview(ctx) {
 
 function drawFocusHint(ctx) {
   if (!state.focusHint) return;
-  const [l, t, r, b] = state.focusHint;
-  const [x1, y1] = toScreen(l, t), [x2, y2] = toScreen(r, b);
+  const path = shapePath({ points: state.focusHint });
   ctx.save();
   ctx.setLineDash([7, 5]);
   ctx.lineWidth = 3;
   ctx.strokeStyle = "rgb(0 0 0 / 70%)";
-  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.stroke(path);
   ctx.lineWidth = 1.6;
   ctx.strokeStyle = "#fff";
-  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.stroke(path);
   ctx.restore();
 }
 
