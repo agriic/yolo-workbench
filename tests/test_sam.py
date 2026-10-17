@@ -218,3 +218,43 @@ def test_api_flow(tmp_path):
             assert (await client.post("/api/v1/images/unknown/sam/segment", json=body)).status_code == 404
 
     asyncio.run(run())
+
+
+def rounded_rectangle_mask(shape=(480, 640)):
+    """A tilted 360×220 rectangle whose corners the mask rounds off (as a model's mask does) and its true corners."""
+    import cv2
+
+    corners = cv2.boxPoints(((320, 240), (360, 220), 12)).astype(np.float32)
+    mask = np.zeros(shape, np.uint8)
+    cv2.fillPoly(mask, [np.round(corners).astype(np.int32)], 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31)))
+    return mask.astype(bool), corners
+
+
+def test_point_limit_fits_vertices_into_rounded_corners():
+    mask, corners = rounded_rectangle_mask()
+    height, width = mask.shape
+    assert len(mask_outlines(mask)[0]) // 2 > 8  # lightly simplified, the rounded corners take several points
+    polygon = np.array(mask_outlines(mask, max_points=4)[0]).reshape(-1, 2) * [width, height]
+    assert len(polygon) == 4
+    # the vertices leave the outline for the corners it rounded off (Douglas–Peucker alone stays ~5 px inside)
+    for corner in corners:
+        assert np.hypot(*(polygon - corner).T).min() < 2.5
+    assert mask_outlines(mask, max_points=1000) == [mask_outlines(mask, max_points=1000)[0]]  # under the limit: untouched
+
+
+def test_segment_applies_the_point_limit(tmp_path):
+    image = tmp_path / "large.png"
+    Image.new("RGB", (640, 480)).save(image)
+
+    class RoundedSam(FakeSam):
+        def segment(self, features, shape, points, labels, box):
+            return rounded_rectangle_mask(shape)[0], 0.9
+
+    manager = ready_manager(RoundedSam)
+    prompt = [{"x": 0.5, "y": 0.5, "positive": True}]
+    assert len(manager.segment(image, "segmentation", prompt, None)["points"]) > 16
+    limited = manager.segment(image, "segmentation", prompt, None, max_points=5)
+    assert len(limited["points"]) // 2 <= 5 and limited["outlines"] == [limited["points"]]
+    box = manager.segment(image, "detection", prompt, None, max_points=5)["points"]
+    assert len(box) == 4  # boxes ignore the limit

@@ -13,11 +13,33 @@ export function configureSam(dependencies) {
 
 // set by the first click on "Smart annotation": from then on images are encoded as soon as they open
 const USED_KEY = "samUsed";
+const MAX_POINTS_KEY = "samMaxPoints";  // segmentation: the polygon point limit, kept across images and sessions
 const DRAG_THRESHOLD = 4;   // px of pointer travel that turns a click into a box drag
 const POINT_HIT = 8;        // px: clicking an existing point removes it
 
 const used = () => { try { return localStorage.getItem(USED_KEY) === "1"; } catch { return false; } };
 const sam = () => state.sam;
+
+function maxPoints() {
+  try {
+    const value = Number(localStorage.getItem(MAX_POINTS_KEY));
+    return Number.isInteger(value) && value >= 3 && value <= 10000 ? value : null;
+  } catch { return null; }
+}
+
+let maxPointsTimer;
+
+/** The Max points field changed: remember it and re-run the current prompts with the new limit. */
+export function samMaxPointsChanged() {
+  clearTimeout(maxPointsTimer);
+  const text = $("sam-max-points").value.trim();
+  const value = text === "" ? null : Math.round(+text);
+  if (value !== null && !(value >= 3 && value <= 10000)) return;
+  try {
+    if (value === null) localStorage.removeItem(MAX_POINTS_KEY); else localStorage.setItem(MAX_POINTS_KEY, String(value));
+  } catch { /* the limit then lasts only while the field keeps it */ }
+  maxPointsTimer = setTimeout(() => { if (sam().result) segment(); }, 250);
+}
 
 export async function refreshSam() {
   try { applySamState(await api("/api/v1/sam")); } catch { /* the button stays disabled */ }
@@ -63,6 +85,8 @@ export async function toggleSam(force = null) {
   clearPrompts();
   $("smart-annotate").classList.toggle("active", active);
   $("smart-annotate").setAttribute("aria-pressed", String(active));
+  $("sam-points-field").hidden = !active || state.meta.category !== "segmentation";
+  if (active && document.activeElement !== $("sam-max-points")) $("sam-max-points").value = maxPoints() ?? "";
   if (active) {
     state.drawing = null;
     try { localStorage.setItem(USED_KEY, "1"); } catch { /* only skips encoding ahead */ }
@@ -143,7 +167,7 @@ async function segment() {
   try {
     const result = await api(`/images/${id}/sam/segment`, {
       method: "POST",
-      body: JSON.stringify({ points: s.points, box: s.box }),
+      body: JSON.stringify({ points: s.points, box: s.box, max_points: currentMaxPoints() }),
     });
     if (request !== s.request || state.detail?.id !== id) return;
     s.result = result;
@@ -210,6 +234,13 @@ function addPoint(norm, screen, positive) {
   promptsChanged();
 }
 
+// the field's value while it is valid (it is saved as it changes), else the remembered one
+function currentMaxPoints() {
+  const text = $("sam-max-points").value.trim();
+  const value = Math.round(+text);
+  return text !== "" && value >= 3 && value <= 10000 ? value : text === "" ? null : maxPoints();
+}
+
 const diff = (a, b) => [a[0] - b[0], a[1] - b[1]];
 const clampPoint = ([x, y]) => [Math.min(1, Math.max(0, x)), Math.min(1, Math.max(0, y))];
 
@@ -237,6 +268,15 @@ export function drawSam(ctx) {
     if (state.meta.category === "detection") {
       ctx.setLineDash([6, 4]);
       ctx.stroke(deps.shapePath({ points: s.result.points }));
+    } else if (currentMaxPoints()) {
+      // with a point limit the vertices are what is being tuned: show them
+      ctx.fillStyle = color;
+      for (let i = 0; i < s.result.points.length; i += 2) {
+        const [sx, sy] = deps.toScreen(s.result.points[i], s.result.points[i + 1]);
+        ctx.beginPath();
+        ctx.arc(sx, sy, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
     ctx.restore();
   }

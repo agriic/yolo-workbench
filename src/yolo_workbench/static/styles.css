@@ -813,6 +813,11 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
 .mapping-row select { width: 150px; height: 28px; font-size: 12px; }
 .pred-threshold { font-size: 12px; color: var(--ed-text-2); margin-top: 2px; }
 #prediction-section input[type="range"] { width: 100%; accent-color: var(--accent); }
+.pred-points { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+#editor input.points-limit {
+  width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; font-size: 12px;
+  background: var(--ed-control); border: 1px solid var(--ed-control-line); color: var(--ed-text);
+}
 .pred-actions { display: flex; gap: 6px; margin: 6px 0; }
 .pred-actions button { flex: 1; font-size: 12px; }
 .pred-row { border-style: dashed; }

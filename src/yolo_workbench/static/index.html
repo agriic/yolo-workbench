@@ -348,6 +348,7 @@
         </div>
         <button id="predict-image" class="secondary" title="Predict annotations for this image (P)" hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.2 2.2m8.4 8.4 2.2 2.2m0-12.8-2.2 2.2M7.8 16.2l-2.2 2.2"/></svg>Predict</button>
         <button id="smart-annotate" class="secondary" aria-pressed="false" disabled title="Smart annotation: click objects, SAM outlines them (S)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/></svg>Smart annotation</button>
+        <label class="field inline" id="sam-points-field" hidden title="Polygons from smart annotation get at most this many points, fitted to SAM's outline (empty: SAM's outline, lightly simplified). Kept for the next images.">Max points<input id="sam-max-points" class="points-limit" type="number" min="3" max="10000" step="1" placeholder="all" inputmode="numeric"></label>
         <label class="field inline" id="draw-class-field">Draw class<select id="draw-class"></select></label>
         <button id="delete" class="danger-btn" title="Delete selected (⌫)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6"/></svg>Delete</button>
       </div>
@@ -364,6 +365,8 @@
           <h2>Predictions <span id="prediction-count"></span></h2>
           <label class="field-label pred-threshold">Min confidence <span id="pred-conf-value">0%</span></label>
           <input id="pred-conf" type="range" min="0" max="1" step="0.05" value="0">
+          <label class="field-label pred-threshold pred-points" id="pred-points-wrap" hidden title="Simplify predicted polygons to at most this many points (empty: keep the model's outline). Applies to pending predictions and is what Accept writes.">Max points per polygon
+            <input id="pred-max-points" class="points-limit" type="number" min="3" max="10000" step="1" placeholder="all" inputmode="numeric"></label>
           <div class="pred-actions">
             <button id="accept-all-preds" class="secondary">Accept all ≥</button>
             <button id="reject-all-preds" class="secondary">Reject all</button>

@@ -197,8 +197,9 @@ class SamManager:
             self._encoded(path)
         return {"encoded": True}
 
-    def segment(self, path: Path, category: str, points: list[dict], box: list[float] | None) -> dict:
-        """Prompt with normalized points ({x, y, positive}) and/or a normalized x1,y1,x2,y2 box."""
+    def segment(self, path: Path, category: str, points: list[dict], box: list[float] | None, max_points: int | None = None) -> dict:
+        """Prompt with normalized points ({x, y, positive}) and/or a normalized x1,y1,x2,y2 box. A segmentation
+        polygon gets at most `max_points` vertices, fitted to the mask outline (None: the usual light simplification)."""
         if category == "classification":
             raise DatasetError("Smart annotation is not available for classification datasets")
         if not points and box is None:
@@ -216,7 +217,7 @@ class SamManager:
             box_px = None if box is None else [box[0] * width, box[1] * height, box[2] * width, box[3] * height]
             mask, score = backend.segment(features, (height, width), pixels, labels, box_px)
         mask = drop_specks(mask)
-        outlines = mask_outlines(mask) if mask.sum() >= MIN_AREA else []
+        outlines = mask_outlines(mask, max_points if category == "segmentation" else None) if mask.sum() >= MIN_AREA else []
         if not outlines:
             return {"found": False, "score": score, "outlines": [], "points": []}
         # outlines show exactly what is added: a box around every part, or the largest part as the polygon

@@ -240,6 +240,81 @@ def test_segmentation_predictions_accept(tmp_path):
     assert len(record.annotations) == 2
 
 
+def bendy_square(steps=40, wobble=0.004):
+    """A square (0.1..0.5) whose edges wiggle like a mask outline: 4 * steps points, corners included."""
+    import math
+
+    points = []
+    corners = [(0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.1, 0.5)]
+    for (x0, y0), (x1, y1) in zip(corners, corners[1:] + corners[:1]):
+        for step in range(steps):
+            t = step / steps
+            offset = wobble * math.sin(t * math.pi * 6) if step else 0.0
+            # perpendicular to the edge
+            dx, dy = (y1 - y0) / 0.4, -(x1 - x0) / 0.4
+            points += [x0 + (x1 - x0) * t + dx * offset, y0 + (y1 - y0) * t + dy * offset]
+    return points
+
+
+def test_simplify_polygon_caps_points_and_keeps_corners():
+    from yolo_workbench.masks import simplify_polygon
+
+    points = bendy_square()
+    assert simplify_polygon(points, 200, 640, 640) == points
+    square = simplify_polygon(points, 4, 640, 640)
+    assert len(square) == 8
+    # the lines fitted through the wiggling edges meet at the square's corners, give or take a pixel
+    for cx, cy in [(0.1, 0.1), (0.5, 0.1), (0.5, 0.5), (0.1, 0.5)]:
+        assert min(abs(x - cx) + abs(y - cy) for x, y in zip(square[::2], square[1::2])) < 0.004
+    for limit in (5, 12, 30):
+        assert 3 <= len(simplify_polygon(points, limit, 640, 480)) // 2 <= limit
+
+
+def test_max_points_simplifies_pending_and_accepted_polygons(tmp_path):
+    dataset, label, manager, model = make_predictor(tmp_path, "segmentation")
+    raw = bendy_square()
+
+    class Backend(FakeBackend):
+        def predict(self, image_path):
+            return [{"class_id": 0, "confidence": 0.9, "points": raw}]
+
+    manager._backend_factory = Backend
+    manager.load(str(model))
+    record = next(iter(dataset.images.values()))
+    manager.predict_image(record.id)
+    [item] = manager.predictions_for(record.id)["items"]
+    assert len(item["points"]) == len(raw) and item["raw_count"] == len(raw) // 2
+    assert "raw_points" not in item
+
+    manager.set_options(max_points=4)
+    [item] = manager.predictions_for(record.id)["items"]
+    assert len(item["points"]) == 8
+    manager.set_options(max_points=None)  # back to the model's own outline
+    assert manager.predictions_for(record.id)["items"][0]["points"] == raw
+    manager.set_options(max_points=6)
+    manager.accept(record.id)
+    assert len(record.annotations[-1].points) <= 12
+
+    # the limit is remembered per dataset, next to the recent models
+    reopened = PredictorManager(Dataset(dataset.yaml_path, "segmentation"), backend_factory=Backend)
+    assert reopened.max_points == 6 and reopened.payload()["max_points"] == 6
+    assert reopened._recent_models() == [model.as_posix()]
+
+
+def test_predictor_options_endpoint(tmp_path):
+    dataset, label, manager, model = make_predictor(tmp_path, "segmentation")
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"), predictor=manager)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.put("/api/v1/predictor/options", json={"max_points": 12})
+            assert response.status_code == 200 and response.json()["max_points"] == 12
+            assert (await client.put("/api/v1/predictor/options", json={"max_points": 2})).status_code == 422
+            assert (await client.put("/api/v1/predictor/options", json={"max_points": None})).json()["max_points"] is None
+
+    asyncio.run(run())
+
+
 def overlapping_backend(points, model_class_id=0):
     """Backend emitting one prediction with the given geometry (model class 0 maps to dataset class 1)."""
 

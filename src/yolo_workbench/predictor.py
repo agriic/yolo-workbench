@@ -13,7 +13,7 @@ from PIL import Image
 from . import frameworks, libraries
 from .dataset import Dataset, DatasetError
 from .imaging import upright_rgb
-from .masks import drop_specks, mask_outlines
+from .masks import drop_specks, mask_outlines, simplify_polygon
 from .models import ImageRecord
 
 
@@ -62,6 +62,11 @@ def _matches_existing(category: str, class_id: int | None, points: list[float], 
 
 def _clamp(value: float) -> float:
     return min(1.0, max(0.0, float(value)))
+
+
+def _public(items: list[dict]) -> list[dict]:
+    """Pending predictions as the API shows them (without the model's unsimplified polygon)."""
+    return [{key: value for key, value in item.items() if key != "raw_points"} for item in items]
 
 
 def _same_file(a: str, b: str) -> bool:
@@ -211,6 +216,9 @@ class PredictorManager:
         self.model_path: str | None = None
         self.conf = 0.25
         self.iou = 0.45
+        # segmentation: pending polygons are simplified to at most this many points (None = as the model drew them)
+        saved = self._settings().get("max_points")
+        self.max_points: int | None = saved if isinstance(saved, int) and saved >= 3 else None
         self.mapping: dict[int, int | None] = {}  # model class id -> dataset class id (None = unmapped)
         self.predictions: dict[str, list[dict]] = {}  # image_id -> pending predictions
         self.job: dict = self._new_job()
@@ -267,6 +275,7 @@ class PredictorManager:
                 "model": {"path": self.model_path, "names": self.backend.names if self.backend else {}, "framework": getattr(self.backend, "framework", None)},
                 "conf": self.conf,
                 "iou": self.iou,
+                "max_points": self.max_points,
                 "mapping": {str(key): value for key, value in self.mapping.items()},
                 "job": job,
                 "pending": {image_id: len(items) for image_id, items in self.predictions.items() if items},
@@ -323,22 +332,45 @@ class PredictorManager:
     def _recents_path(self) -> Path:
         return self.dataset.root / ".yolo-workbench" / "predictor.json"
 
-    def _recent_models(self) -> list[str]:
+    def _settings(self) -> dict:
         try:
             data = json.loads(self._recents_path.read_text(encoding="utf-8"))
-            recents = data.get("recent_models", [])
-            return [str(item) for item in recents] if isinstance(recents, list) else []
+            return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
-            return []
+            return {}
+
+    def _save_settings(self, **changes) -> None:
+        try:
+            self._recents_path.parent.mkdir(parents=True, exist_ok=True)
+            self._recents_path.write_text(json.dumps({**self._settings(), **changes}), encoding="utf-8")
+        except OSError:
+            pass  # recents and options are a convenience; failing to persist them must never break anything
+
+    def _recent_models(self) -> list[str]:
+        recents = self._settings().get("recent_models", [])
+        return [str(item) for item in recents] if isinstance(recents, list) else []
 
     def _remember_model(self, path: str) -> None:
         # older recents may name the same file differently (backslashes on Windows, relative paths)
         recents = [path] + [item for item in self._recent_models() if not _same_file(item, path)]
-        try:
-            self._recents_path.parent.mkdir(parents=True, exist_ok=True)
-            self._recents_path.write_text(json.dumps({"recent_models": recents[:10]}), encoding="utf-8")
-        except OSError:
-            pass  # recents are a convenience; failing to persist them must never break loading
+        self._save_settings(recent_models=recents[:10])
+
+    def set_options(self, max_points: int | None) -> dict:
+        """Change the polygon point limit; pending predictions are re-simplified from the model's own polygons."""
+        with self._lock:
+            self.max_points = max_points
+            for image_id, items in self.predictions.items():
+                record = self.dataset.images.get(image_id)
+                for item in items:
+                    item["points"] = self._shape(record, item["raw_points"])
+        self._save_settings(max_points=max_points)
+        return self.payload()
+
+    def _shape(self, record: ImageRecord | None, points: list[float]) -> list[float]:
+        if self.dataset.category != "segmentation" or not self.max_points:
+            return points
+        width, height = (record.width, record.height) if record else (1, 1)
+        return simplify_polygon(points, self.max_points, width, height)
 
     def _trained_models(self) -> dict[Path, str]:
         """The best weights of the dataset's training runs (newest first) -> "<run name> · best.pt" (· best (RF-DETR))."""
@@ -523,13 +555,16 @@ class PredictorManager:
     def _prediction(self, record: ImageRecord, item: dict) -> dict:
         self._counter += 1
         model_class_id = int(item["class_id"])
+        points = [float(value) for value in item["points"]]
         return {
             "id": f"pred:{record.id}:{self._counter}",
             "model_class_id": model_class_id,
             "model_class_name": self.backend.names.get(model_class_id, str(model_class_id)),
             "class_id": self.mapping.get(model_class_id),
             "confidence": float(item["confidence"]),
-            "points": [float(value) for value in item["points"]],
+            "points": self._shape(record, points),
+            "raw_points": points,  # kept server-side so a changed point limit starts from the model's polygon
+            "raw_count": len(points) // 2,
         }
 
     def predict_image(self, image_id: str) -> dict:
@@ -560,7 +595,7 @@ class PredictorManager:
     def predictions_for(self, image_id: str) -> dict:
         record = self.dataset.require_image(image_id)
         with self._lock:
-            return {"image_id": record.id, "items": [dict(item) for item in self.predictions.get(record.id, [])]}
+            return {"image_id": record.id, "items": _public(self.predictions.get(record.id, []))}
 
     def _take(self, image_id: str, prediction_ids: list[str] | None) -> tuple[list[dict], list[dict]]:
         """Split pending predictions into (chosen, kept) without mutating state."""
@@ -596,11 +631,11 @@ class PredictorManager:
         detail = self.dataset.replace_annotations(record.id, annotations)
         with self._lock:
             self.predictions[record.id] = kept
-        return {"accepted": len(chosen), "detail": detail, "predictions": kept}
+        return {"accepted": len(chosen), "detail": detail, "predictions": _public(kept)}
 
     def reject(self, image_id: str, prediction_ids: list[str] | None = None) -> dict:
         record = self.dataset.require_image(image_id)
         with self._lock:
             chosen, kept = self._take(record.id, prediction_ids)
             self.predictions[record.id] = kept
-            return {"rejected": len(chosen), "predictions": kept}
+            return {"rejected": len(chosen), "predictions": _public(kept)}

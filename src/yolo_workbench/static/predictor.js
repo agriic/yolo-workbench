@@ -54,6 +54,9 @@ export function applyPredictorState(data) {
   pred.mapping = data.mapping;
   pred.pending = data.pending;
   pred.job = data.job;
+  pred.maxPoints = data.max_points ?? null;
+  $("pred-points-wrap").hidden = state.meta.category !== "segmentation";
+  if (document.activeElement !== $("pred-max-points")) $("pred-max-points").value = pred.maxPoints ?? "";
   const ready = pred.status === "ready";
   const running = pred.job.state === "running";
   const canCancel = running && pred.job.done < pred.job.total && !pred.job.cancel_requested;
@@ -143,6 +146,24 @@ export async function retryPredict() {
   } catch (error) { deps.toast(error.message, "error"); }
 }
 
+let maxPointsTimer;
+
+// typing a number re-simplifies every pending prediction server-side; the ghosts follow
+export function maxPointsChanged() {
+  clearTimeout(maxPointsTimer);
+  const input = $("pred-max-points");
+  const text = input.value.trim();
+  const value = text === "" ? null : Math.round(+text);
+  if (value !== null && !(value >= 3 && value <= 10000)) return;
+  maxPointsTimer = setTimeout(async () => {
+    if (value === state.pred.maxPoints) return;
+    try {
+      applyPredictorState(await api("/predictor/options", { method: "PUT", body: JSON.stringify({ max_points: value }) }));
+      if (state.detail) await loadEditorPredictions(state.detail.id);
+    } catch (error) { deps.toast(error.message, "error"); }
+  }, 300);
+}
+
 export async function predictImage() {
   if (!state.detail) return;
   if (state.pred.status !== "ready") return deps.toast("Load a model first", "error");
@@ -189,6 +210,16 @@ export function drawPredictions(ctx) {
     ctx.lineWidth = 1.8;
     ctx.setLineDash([7, 5]);
     ctx.stroke(path);
+    if (state.pred.maxPoints && state.meta.category === "segmentation") {
+      // with a point limit the vertices are what is being tuned: show them
+      ctx.fillStyle = color;
+      for (let i = 0; i < prediction.points.length; i += 2) {
+        const [sx, sy] = deps.toScreen(prediction.points[i], prediction.points[i + 1]);
+        ctx.beginPath();
+        ctx.arc(sx, sy, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
     ctx.restore();
     drawPredictionBadge(ctx, prediction, color);
   }
@@ -240,10 +271,13 @@ export function renderPredList() {
   $("prediction-list").innerHTML = items.map(p => {
     const unmapped = p.class_id === null;
     const name = unmapped ? `${p.model_class_name} (unmapped)` : state.meta.names[p.class_id] ?? `class ${p.class_id}`;
+    const count = p.points.length / 2;
+    const shape = state.meta.category === "segmentation"
+      ? ` <span title="${count === p.raw_count ? "Points as the model drew them" : `Simplified from ${p.raw_count} points`}">· ${count} pts</span>` : "";
     return `<div class="annotation-row pred-row ${p.confidence < state.pred.minConf ? "pred-dim" : ""}" data-prediction="${esc(p.id)}">
       <span class="swatch" style="background:${unmapped ? UNMAPPED_COLOR : classColor(p.class_id)}"></span>
       <span class="pred-name" title="${esc(name)}">${esc(name)}</span>
-      <span class="row-meta">${Math.round(p.confidence * 100)}%</span>
+      <span class="row-meta">${Math.round(p.confidence * 100)}%${shape}</span>
       <button class="row-accept" title="${unmapped ? "Unmapped classes cannot be accepted" : "Accept prediction"}" ${unmapped ? "disabled" : ""}>✓</button>
       <button class="row-delete" title="Reject prediction">×</button>
     </div>`;

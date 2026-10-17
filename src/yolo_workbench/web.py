@@ -73,6 +73,10 @@ class PredictorLoadPayload(StrictPayload):
     iou: float | None = Field(default=None, ge=0, le=1)
 
 
+class PredictorOptionsPayload(StrictPayload):
+    max_points: int | None = Field(default=None, ge=3, le=10000)
+
+
 class PredictorMappingPayload(BaseModel):
     mapping: dict[str, int | None]
 
@@ -105,6 +109,7 @@ class SamPoint(StrictPayload):
 class SamSegmentPayload(StrictPayload):
     points: list[SamPoint] = Field(default_factory=list, max_length=64)
     box: list[float] | None = Field(default=None, min_length=4, max_length=4)  # normalized x1, y1, x2, y2
+    max_points: int | None = Field(default=None, ge=3, le=10000)  # segmentation: polygon vertex limit
 
 
 class ClassAddPayload(BaseModel):
@@ -518,6 +523,10 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def predictor_load(payload: PredictorLoadPayload, session: DatasetSession = current):
         return session.predictor.load(payload.path, payload.conf, payload.iou)
 
+    @router.put("/predictor/options")
+    def predictor_options(payload: PredictorOptionsPayload, session: DatasetSession = current):
+        return session.predictor.set_options(payload.max_points)
+
     @router.put("/predictor/mapping")
     def predictor_mapping(payload: PredictorMappingPayload, session: DatasetSession = current):
         return session.predictor.set_mapping(payload.mapping)
@@ -618,7 +627,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def sam_segment(image_id: str, payload: SamSegmentPayload, session: DatasetSession = current):
         record = require_image(session, image_id)
         points = [point.model_dump() for point in payload.points]
-        return sam.segment(record.path, session.dataset.category, points, payload.box)
+        return sam.segment(record.path, session.dataset.category, points, payload.box, payload.max_points)
 
     @router.get("/embeddings")
     def embeddings_state(session: DatasetSession = current):

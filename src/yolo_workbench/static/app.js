@@ -10,7 +10,7 @@ import {
 } from "./canvas.js";
 import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor,
-  drawPredictions, hitPrediction, loadEditorPredictions, loadModel, predictImage,
+  drawPredictions, hitPrediction, loadEditorPredictions, loadModel, maxPointsChanged, predictImage,
   refreshPredictor, rejectPredictions, renderModelMenu, renderPredList,
   retryPredict, runPredict,
 } from "./predictor.js";
@@ -21,7 +21,7 @@ import {
 } from "./embeddings.js";
 import {
   acceptSam, configureSam, drawSam, hasPrompts, clearPrompts, refreshSam, removeLastPrompt, samEditorClosed,
-  samHint, samImageOpened, samPointerDown, samPointerMove, samPointerUp, samRightClick, toggleSam,
+  samHint, samImageOpened, samMaxPointsChanged, samPointerDown, samPointerMove, samPointerUp, samRightClick, toggleSam,
 } from "./sam.js";
 import { bindManage, configureManage, loadClasses, loadStorage, renderManageMeta } from "./manage.js";
 import { bindRepair, configureRepair, openLabelText, renderUnknownClasses } from "./repair.js";
@@ -305,6 +305,7 @@ function bind() {
     renderPredList();
     render();
   };
+  $("pred-max-points").oninput = maxPointsChanged;
   $("accept-all-preds").onclick = () => acceptPredictions(null, state.pred.minConf);
   $("reject-all-preds").onclick = () => rejectPredictions(null);
   $("prediction-list").addEventListener("click", e => {
@@ -422,6 +423,9 @@ function bind() {
   });
   // blurred so ⏎ (accept) and Space (pan) don't press the button again
   $("smart-annotate").onclick = e => { e.currentTarget.blur(); toggleSam(); };
+  $("sam-max-points").oninput = samMaxPointsChanged;
+  // ⏎ in a point-limit field hands the keyboard back to the editor (the next ⏎ accepts)
+  for (const id of ["sam-max-points", "pred-max-points"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") e.currentTarget.blur(); });
   $("fit").onclick = fit;
   $("zoom-in").onclick = () => zoomCentered(1.25);
   $("zoom-out").onclick = () => zoomCentered(0.8);
