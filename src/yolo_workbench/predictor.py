@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import json
+import sys
 import threading
 from pathlib import Path
 
@@ -25,7 +27,16 @@ def rfdetr_available() -> bool:
     return importlib.util.find_spec("rfdetr") is not None
 
 
+def free_gpu_memory() -> None:
+    """Hand the memory of dropped models back to the GPU (only when torch is already loaded)."""
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 MODEL_EXTENSIONS = {".pt", ".pth"}
+UNLOAD_WAIT = 10.0  # seconds an unload waits for a batch run's current image
 SCAN_DEPTH = 4
 SCAN_LIMIT = 50
 DEDUP_IOU = 0.6  # predictions matching an existing same-class annotation at or above this IoU are dropped
@@ -214,6 +225,8 @@ class PredictorManager:
         self.error: str | None = None
         self.backend = None
         self.model_path: str | None = None
+        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU)
+        self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
         self.conf = 0.25
         self.iou = 0.45
         # segmentation: pending polygons are simplified to at most this many points (None = as the model drew them)
@@ -276,6 +289,7 @@ class PredictorManager:
                 "conf": self.conf,
                 "iou": self.iou,
                 "max_points": self.max_points,
+                "unloaded": self.unloaded,
                 "mapping": {str(key): value for key, value in self.mapping.items()},
                 "job": job,
                 "pending": {image_id: len(items) for image_id, items in self.predictions.items() if items},
@@ -300,6 +314,7 @@ class PredictorManager:
                 raise DatasetError(f"{self.external_busy}; wait for it to finish before loading a model")
             self.status = "loading"
             self.error = None
+            generation = self._generation
         previous = getattr(self.backend, "framework", None)
         try:
             backend = self._backend_factory(model_path, self.dataset.category, conf if conf is not None else self.conf, iou if iou is not None else self.iou)
@@ -313,7 +328,10 @@ class PredictorManager:
                 self.error = str(exc)
             raise DatasetError(f"Failed to load model: {exc}") from exc
         with self._lock:
+            if generation != self._generation:
+                raise DatasetError(self.unloaded or "The model was unloaded while loading")
             self.backend = backend
+            self.unloaded = None
             self.model_path = model_path.as_posix()
             if conf is not None:
                 self.conf = conf
@@ -327,6 +345,24 @@ class PredictorManager:
             self.status = "ready"
         self._remember_model(model_path.as_posix())
         return self.payload()
+
+    def unload(self, run: str) -> bool:
+        """Drop the model so a training run gets the GPU; cancels a batch run and waits for its current image.
+        Pending predictions, the class mapping and the model path stay. False when nothing was loaded."""
+        with self._lock:
+            if self.backend is None and self.status != "loading":
+                return False
+            self._generation += 1
+            if self.job["state"] == "running":
+                self._cancel_event.set()
+                self.job["cancel_requested"] = True
+            thread = self._thread
+            self.backend = None
+            self.status = "idle"
+            self.unloaded = f"The model was unloaded to free memory for training run '{run}'; load it again"
+        if thread is not None:
+            thread.join(UNLOAD_WAIT)
+        return True
 
     @property
     def _recents_path(self) -> Path:
@@ -482,7 +518,7 @@ class PredictorManager:
     def run(self, image_ids: list[str] | None = None, split: str | None = None, only_unlabeled: bool = False) -> dict:
         with self._lock:
             if self.status != "ready" or not self.backend:
-                raise DatasetError("Load a model first")
+                raise DatasetError(self.unloaded or "Load a model first")
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is already in progress")
             if self.external_busy:
@@ -491,7 +527,7 @@ class PredictorManager:
             self.job = self._new_job("running", len(records))
             self._failed_image_ids = []
             self._cancel_event.clear()
-            self._thread = threading.Thread(target=self._run_batch, args=(records,), daemon=True)
+            self._thread = threading.Thread(target=self._run_batch, args=(records, self.backend), daemon=True)
             self._thread.start()
         return self.payload()
 
@@ -526,7 +562,7 @@ class PredictorManager:
             raise DatasetError("No images match the requested selection")
         return records
 
-    def _run_batch(self, records: list[ImageRecord]) -> None:
+    def _run_batch(self, records: list[ImageRecord], backend) -> None:
         for index, record in enumerate(records):
             if self._cancel_event.is_set():
                 with self._lock:
@@ -534,9 +570,9 @@ class PredictorManager:
                 break
             try:
                 with self.backend_lock:
-                    raw = self.backend.predict(record.path)
+                    raw = backend.predict(record.path)
                 with self._lock:
-                    items = [self._prediction(record, item) for item in raw]
+                    items = [self._prediction(record, item, backend.names) for item in raw]
                     self.predictions[record.id] = self._filter_new(record, items)
             except Exception as exc:  # surfaced to the UI, never crashes the server
                 with self._lock:
@@ -553,14 +589,14 @@ class PredictorManager:
             self.job["state"] = "cancelled" if self._cancel_event.is_set() else "done"
             self.job["cancel_requested"] = False
 
-    def _prediction(self, record: ImageRecord, item: dict) -> dict:
+    def _prediction(self, record: ImageRecord, item: dict, names: dict) -> dict:
         self._counter += 1
         model_class_id = int(item["class_id"])
         points = [float(value) for value in item["points"]]
         return {
             "id": f"pred:{record.id}:{self._counter}",
             "model_class_id": model_class_id,
-            "model_class_name": self.backend.names.get(model_class_id, str(model_class_id)),
+            "model_class_name": names.get(model_class_id, str(model_class_id)),
             "class_id": self.mapping.get(model_class_id),
             "confidence": float(item["confidence"]),
             "points": self.shape(record, points),
@@ -573,16 +609,17 @@ class PredictorManager:
         record = self.dataset.require_image(image_id)
         with self._lock:
             if self.status != "ready" or not self.backend:
-                raise DatasetError("Load a model first")
+                raise DatasetError(self.unloaded or "Load a model first")
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is already in progress")
+            backend = self.backend
         try:
             with self.backend_lock:
-                raw = self.backend.predict(record.path)
+                raw = backend.predict(record.path)
         except Exception as exc:
             raise DatasetError(f"Prediction failed: {exc}") from exc
         with self._lock:
-            self.predictions[record.id] = self._filter_new(record, [self._prediction(record, item) for item in raw])
+            self.predictions[record.id] = self._filter_new(record, [self._prediction(record, item, backend.names) for item in raw])
         return self.predictions_for(record.id)
 
     def _filter_new(self, record: ImageRecord, items: list[dict]) -> list[dict]:

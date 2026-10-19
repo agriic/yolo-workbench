@@ -988,3 +988,99 @@ def test_real_training_smoke(tmp_path):
     assert detail["status"] == "completed", manager.log(None, run["id"])["text"][-3000:]
     assert detail["epochs_done"] == 2 and detail["val"]["metrics"] and detail["test"]["metrics"]
     assert not list(dataset.root.rglob("*.cache"))
+
+
+# ---------- unloading SAM and prediction models ----------
+
+
+class FakePredictorBackend:
+    names = {0: "cat"}
+
+    def __init__(self, path, category, conf, iou):
+        pass
+
+    def predict(self, image_path):
+        return []
+
+
+class FakeSamBackend:
+    def __init__(self, name):
+        pass
+
+
+def test_starting_a_run_unloads_sam_and_the_prediction_model(tmp_path):
+    from yolo_workbench.predictor import PredictorManager
+    from yolo_workbench.sam import SamManager
+
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+    predictor = PredictorManager(dataset, backend_factory=FakePredictorBackend)
+    sam = SamManager(backend_factory=FakeSamBackend, gpu=True)
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media"), training=manager, predictor=predictor, sam=sam)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"x")
+
+    async def run():
+        async with client_for(app) as client:
+            assert (await client.post("/api/v1/predictor/load", json={"path": str(model)})).json()["status"] == "ready"
+            await client.post("/api/v1/sam/start")
+            sam._thread.join(5)
+            assert sam.status == "ready"
+            response = await client.post("/api/v1/training/runs", json={"name": "big run", "yaml": ARGS})
+            assert response.json()["run"]["active"] and launcher.launches
+            state = (await client.get("/api/v1/predictor")).json()
+            assert state["status"] == "idle" and "training run 'big run'" in state["unloaded"]
+            state = (await client.get("/api/v1/sam")).json()
+            assert state["status"] == "idle" and "training run 'big run'" in state["unloaded"]
+            image_id = next(iter(dataset.images))
+            response = await client.post(f"/api/v1/images/{image_id}/predictions/compute")
+            assert response.status_code == 400 and "big run" in response.json()["detail"]
+            # loading again while the run trains is the user's call
+            assert (await client.post("/api/v1/predictor/load", json={"path": str(model)})).json()["status"] == "ready"
+
+    asyncio.run(run())
+
+
+def test_a_failing_unload_does_not_stop_the_run(tmp_path):
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+    calls = []
+
+    def before_launch(run):
+        calls.append(run)
+        raise RuntimeError("boom")
+
+    manager.before_launch = before_launch
+    result = manager.enqueue(None, dataset, "r", "", ARGS)
+    assert calls == ["r"] and result["run"]["active"] and len(launcher.launches) == 1
+
+
+def test_projects_mode_unloads_the_open_projects_model(tmp_path):
+    from yolo_workbench.sam import SamManager
+
+    launcher = FakeLauncher()
+    workspace = Workspace(tmp_path / "projects", jobs=JobManager(synchronous=True), background_probe=False, training_options={"launcher": launcher, "weights_dir": tmp_path / "w"})
+    slug = workspace.create("Alpha", "detection", ["cat"])["slug"]
+    for split in ("train", "val"):
+        Image.new("RGB", (16, 16)).save(workspace.root / slug / "images" / split / "a.jpg")
+        (workspace.root / slug / "labels" / split / "a.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    sam = SamManager(backend_factory=FakeSamBackend, gpu=True)
+    app = create_workspace_app(workspace, media_cache=MediaCache(tmp_path / "media"), sam=sam)
+    predictor = workspace.session(slug).predictor
+    predictor._backend_factory = FakePredictorBackend
+    predictor._available = True
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"x")
+    predictor.load(str(model))
+    sam.start()
+    sam._thread.join(5)
+
+    async def run():
+        async with client_for(app) as client:
+            response = await client.post(f"/api/v1/projects/{slug}/training/runs", json={"name": "p", "yaml": ARGS})
+            assert response.json()["run"]["active"]
+            assert predictor.status == "idle" and predictor.unloaded and sam.status == "idle"
+
+    asyncio.run(run())

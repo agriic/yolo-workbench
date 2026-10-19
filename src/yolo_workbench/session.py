@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from .dataset import Dataset
 from .embeddings import EmbeddingsManager
 from .labelqa import LabelQAManager
-from .predictor import PredictorManager
+from .predictor import UNLOAD_WAIT, PredictorManager
 
 
 @dataclass
@@ -25,6 +25,13 @@ class DatasetSession:
         # a test may pass a stand-in predictor without the real manager's state; Label QA needs the real one
         labelqa = LabelQAManager(dataset, predictor) if isinstance(predictor, PredictorManager) else None
         return cls(dataset, predictor, EmbeddingsManager(dataset), slug, project or {}, labelqa)
+
+    def unload_models(self, run: str) -> bool:
+        """Free the GPU for training run `run`: stop Label QA's analysis and drop the prediction model."""
+        if self.labelqa is not None:
+            self.labelqa.stop(UNLOAD_WAIT)
+        unload = getattr(self.predictor, "unload", None)  # a test's stand-in predictor may have none
+        return bool(unload and unload(run))
 
     def busy_reason(self) -> str | None:
         """Why this session cannot be closed right now, if anything is still running."""

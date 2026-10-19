@@ -567,3 +567,44 @@ def test_predictor_api_endpoints(tmp_path):
             assert missing.status_code == 400
 
     asyncio.run(run())
+
+
+def test_unload_for_training_keeps_pending_predictions(tmp_path):
+    dataset, _, manager, model = make_predictor(tmp_path)
+    manager.load(str(model))
+    image_id = next(iter(dataset.images))
+    pending = manager.predict_image(image_id)["items"]
+    assert manager.unload("run 1") is True
+    state = manager.payload()
+    assert state["status"] == "idle" and "training run 'run 1'" in state["unloaded"]
+    assert state["model"]["path"] == model.as_posix() and state["pending"] == {image_id: len(pending)}
+    with pytest.raises(DatasetError, match="training run 'run 1'"):
+        manager.predict_image(image_id)
+    with pytest.raises(DatasetError, match="training run 'run 1'"):
+        manager.run()
+    assert manager.accept(image_id, [pending[0]["id"]])["accepted"] == 1  # pending predictions need no model
+    assert manager.unload("run 2") is False
+    manager.load(str(model))
+    assert manager.payload()["unloaded"] is None and manager.status == "ready"
+
+
+def test_unload_cancels_a_batch_run(tmp_path):
+    dataset, _, _, model = make_predictor(tmp_path)
+    Image.new("RGB", (100, 80), "white").save(tmp_path / "train" / "second.jpg")
+    (tmp_path / "train" / "second.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    dataset = Dataset(dataset.yaml_path, "detection")
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingBackend(FakeBackend):
+        def predict(self, image_path):
+            started.set()
+            release.wait(2)
+            return super().predict(image_path)
+
+    manager = PredictorManager(dataset, backend_factory=BlockingBackend)
+    manager.load(str(model))
+    manager.run()
+    assert started.wait(1)
+    threading.Timer(0.05, release.set).start()
+    assert manager.unload("run") is True  # waits for the image in flight
+    assert manager.job["state"] == "cancelled" and manager.job["completed"] == 1 and manager.job["failed"] == 0

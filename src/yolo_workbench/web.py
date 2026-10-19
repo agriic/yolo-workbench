@@ -5,7 +5,7 @@ import json
 import math
 from pathlib import Path
 from urllib.parse import quote
-from typing import Literal
+from typing import Callable, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -21,7 +21,7 @@ from .imaging import upright_rgb
 from .jobs import JobManager
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
-from .predictor import PredictorManager
+from .predictor import PredictorManager, free_gpu_memory
 from .sam import SamManager
 from .session import DatasetSession
 from .training import TrainingManager, ultralytics_defaults
@@ -822,6 +822,20 @@ def _training_routes(app: FastAPI, training: TrainingManager) -> None:
         return training.reorder(payload.order)
 
 
+def _unload_before_training(training: TrainingManager, sam: SamManager, current_session: Callable[[], DatasetSession | None]) -> None:
+    """A run about to start gets the GPU: SAM and the open dataset's prediction model are unloaded first."""
+
+    def unload(run: str) -> None:
+        session = current_session()
+        freed = sam.unload(run)
+        if session is not None:
+            freed = session.unload_models(run) or freed
+        if freed:
+            free_gpu_memory()
+
+    training.before_launch = unload
+
+
 def _mount_static(app: FastAPI) -> None:
     static = Path(__file__).parent / "static"
     app.mount("/", StaticFiles(directory=static, html=True), name="static")
@@ -850,6 +864,7 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     sam = sam or SamManager()
     _sam_routes(app, sam)
     session = DatasetSession.open(dataset, predictor)
+    _unload_before_training(training, sam, lambda: session)
     app.state.dataset = dataset
     app.state.session = session
     app.state.predictor = session.predictor
@@ -868,6 +883,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     _training_routes(app, workspace.training)
     sam = sam or SamManager()
     _sam_routes(app, sam)
+    _unload_before_training(workspace.training, sam, lambda: workspace.active)
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
 

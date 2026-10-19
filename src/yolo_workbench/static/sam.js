@@ -52,6 +52,7 @@ function applySamState(data) {
   s.model = data.model;
   s.message = data.message;
   s.error = data.error;
+  s.unloaded = data.unloaded ?? null;  // a training run took the GPU: not loaded again by itself
   const button = $("smart-annotate");
   button.disabled = s.status === "unavailable";
   button.title = {
@@ -59,7 +60,7 @@ function applySamState(data) {
     loading: data.message || "Loading SAM…",
     error: data.error || "SAM failed to load — click to retry",
     ready: `Smart annotation with ${data.model}${data.device ? ` on ${data.device}` : ""} (S)`,
-  }[s.status] || "Smart annotation: click objects, SAM outlines them (S)";
+  }[s.status] || s.unloaded || "Smart annotation: click objects, SAM outlines them (S)";
   button.classList.toggle("loading", s.status === "loading");
   clearTimeout(s.poll);
   if (s.status === "loading") s.poll = setTimeout(refreshSam, 1000);
@@ -99,7 +100,7 @@ export async function toggleSam(force = null) {
 export function samImageOpened() {
   clearPrompts();
   if (!used() || state.meta.category === "classification" || sam().status === "unavailable") return;
-  if (sam().status === "ready") encodeCurrent(); else startModel();
+  if (sam().status === "ready") encodeCurrent(); else if (!sam().unloaded) startModel();
 }
 
 export function samEditorClosed() {
@@ -117,11 +118,24 @@ async function encodeCurrent() {
     await api(`/images/${id}/sam/encode`, { method: "POST" });
     if (s.encoding === id) s.encoded = id;
   } catch (error) {
-    if (state.detail?.id === id) deps.toast(error.message, "error");
+    if (!(await modelLost(error)) && state.detail?.id === id) deps.toast(error.message, "error");
   } finally {
     if (s.encoding === id) s.encoding = null;
     deps.updateStatus();
   }
+}
+
+/** After a failed request: true when the server no longer has the model (a training run unloaded it).
+ * Smart annotation then turns off, so turning it on loads the model again. */
+async function modelLost(error) {
+  await refreshSam();
+  const s = sam();
+  if (s.status === "ready" || s.status === "loading") return false;
+  if (s.active) {
+    await toggleSam(false);
+    deps.toast(s.unloaded || error.message, "error");
+  }
+  return true;
 }
 
 export function clearPrompts() {
@@ -173,7 +187,7 @@ async function segment() {
     s.result = result;
     s.encoded = id;
   } catch (error) {
-    if (request === s.request) deps.toast(error.message, "error");
+    if (request === s.request && !(await modelLost(error))) deps.toast(error.message, "error");
   } finally {
     if (request === s.request) { s.busy = false; deps.render(); }
   }

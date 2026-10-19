@@ -120,11 +120,13 @@ class SamManager:
         self.model: str | None = None
         self.device: str | None = None
         self.backend = None
+        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU)
+        self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
         self._features: OrderedDict[tuple, tuple] = OrderedDict()  # (path, mtime_ns, size) -> (features, (h, w))
 
     def payload(self) -> dict:
         with self._lock:
-            return {"status": self.status, "message": self.message, "error": self.error, "model": self.model, "device": self.device}
+            return {"status": self.status, "message": self.message, "error": self.error, "model": self.model, "device": self.device, "unloaded": self.unloaded}
 
     def candidates(self) -> list[str]:
         """Large when a GPU can run it at interactive speed, base as the fallback."""
@@ -139,14 +141,17 @@ class SamManager:
             if self.status in ("idle", "error"):
                 self.status = "loading"
                 self.error = None
-                self._thread = threading.Thread(target=self._load, name="sam-load", daemon=True)
+                self.unloaded = None
+                self._thread = threading.Thread(target=self._load, args=(self._generation,), name="sam-load", daemon=True)
                 self._thread.start()
         return self.payload()
 
-    def _load(self) -> None:
+    def _load(self, generation: int) -> None:
         errors = []
         for name in self.candidates():
             with self._lock:
+                if generation != self._generation:
+                    return
                 self.message = f"Loading {name} (downloaded on first use)…"
             try:
                 backend = self._factory(name)
@@ -154,6 +159,8 @@ class SamManager:
                 errors.append(f"{name}: {exc}")
                 continue
             with self._lock:
+                if generation != self._generation:
+                    return  # unloaded meanwhile: the backend is dropped with this thread
                 self.backend = backend
                 self.model = name
                 self.device = getattr(backend, "device", None)
@@ -161,9 +168,27 @@ class SamManager:
                 self.message = None
             return
         with self._lock:
+            if generation != self._generation:
+                return
             self.status = "error"
             self.message = None
             self.error = "Failed to load SAM — " + "; ".join(errors)
+
+    def unload(self, run: str) -> bool:
+        """Drop the model (and the encoded images) so a training run gets the GPU. False when nothing was loaded."""
+        with self._lock:
+            if self.status not in ("ready", "loading"):
+                return False
+            self._generation += 1
+            self.backend = None
+            self.model = None
+            self.device = None
+            self.status = "idle"
+            self.message = None
+            self.unloaded = f"Smart annotation was unloaded to free memory for training run '{run}'; turn it on again to load it"
+        with self._run_lock:  # an in-flight encode or decode finishes first
+            self._features.clear()
+        return True
 
     def _require_backend(self):
         with self._lock:
@@ -172,7 +197,7 @@ class SamManager:
                     "loading": "Smart annotation is still loading",
                     "error": self.error or "Smart annotation failed to load",
                     "unavailable": "Smart annotation needs ultralytics",
-                }.get(self.status, "Start smart annotation first"))
+                }.get(self.status, self.unloaded or "Start smart annotation first"))
             return self.backend
 
     def _encoded(self, path: Path) -> tuple:

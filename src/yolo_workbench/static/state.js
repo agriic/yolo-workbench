@@ -27,10 +27,10 @@ export const state = {
   canRedo: false,
   pred: {
     status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
-    modelPath: null, job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
+    modelPath: null, unloaded: null, job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
   },
   sam: {
-    status: "unavailable", model: null, message: null, error: null, poll: null,
+    status: "unavailable", model: null, message: null, error: null, unloaded: null, poll: null,
     active: false,       // smart annotation mode is on
     points: [],          // {x, y, positive} prompts, normalized
     box: null,           // [x1, y1, x2, y2] box prompt, normalized

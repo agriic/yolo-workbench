@@ -1,6 +1,7 @@
 import asyncio
 import io
 import math
+import threading
 import time
 
 import pytest
@@ -13,6 +14,7 @@ from yolo_workbench.labelqa import LabelQAManager, compute_findings
 from yolo_workbench.media_cache import MediaCache
 from yolo_workbench.models import Annotation
 from yolo_workbench.predictor import PredictorManager
+from yolo_workbench.session import DatasetSession
 from yolo_workbench.web import create_app
 
 LABELS = (
@@ -307,3 +309,29 @@ def test_segmentation_loose_outline_takes_the_limited_polygon(tmp_path):
     assert found["kind"] == "box_mismatch"
     qa.apply(image_id, found["key"])
     assert len(dataset.images[image_id].annotations[0].points) <= 12
+
+
+def test_unloading_for_training_stops_the_analysis(tmp_path):
+    dataset, predictor, _ = make_qa(tmp_path)
+    for name in ("b", "c"):
+        Image.new("RGB", (200, 160), "white").save(tmp_path / "train" / f"{name}.jpg")
+    dataset = Dataset(tmp_path / "data.yaml", "detection")
+    started, release = threading.Event(), threading.Event()
+
+    class SlowBackend(FakeBackend):
+        def predict(self, image_path, conf=None):
+            started.set()
+            release.wait(2)
+            return super().predict(image_path, conf)
+
+    predictor = PredictorManager(dataset, backend_factory=SlowBackend)
+    predictor.load(str(tmp_path / "model.pt"))
+    session = DatasetSession.open(dataset, predictor)
+    session.labelqa.start()
+    assert started.wait(1)
+    threading.Timer(0.05, release.set).start()
+    assert session.unload_models("run") is True
+    assert session.labelqa.job["state"] == "cancelled" and session.labelqa.job["done"] == 1
+    assert predictor.external_busy is None and predictor.backend is None
+    with pytest.raises(DatasetError, match="training run 'run'"):
+        session.labelqa.start()

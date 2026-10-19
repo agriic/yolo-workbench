@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 
 import numpy as np
 import pytest
@@ -258,3 +259,36 @@ def test_segment_applies_the_point_limit(tmp_path):
     assert len(limited["points"]) // 2 <= 5 and limited["outlines"] == [limited["points"]]
     box = manager.segment(image, "detection", prompt, None, max_points=5)["points"]
     assert len(box) == 4  # boxes ignore the limit
+
+
+def test_unload_drops_the_model_until_started_again(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    path = next(iter(dataset.images.values())).path
+    manager = ready_manager()
+    manager.encode(path)
+    assert manager.unload("run 1") is True
+    state = manager.payload()
+    assert state["status"] == "idle" and state["model"] is None and "training run 'run 1'" in state["unloaded"]
+    assert manager.backend is None and not manager._features
+    with pytest.raises(DatasetError, match="training run 'run 1'"):
+        manager.segment(path, "detection", [{"x": 0.5, "y": 0.5, "positive": True}], None)
+    assert manager.unload("run 2") is False  # nothing loaded
+    manager.start()
+    manager._thread.join(5)
+    assert manager.payload()["status"] == "ready" and manager.payload()["unloaded"] is None
+
+
+def test_unload_while_loading_discards_the_model(tmp_path):
+    release = threading.Event()
+
+    class SlowSam(FakeSam):
+        def __init__(self, name):
+            release.wait(5)
+            super().__init__(name)
+
+    manager = SamManager(backend_factory=SlowSam, gpu=True)
+    manager.start()
+    assert manager.unload("run") is True
+    release.set()
+    manager._thread.join(5)
+    assert manager.payload()["status"] == "idle" and manager.backend is None

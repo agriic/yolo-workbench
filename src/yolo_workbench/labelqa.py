@@ -131,7 +131,7 @@ class LabelQAManager:
         predictor = self.predictor
         with predictor._lock:
             if predictor.status != "ready" or predictor.backend is None:
-                raise DatasetError("Load a model first: pick a trained run or a .pt file above")
+                raise DatasetError(predictor.unloaded or "Load a model first: pick a trained run or a .pt file above")
             if predictor.job["state"] == "running":
                 raise DatasetError("A prediction run is in progress; wait for it to finish")
             backend, model_path, mapping = predictor.backend, predictor.model_path, dict(predictor.mapping)
@@ -176,6 +176,16 @@ class LabelQAManager:
                 raise DatasetError("Label QA is not running")
             self._cancel.set()
         return self.payload()
+
+    def stop(self, timeout: float) -> None:
+        """Cancel a running analysis and wait (up to `timeout` seconds) for its current image."""
+        with self._lock:
+            if self.job["state"] != "running":
+                return
+            self._cancel.set()
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
 
     def clear(self) -> dict:
         with self._lock:

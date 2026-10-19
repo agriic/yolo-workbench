@@ -17,6 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from .fsutil import occupied, replace
 from .imaging import upright_size
 from .models import Annotation, Category, ImageRecord
+from .overlap import find_overlaps
 from .review import STATUSES as REVIEW_STATUSES, ReviewStore
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -653,10 +654,23 @@ class Dataset:
             except (ValueError, IndexError) as exc:
                 # fixing removes the line; the raw label editor can repair it instead
                 record.issues.append(self._issue("malformed_label", "error", f"Line {line_number}: {exc}", record, fixable=True, line=line_number))
+        record.issues.extend(self._overlap_issues(record))
         record.class_ids = {annotation.class_id for annotation in record.annotations}
         self._mtimes[record.label_path] = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
         self._revisions[record.label_path] = self._revisions.get(record.label_path, 0) + 1
         self._refresh_record_indexes(record)
+
+    def _overlap_issues(self, record: ImageRecord) -> list[dict]:
+        """Objects covering nearly the same place as an earlier one; a same-class copy is fixed by deleting the later one."""
+        issues = []
+        shape = "box" if self.category == "detection" else "polygon"
+        for first, second, iou in find_overlaps(self.category, record.annotations):
+            earlier, later = record.annotations[first], record.annotations[second]
+            line = earlier.id.rsplit(":", 1)[1]
+            same = earlier.class_id == later.class_id
+            message = f"Same place as the {shape} on line {line}, {'same class' if same else 'another class'} (IoU {iou:.2f})"
+            issues.append(self._issue("overlap", "warning", message, record, later.id, same, other_annotation_id=earlier.id, iou=round(iou, 3), same_class=same))
+        return issues
 
     def _zero_area(self, annotation: Annotation) -> bool:
         if self.category == "detection":
@@ -1630,7 +1644,7 @@ class Dataset:
             annotation = next(a for a in annotations if a.id == annotation.id)
             if issue["kind"] == "out_of_range":
                 annotation.points = [min(1, max(0, value)) for value in annotation.points]
-            elif issue["kind"] in {"zero_area", "duplicate"}:
+            elif issue["kind"] in {"zero_area", "duplicate", "overlap"}:
                 annotations.remove(annotation)
             return self.replace_annotations(record.id, [a.as_dict() for a in annotations])
 
@@ -1669,13 +1683,17 @@ class Dataset:
             return []
         annotations = [Annotation(a.id, a.class_id, list(a.points)) for a in record.annotations]
         removed: set[str] = set()
-        for issue in issues:
+        position = {a.id: index for index, a in enumerate(annotations)}
+        for issue in sorted(issues, key=lambda issue: position.get(issue["annotation_id"], -1)):
             annotation = next((a for a in annotations if a.id == issue["annotation_id"]), None)
             if not annotation:
                 continue
             if issue["kind"] == "out_of_range":
                 annotation.points = [min(1, max(0, value)) for value in annotation.points]
             elif issue["kind"] in {"zero_area", "duplicate"}:
+                removed.add(annotation.id)
+            elif issue["kind"] == "overlap" and issue["other_annotation_id"] not in removed:
+                # in a chain A~B~C, deleting B already settles C's overlap with it
                 removed.add(annotation.id)
         return [a.as_dict() for a in annotations if a.id not in removed]
 

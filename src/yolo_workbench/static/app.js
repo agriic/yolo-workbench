@@ -176,6 +176,8 @@ function showTab(tab, runId = null) {
   document.body.classList.toggle("on-training", tab === "training");
   if (leaving === "training" && tab !== "training") {
     hideTraining();
+    refreshPredictor();  // a run that started unloaded the models
+    refreshSam();
     const url = new URL(location.href);
     url.searchParams.delete("tab");
     url.searchParams.delete("run");
@@ -1083,6 +1085,7 @@ export async function loadIssues() {
 const FIX_ACTIONS = {
   malformed_label: ["Remove line", "Remove all", "Remove the malformed line from the label file", count => `Remove ${count} malformed line${count === 1 ? "" : "s"} from the label files?`],
   orphan_label: ["Trash", "Trash all", "Move the label file to the dataset trash", count => `Move ${count} orphan label file${count === 1 ? "" : "s"} to the dataset trash?`],
+  overlap: ["Delete later", "Delete later ones", "Delete the later of two same-class objects in the same place (other classes need a manual choice)", count => `Delete the later object of ${count} same-class overlap${count === 1 ? "" : "s"}, keeping the earlier one?`],
 };
 
 function renderIssues() {

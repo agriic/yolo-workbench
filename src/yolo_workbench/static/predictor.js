@@ -56,6 +56,7 @@ export function applyPredictorState(data) {
   pred.job = data.job;
   pred.maxPoints = data.max_points ?? null;
   pred.modelPath = data.model.path;
+  pred.unloaded = data.unloaded ?? null;  // a training run took the GPU
   $("pred-points-wrap").hidden = state.meta.category !== "segmentation";
   if (document.activeElement !== $("pred-max-points")) $("pred-max-points").value = pred.maxPoints ?? "";
   const ready = pred.status === "ready";
@@ -76,7 +77,7 @@ export function applyPredictorState(data) {
   const unmapped = Object.values(pred.mapping).filter(value => value === null).length;
   $("predictor-status").textContent = {
     unavailable: "Assisted labeling needs the [predict] extra (ultralytics)",
-    idle: "",
+    idle: pred.unloaded || "",
     loading: "Loading model…",
     error: pred.error || "Failed to load model",
     ready: running
@@ -157,7 +158,10 @@ export async function runPredict() {
       method: "POST",
       body: JSON.stringify({ split: $("image-split").value, only_unlabeled: $("predict-unlabeled").checked }),
     }));
-  } catch (error) { deps.toast(error.message, "error"); }
+  } catch (error) {
+    deps.toast(error.message, "error");
+    refreshPredictor();  // the model may have been unloaded for a training run
+  }
 }
 
 export async function cancelPredict() {
@@ -208,6 +212,7 @@ export async function predictImage() {
     deps.loadImages();
   } catch (error) {
     deps.toast(error.message, "error");
+    refreshPredictor();  // the model may have been unloaded for a training run
   } finally {
     button.disabled = state.pred.job.state === "running";
   }

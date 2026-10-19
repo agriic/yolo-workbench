@@ -257,6 +257,8 @@ class TrainingManager:
         self.exporter = exporter or launch_export
         self._exports: dict[Path, str] = {}  # run dir -> its latest ONNX export job
         self.weights_dir = weights_dir or Path.home() / ".cache" / "yolo-workbench" / "weights"
+        # called with a run's name right before it launches: the app unloads SAM and prediction models (one GPU)
+        self.before_launch: Callable[[str], None] | None = None
         self._lock = threading.RLock()
         self._handle = None  # process handle of a run this server launched (None after a restart)
         self._locked: dict[Path, dict] = {}  # dataset yaml -> lock info; replaced whole, read without the lock
@@ -457,7 +459,8 @@ class TrainingManager:
                 self._queue["queue"].pop(0)
                 self._queue["active"] = entry
                 self._refresh_lock()
-                self._handle = self.launcher(workdir / "spec.json", run_dir, self.weights_dir)
+            self._free_models(meta.get("name", run_dir.name))
+            self._handle = self.launcher(workdir / "spec.json", run_dir, self.weights_dir)
             _write_json(workdir / "process.json", {"pid": self._handle.pid, "create_time": _process_create_time(self._handle.pid), "started": time.time()})
             self._save_queue()
         except Exception as exc:
@@ -469,6 +472,14 @@ class TrainingManager:
             self._write_state(run_dir, status="failed", phase="failed", error=f"Could not start: {exc}", finished=time.time())
             self._save_queue()
             self._refresh_lock()
+
+    def _free_models(self, run: str) -> None:
+        if self.before_launch is None:
+            return
+        try:
+            self.before_launch(run)
+        except Exception as exc:  # the run starts anyway; it may just have less GPU memory
+            print(f"training: could not unload models before '{run}': {exc}", file=sys.stderr)
 
     # ---------- dataset → training data ----------
 
