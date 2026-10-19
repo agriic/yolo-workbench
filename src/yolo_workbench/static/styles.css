@@ -490,6 +490,7 @@ body.classification .toolbar-popover { grid-template-columns: minmax(0, 1fr); wi
 .issue .message { font-size: 12px; color: var(--text-2); margin-top: 2px; }
 .issue-actions { display: flex; gap: 6px; justify-content: end; }
 .issue-actions button { font-size: 12px; padding: 5px 10px; }
+.issue-actions .issue-open { flex: 0 0 64px; justify-content: center; }
 
 /* ---------- statistics ---------- */
 .stats-loading { padding: 64px 20px; text-align: center; color: var(--text-3); }
@@ -640,7 +641,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   opacity: 0;
   flex: none;
 }
-.annotation-row:hover .row-delete, .annotation-row.selected .row-delete { opacity: 1; }
+#editor .annotation-row:hover .row-delete, #editor .annotation-row.selected .row-delete, #editor .row-delete:focus-visible { opacity: 1; }
 #editor .row-delete:hover { background: #3a2723; }
 .empty-note { font-size: 12px; color: var(--ed-text-2); line-height: 1.5; margin: 4px 0; }
 
@@ -853,7 +854,7 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   cursor: pointer;
   opacity: 0;
 }
-.pred-row:hover .row-accept { opacity: 1; }
+#editor .pred-row:hover .row-accept, #editor .row-accept:focus-visible { opacity: 1; }
 .pred-row .row-accept:disabled { color: var(--ed-text-2); cursor: not-allowed; }
 #editor .row-accept:hover:not(:disabled) { background: var(--accent-weak, #143028); }
 

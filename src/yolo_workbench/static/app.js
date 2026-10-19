@@ -488,7 +488,13 @@ function bind() {
     const row = e.target.closest("[data-annotation]");
     if (!row) return;
     if (e.target.closest(".row-delete")) return removeAnnotation(row.dataset.annotation);
-    if (e.target.closest("select")) return;
+    if (e.target.closest("select")) {
+      // select the row too, without re-rendering the list (that would close the open dropdown)
+      if (state.selected === row.dataset.annotation) return;
+      state.selected = row.dataset.annotation;
+      for (const other of $("annotation-list").children) other.classList.toggle("selected", other === row);
+      return render();
+    }
     state.selected = row.dataset.annotation;
     renderList(); render();
   });
@@ -1103,6 +1109,8 @@ function renderIssues() {
       ${kind !== "orphan_label" ? `<button class="show-kind" data-show-kind="${esc(kind)}" title="Show these images in the Annotation tab">Show images</button>` : ""}
     </span>`).join("");
   const visible = state.issueFilter ? items.filter(issue => issue.kind === state.issueFilter) : items;
+  // Open comes last and keeps its slot on every row: fixing an issue removes its row, so the rows below move up
+  // under the pointer, and clicking Open again in the same spot must not land on the next row's fix button.
   $("issues").innerHTML = visible.map(issue => `
     <div class="issue">
       <span class="severity-dot ${esc(issue.severity)}" title="${esc(issue.severity)}"></span>
@@ -1110,9 +1118,9 @@ function renderIssues() {
       <div><strong title="${esc(issue.path || issue.image_name)}">${esc(issue.path || issue.image_name)}</strong><div class="message">${esc(issue.message)}</div></div>
       <span class="split-badge">${esc(issue.split || "—")}</span>
       <span class="issue-actions">
-        ${issue.image_id ? `<button data-issue-open="${issue.image_id}" data-object="${esc(issue.annotation_id || "")}">Open</button>` : ""}
         ${issue.kind === "malformed_label" ? `<button data-edit-label="${issue.image_id}" title="Repair the line in the raw label file">Edit file</button>` : ""}
         ${issue.fixable ? `<button data-fix="${issue.id}" title="${esc(FIX_ACTIONS[issue.kind]?.[2] ?? "Fix automatically")} (Ctrl+Z undoes)">${esc(FIX_ACTIONS[issue.kind]?.[0] ?? "Fix")}</button>` : ""}
+        ${issue.image_id ? `<button class="issue-open" data-issue-open="${issue.image_id}" data-object="${esc(issue.annotation_id || "")}">Open</button>` : `<span class="issue-open" aria-hidden="true"></span>`}
       </span>
     </div>`).join("") || `<div class="empty">No issues found. The dataset looks clean.</div>`;
 }
