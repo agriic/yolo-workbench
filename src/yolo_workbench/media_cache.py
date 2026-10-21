@@ -13,9 +13,19 @@ from .fsutil import replace
 PALETTE_VERSION = 2
 
 
-def default_cache_dir() -> Path:
+def cache_root() -> Path:
+    """~/.cache/yolo-workbench, or under XDG_CACHE_HOME (the server sets it from its cache_dir)."""
     base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return base / "yolo-workbench" / "media"
+    return base / "yolo-workbench"
+
+
+def default_cache_dir() -> Path:
+    return cache_root() / "media"
+
+
+def default_weights_dir() -> Path:
+    """Downloaded pretrained weights (training) and SAM 2.1 weights."""
+    return cache_root() / "weights"
 
 
 class MediaCache:

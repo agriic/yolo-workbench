@@ -1,5 +1,7 @@
 export const state = {
   mode: "single",      // "single" dataset or "projects" folder
+  server: false,       // started by yolo-workbench-server
+  features: { path_import: true, model_upload: true },  // from /api/v1/app
   project: null,       // project slug in projects mode
   meta: null,
   imageSelection: new Map(),  // image id -> image item (Annotation grid bulk actions)

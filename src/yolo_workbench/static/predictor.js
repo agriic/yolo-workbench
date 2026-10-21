@@ -84,6 +84,7 @@ export function applyPredictorState(data) {
       ? `Predicting ${pred.job.done}/${pred.job.total} · ${pred.job.completed || 0} completed · ${pred.job.failed || 0} failed${pred.job.cancel_requested ? " · cancelling…" : ""}`
       : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""}`,
   }[pred.status] || "";
+  if (data.gpu_warning) $("predictor-status").textContent += `${$("predictor-status").textContent ? " · " : ""}${data.gpu_warning}`;
   $("predictor-status").title = $("predictor-status").textContent;
   renderModelChip();
   renderMapping();
@@ -149,6 +150,24 @@ export async function loadModel() {
     $("predictor-status").title = error.message;
     renderModelChip();
     deps.toast(error.message, "error");
+  }
+}
+
+// A model file from this computer: streamed into the dataset's models/ folder on the server, then loaded.
+export async function uploadModel(file) {
+  if (!file) return;
+  $("upload-model").disabled = true;
+  $("predictor-status").textContent = `Uploading ${file.name}…`;
+  try {
+    const result = await api(`/models/upload?name=${encodeURIComponent(file.name)}`, { method: "PUT", body: file, headers: { "Content-Type": "application/octet-stream" } });
+    $("model-path").value = result.path;
+    deps.toast(`Uploaded ${result.name}`);
+    await loadModel();
+  } catch (error) {
+    $("predictor-status").textContent = error.message;
+    deps.toast(error.message, "error");
+  } finally {
+    $("upload-model").disabled = false;
   }
 }
 

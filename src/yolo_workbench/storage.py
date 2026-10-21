@@ -3,17 +3,24 @@
 Deleting images (or a classification class) moves files into trash/<session>/, and the first
 write to each label file in a session copies it into backups/<session>/. Both mirror the
 dataset-relative paths, so a session's trash can be put back where it came from. Undo covers
-the current session; older sessions are restored or deleted for good from here.
+the current session (and older trash it still points into); older sessions are restored or
+deleted for good from here, or by the server's retention (`purge_expired`).
+
+A session starts when the dataset is opened; a server also starts a new one daily (Dataset.rotate_session).
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import time
 from pathlib import Path
 
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError, IMAGE_EXTENSIONS
+from .runtime import RUNTIME
+
+log = logging.getLogger(__name__)
 
 KINDS = ("trash", "backups")
 SESSION_PATTERN = re.compile(r"^\d{8}-\d{6}$")
@@ -44,7 +51,8 @@ def _started(session: str) -> str | None:
 
 def summary(dataset: Dataset) -> dict:
     """Every session's trash and backups with file counts and sizes, newest first."""
-    result: dict = {"current_session": dataset.session_id, "total_bytes": 0}
+    referenced = dataset.referenced_trash_sessions()
+    result: dict = {"current_session": dataset.session_id, "total_bytes": 0, "retention_days": {"trash": RUNTIME.trash_retention_days, "backups": RUNTIME.backup_retention_days}}
     for kind in KINDS:
         base = dataset.root / WORKBENCH_DIR / kind
         sessions = []
@@ -59,6 +67,7 @@ def summary(dataset: Dataset) -> dict:
                     "images": sum(1 for path in files if path.suffix.lower() in IMAGE_EXTENSIONS),
                     "bytes": size,
                     "current": directory.name == dataset.session_id,
+                    "in_undo": kind == "trash" and directory.name in referenced,
                 })
                 result["total_bytes"] += size
         result[kind] = sessions
@@ -88,12 +97,47 @@ def restore_trash(dataset: Dataset, session: str) -> dict:
 
 
 def purge(dataset: Dataset, kind: str, session: str) -> dict:
-    """Delete a session's trash or backups for good. The current session's stay: its undo history refers to them."""
+    """Delete a session's trash or backups for good. The current session's stay, and so does trash the undo
+    history can still put back."""
     directory = _session_dir(dataset, kind, session)
     if session == dataset.session_id:
-        raise DatasetError(f"The current session's {kind} backs its undo history; it can be deleted after a restart")
+        raise DatasetError(f"The current session's {kind} backs its undo history; it can be deleted once a new session starts (after a restart, or daily on a server)")
+    if kind == "trash" and session in dataset.referenced_trash_sessions():
+        raise DatasetError("Undo can still put files back from this session's trash; it can be deleted once those edits leave the undo history")
     shutil.rmtree(directory)
     return summary(dataset)
+
+
+def purge_expired(root: Path, kind: str, days: float, protected: set[str] = frozenset()) -> list[str]:
+    """Delete the `kind` sessions of the dataset at `root` whose newest file is older than `days` (0: keep all),
+    except the `protected` ones (the open dataset's current session and trash its undo history points into)."""
+    base = root / WORKBENCH_DIR / kind
+    if days <= 0 or not base.is_dir():
+        return []
+    cutoff = time.time() - days * 86400
+    purged = []
+    for directory in base.iterdir():
+        if not directory.is_dir() or not SESSION_PATTERN.match(directory.name) or directory.name in protected:
+            continue
+        try:
+            newest = max((path.stat().st_mtime for path in directory.rglob("*")), default=directory.stat().st_mtime)
+        except OSError:
+            continue
+        if newest < cutoff:
+            shutil.rmtree(directory, ignore_errors=True)
+            purged.append(directory.name)
+            log.info("storage: deleted %s session %s of %s (older than %g days)", kind, directory.name, root.name, days)
+    return purged
+
+
+def apply_retention(root: Path, dataset: Dataset | None = None) -> dict:
+    """The server's retention for one dataset (open or not): expired trash and backup sessions go."""
+    current: set[str] = {dataset.session_id} if dataset is not None else set()
+    in_undo = dataset.referenced_trash_sessions() if dataset is not None else set()
+    return {
+        "trash": purge_expired(root, "trash", RUNTIME.trash_retention_days, current | in_undo),
+        "backups": purge_expired(root, "backups", RUNTIME.backup_retention_days, current),
+    }
 
 
 def _prune_empty(directory: Path) -> None:

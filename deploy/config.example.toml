@@ -1,0 +1,90 @@
+# YOLO Workbench server configuration (yolo-workbench-server run --config /etc/yolo-workbench/config.toml)
+#
+# Every setting is shown with its default. Environment variables override this file: WORKBENCH_ plus the
+# setting's name as in docs/server.md (e.g. WORKBENCH_PORT, WORKBENCH_TRAINING_PAUSE_DEADLINE_S); CLI options
+# (--projects, --host, --port) override both. Relative paths are relative to this file.
+# Unknown keys are errors, so a typo cannot silently keep a default.
+
+[server]
+# The projects folder: every project (dataset, models, runs) plus the shared training queue lives here.
+projects_root = "/srv/yolo-workbench/projects"
+# Create the folder when it is missing. Off by default: a disk that is not mounted must stop the service,
+# not turn into an empty workspace on the system disk.
+create_projects_root = false
+# Address and port to listen on. 0.0.0.0 = every network interface.
+host = "0.0.0.0"
+port = 8765
+# The names and addresses people type in the browser to reach the server (required with host 0.0.0.0).
+# localhost / 127.0.0.1 always work. ["*"] accepts any name (turns the Host check off).
+allowed_hosts = ["gpu-server", "gpu-server.example.local", "10.0.0.20"]
+# How long a stop waits for jobs (imports, exports, predictions) and open projects to finish (seconds).
+shutdown_deadline_s = 60
+
+[storage]
+# Rebuildable caches: thumbnails, downloaded weights (YOLO, RF-DETR, SAM), torch/Ultralytics/matplotlib
+# settings. Default: ~/.cache of the service account.
+cache_dir = "/var/cache/yolo-workbench"
+# Thumbnail/crop cache size (MB).
+media_cache_mb = 512
+# Uploads, imports, new training runs and ONNX exports are refused below this much free space (GB);
+# every page shows a warning.
+min_free_disk_gb = 5.0
+# Deleted images (dataset trash) and the original of every edited label file (backups) are kept per
+# session. Earlier sessions are deleted after this many days (0 = keep forever). Files the undo
+# history can still put back are kept regardless.
+trash_retention_days = 30
+backup_retention_days = 30
+# Deleted projects (<projects>/.trash/) are deleted for good after this many days (0 = keep).
+project_trash_retention_days = 30
+# A new backup/trash session starts this often (hours) while a project stays open, so older ones can expire.
+session_rotate_hours = 24.0
+# Browser uploads that were never imported are removed after this many hours.
+staging_max_age_hours = 24.0
+# How often abandoned uploads are cleaned and retention runs (minutes).
+maintenance_interval_min = 60.0
+
+[limits]
+# One uploaded image/label file, one upload (all files of one import), and an uploaded model file.
+max_upload_file_mb = 1024
+max_upload_files = 100000
+max_upload_total_mb = 102400
+max_model_upload_mb = 4096
+# Undo history per open project: the oldest edits drop off past either limit.
+undo_max_transactions = 200
+undo_max_mb = 256
+
+[training]
+# On stop/restart the active run pauses at the end of its current epoch; this is how long the stop waits
+# for that (seconds). Past it the run is killed and resumes from the previous epoch's checkpoint.
+# systemd's TimeoutStopSec must be longer than this plus shutdown_deadline_s.
+pause_deadline_s = 600
+# A run paused by a service stop resumes by itself at the next start.
+resume_after_service_stop = true
+# Hold the queue (start nothing new) when a run dies unexpectedly, until someone looks at it.
+hold_queue_after_crash = false
+
+[models]
+# Unload SAM and prediction models after this many minutes without use (frees GPU memory; 0 = never).
+idle_unload_minutes = 30.0
+# Loading SAM or a prediction model while a run trains on the GPU: "allow" (with a warning) or "refuse".
+gpu_models_during_training = "allow"
+# Prediction models kept loaded across open projects; loading one more unloads the least recently used.
+max_loaded_models = 2
+
+[projects]
+# Projects open at the same time (each keeps its index and undo history in memory).
+max_open_projects = 4
+# An open project without requests for this many minutes closes when nothing runs in it (0 = never).
+# Closing ends its undo history.
+project_idle_close_min = 60.0
+
+[embeddings]
+# The Embeddings tab (FiftyOne + MongoDB). Everything else works without it.
+enabled = true
+# MongoDB for FiftyOne, e.g. "mongodb://127.0.0.1:27017". Empty: FiftyOne's own configuration.
+# mongodb_uri = "mongodb://127.0.0.1:27017"
+
+[logging]
+level = "info"      # debug, info, warning, error
+format = "text"     # text or json (one JSON object per line)
+access_log = false  # one line per HTTP request; the UI polls every few seconds

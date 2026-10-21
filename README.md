@@ -20,7 +20,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 (Restart the shell..)
 
-Everything (model-assisted labeling, embeddings, training, tests) is a core dependency, so one command installs it all:
+Everything (model-assisted labeling, embeddings, training) is a core dependency, and `uv sync` also installs the test tools (the `dev` group), so one command installs it all:
 
 ```bash
 uv sync
@@ -88,7 +88,7 @@ Edits, class changes, moves and deletes are undoable with Ctrl+Z / Ctrl+Shift+Z.
 
 ### Projects mode
 
-The projects page lists every project in the folder. A project is a YOLO dataset the tool creates: `project.json`, `data.yaml`, `images/<split>/` and `labels/<split>/` (or `<split>/<class>/` for classification), plus `models/` and `runs/`. From the page you can create, rename and delete projects (deleted ones go to `<projects>/.trash/` and can be restored), and adopt existing dataset folders copied into the projects folder. One project is open at a time.
+The projects page lists every project in the folder. A project is a YOLO dataset the tool creates: `project.json`, `data.yaml`, `images/<split>/` and `labels/<split>/` (or `<split>/<class>/` for classification), plus `models/` and `runs/`. From the page you can create, rename and delete projects (deleted ones go to `<projects>/.trash/` and can be restored), and adopt existing dataset folders copied into the projects folder. Several projects can be open at once (in different browser tabs, or by different people on a server).
 
 ### Training
 
@@ -100,7 +100,7 @@ The Training tab trains Ultralytics YOLO models on the open dataset (detect, seg
 - **Live view:** epoch and batch progress, ETA, best epoch so far, loss and metric charts, and the per-epoch table. **Pause** (resumable), **Finish early** (runs the final evaluation), or **Kill**.
 - **Results:** final validation of `best.pt` and, when the dataset has a test split, a test-split evaluation, both per class, plus the Ultralytics plots and the log.
 - **History and comparison:** every run in the dataset's `runs/` folder, including runs made with `yolo train` or RF-DETR's own `train()` (`training_config.json` + `metrics.csv`). Rename runs, add notes, and tick runs to compare their curves, results, and the arguments that differ. **Use for labeling** loads a run's `best.pt` as the Annotation tab's model; **Download best.pt** saves it as `<dataset>-<run>-<imgsz>-<model>-<YYYY.MM.DD>.pt` (the date `best.pt` was written; a fine-tune names the pretrained model it descends from; `.pth` for RF-DETR).
-- **Queue:** a run is a separate process that keeps going if the server stops (the server picks it up again on restart). One run trains at a time; the rest wait in a reorderable queue, shared by all projects in projects mode. While a run trains, its dataset is read-only.
+- **Queue:** a run is a separate process that keeps going if the desktop app stops (it picks the run up again on restart; the [server](docs/server.md) pauses it at a checkpoint instead and resumes it). One run trains at a time; the rest wait in a reorderable queue, shared by all projects in projects mode, that can be held (nothing new starts) for maintenance. While a run trains, its dataset is read-only.
 
 Runs are stored in `<project>/runs/<run>/`, or in single-dataset mode in `runs/` next to the dataset YAML. Delete a run by deleting its folder.
 
@@ -134,13 +134,18 @@ Everything else works without it; the Embeddings tab then reports that it is una
 | `<dataset>/.yolo-workbench/imports.jsonl` | import log |
 | `<dataset>/runs/` or `<project>/runs/` | training runs |
 | `~/.cache/yolo-workbench/media/` | rendered thumbnails and crops (pruned past 512 MB; honors `XDG_CACHE_HOME`) |
-| `~/.cache/yolo-workbench/weights/` | downloaded pretrained weights (training; RF-DETR's in `rfdetr/`) and SAM 2.1 weights (smart annotation; a copy in Ultralytics' weights dir is used instead when present) |
+| `~/.cache/yolo-workbench/weights/` | downloaded pretrained weights (training; RF-DETR's in `rfdetr/`) and SAM 2.1 weights (smart annotation; a copy in Ultralytics' weights dir is used instead when present); honors `XDG_CACHE_HOME` |
+| `<projects>/.workbench/owner.lock` or `<dataset>/.yolo-workbench/owner.lock` | held while a workbench uses the folder |
 
 Label and YAML files are written with LF line endings on every platform.
 
+## Running it on a server
+
+`yolo-workbench-server` runs projects mode as an unattended systemd service for a team on an internal network: configuration file, no prompts or browser, a required Host allow-list, training runs paused at a checkpoint on restart and resumed, idle models unloaded, retention for trash and backups, health endpoints, journald logging. See [docs/server.md](docs/server.md) for installation (`sudo bash deploy/install.sh`), configuration and operation.
+
 ## Security
 
-The server is meant for one user on one machine. It binds to `127.0.0.1`, rejects requests whose `Host` is not local (DNS rebinding), and requires an `X-Workbench` header on every change (cross-site forms). It has no login: binding to another address exposes your datasets to anyone who can reach it.
+The desktop app is meant for one user on one machine. It binds to `127.0.0.1`, rejects requests whose `Host` is not local (DNS rebinding), and requires an `X-Workbench` header on every change (cross-site forms). Neither it nor the server has a login yet: binding to another address exposes your datasets to anyone who can reach it, and model files (`.pt`/`.pth`) run code when loaded. Only one workbench (desktop or server) can use a folder at a time.
 
 ## Tests
 

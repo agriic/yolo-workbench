@@ -7151,15 +7151,15 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "fiftyone" },
-    { name = "httpx" },
     { name = "onnxslim" },
     { name = "pi-heif" },
     { name = "pillow" },
     { name = "protobuf" },
+    { name = "psutil" },
     { name = "pydantic" },
-    { name = "pytest" },
     { name = "pyyaml" },
     { name = "rfdetr", extra = ["augment", "onnx", "train"] },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
     { name = "torch", version = "2.13.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
     { name = "torch", version = "2.14.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'win32'" },
     { name = "torchvision", version = "0.28.0", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'win32'" },
@@ -7170,19 +7170,25 @@ dependencies = [
     { name = "uvicorn" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "httpx" },
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fiftyone", specifier = ">=0.25" },
-    { name = "httpx", specifier = ">=0.27" },
     { name = "onnxslim", specifier = ">=0.1.82" },
     { name = "pi-heif", specifier = ">=0.18" },
     { name = "pillow", specifier = ">=10" },
     { name = "protobuf", specifier = ">=4" },
+    { name = "psutil", specifier = ">=5.9" },
     { name = "pydantic", specifier = ">=2.7" },
-    { name = "pytest", specifier = ">=8" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "rfdetr", extras = ["train", "onnx", "augment"], specifier = ">=1.11.2,<1.12" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2" },
     { name = "torch", marker = "sys_platform != 'win32'", specifier = ">=2" },
     { name = "torch", marker = "sys_platform == 'win32'", specifier = ">=2", index = "https://download.pytorch.org/whl/cu130" },
     { name = "torchvision", marker = "sys_platform != 'win32'", specifier = ">=0.17" },
@@ -7191,4 +7197,10 @@ requires-dist = [
     { name = "ultralytics", specifier = ">=8" },
     { name = "umap-learn", specifier = ">=0.5" },
     { name = "uvicorn", specifier = ">=0.30" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "pytest", specifier = ">=8" },
 ]

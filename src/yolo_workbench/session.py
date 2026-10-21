@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from .dataset import Dataset
@@ -18,6 +19,7 @@ class DatasetSession:
     slug: str | None = None  # None in single-dataset mode
     project: dict = field(default_factory=dict)
     labelqa: LabelQAManager | None = None
+    last_used: float = field(default_factory=time.monotonic)  # last API request (projects mode closes idle sessions)
 
     @classmethod
     def open(cls, dataset: Dataset, predictor: PredictorManager | None = None, slug: str | None = None, project: dict | None = None) -> "DatasetSession":
@@ -32,6 +34,22 @@ class DatasetSession:
             self.labelqa.stop(UNLOAD_WAIT)
         unload = getattr(self.predictor, "unload", None)  # a test's stand-in predictor may have none
         return bool(unload and unload(run))
+
+    def touch(self) -> None:
+        self.last_used = time.monotonic()
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop this dataset's background work (prediction batch, Label QA, size probing) and drop its model.
+        Embeddings cannot be interrupted; their thread is waited for up to `timeout` seconds."""
+        if self.labelqa is not None:
+            self.labelqa.stop(timeout)
+        close = getattr(self.predictor, "close", None)
+        if close is not None:
+            close(timeout)
+        close = getattr(self.embeddings, "close", None)
+        if close is not None:
+            close(timeout)
+        self.dataset.close(timeout)
 
     def busy_reason(self) -> str | None:
         """Why this session cannot be closed right now, if anything is still running."""

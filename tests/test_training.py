@@ -385,7 +385,8 @@ def test_deleted_run_folders_disappear_and_queued_ones_are_dropped(tmp_path):
         manager.run_detail(None, queued["id"])
     launcher.handle.code = 0
     manager.tick()
-    assert manager.queue() == {"active": None, "queued": []} and len(launcher.launches) == 1
+    queue = manager.queue()
+    assert queue["active"] is None and queue["queued"] == [] and not queue["held"] and len(launcher.launches) == 1
 
 
 def test_delete_run_removes_the_folder_but_not_while_running_queued_or_a_base(tmp_path):

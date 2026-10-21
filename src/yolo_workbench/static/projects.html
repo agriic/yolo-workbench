@@ -25,7 +25,7 @@
 
   <main class="projects-main">
     <div class="section-title">
-      <div><h1>Projects</h1><p class="section-subtitle">Each project is one YOLO dataset. Only one project is open at a time.</p></div>
+      <div><h1>Projects</h1><p class="section-subtitle">Each project is one YOLO dataset. Several can be open at once, also by different people.</p></div>
       <button id="new-project" class="primary-btn">New project</button>
     </div>
     <div id="projects-message" class="banner" role="status" hidden></div>
@@ -39,7 +39,7 @@
 
     <details id="trash-section" class="trash-section" hidden>
       <summary>Trash <span id="trash-count" class="badge"></span></summary>
-      <p class="section-subtitle">Deleted projects stay in <code>.trash</code> inside the projects folder until you delete them permanently.</p>
+      <p class="section-subtitle">Deleted projects stay in <code>.trash</code> inside the projects folder until you delete them permanently.<span id="trash-retention"></span></p>
       <div id="trash-list" class="plain-list"></div>
     </details>
   </main>

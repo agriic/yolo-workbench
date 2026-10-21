@@ -119,6 +119,21 @@ class SchemaEntry:
         return {new: old for old, new in self.mapping.items() if new is not None}
 
 
+def _transaction_bytes(transaction: list) -> int:
+    """Roughly what a transaction holds in memory: its label/YAML contents plus a little per entry."""
+    return sum(256 + sum(len(value) for value in vars(entry).values() if isinstance(value, str)) for entry in transaction)
+
+
+def _entry_paths(entry) -> list[Path]:
+    paths: list[Path] = []
+    for value in vars(entry).values():
+        if isinstance(value, Path):
+            paths.append(value)
+        elif isinstance(value, list):
+            paths.extend(item for pair in value if isinstance(pair, tuple) for item in pair if isinstance(item, Path))
+    return paths
+
+
 @dataclass
 class PreparedChange:
     record: ImageRecord
@@ -173,8 +188,13 @@ class Dataset:
         # each history entry is a transaction: one or more files written or moved together
         self._undo: list[list] = []
         self._redo: list[list] = []
+        self._history_bytes: dict[int, int] = {}  # id(transaction) -> its estimated size (for the undo budget)
+        self.history_trimmed = 0  # transactions dropped from the bottom of the undo stack
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
+        self.session_started = time.time()
         self._backed_up: set[Path] = set()
+        self._closing = False
+        self._probe_thread: threading.Thread | None = None
         self.reviews: ReviewStore | None = None  # created once the dataset root is known (see _load)
         self._reviews_dirty = False
         self.indexing: dict[str, int] = {"done": 0, "total": 0}
@@ -187,9 +207,17 @@ class Dataset:
         if not pending:
             return
         if self.background_probe:
-            threading.Thread(target=self._probe_all, args=(pending,), daemon=True).start()
+            self._probe_thread = threading.Thread(target=self._probe_all, args=(pending,), daemon=True, name="probe-sizes")
+            self._probe_thread.start()
         else:
             self._probe_all(pending)
+
+    def close(self, timeout: float = 5.0) -> None:
+        """Stop probing image sizes (what was probed is saved) before the dataset is dropped."""
+        self._closing = True
+        thread = self._probe_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
 
     def _read_config(self) -> dict:
         if not self.yaml_path.is_file():
@@ -517,6 +545,8 @@ class Dataset:
         self._save_size_index()
 
     def _probe(self, record: ImageRecord) -> None:
+        if self._closing:
+            return  # the queued rest is skipped; the next opening probes it
         try:
             with Image.open(record.path) as image:
                 width, height = upright_size(image)
@@ -1310,8 +1340,7 @@ class Dataset:
                 ))
                 self._read_record(record)
             if history and transaction:
-                self._undo.append(transaction)
-                self._redo.clear()
+                self._push_history(transaction)
             changed_ids = [change.record.id for change in changes]
             if changed_ids:
                 self.annotation_generation += 1
@@ -1370,13 +1399,53 @@ class Dataset:
         with self._lock:
             return {"can_undo": bool(self._undo), "can_redo": bool(self._redo)}
 
+    def _push_history(self, transaction: list) -> None:
+        """A new undoable transaction: redo is gone, and the oldest transactions drop off past the budget
+        (runtime.undo_max_transactions / undo_max_bytes). Caller holds the lock."""
+        from .runtime import RUNTIME
+
+        for dropped in self._redo:
+            self._history_bytes.pop(id(dropped), None)
+        self._redo.clear()
+        self._undo.append(transaction)
+        self._history_bytes[id(transaction)] = _transaction_bytes(transaction)
+        total = sum(self._history_bytes.get(id(item), 0) for item in self._undo)
+        while len(self._undo) > 1 and (len(self._undo) > RUNTIME.undo_max_transactions or total > RUNTIME.undo_max_bytes):
+            oldest = self._undo.pop(0)
+            total -= self._history_bytes.pop(id(oldest), 0)
+            self.history_trimmed += 1
+
+    def referenced_trash_sessions(self) -> set[str]:
+        """Sessions whose trash the undo/redo history still points into (their files can be put back)."""
+        trash = self.root / WORKBENCH_DIR / "trash"  # trash paths are built from the (resolved) root: no resolve() per entry
+        sessions: set[str] = set()
+        with self._lock:
+            for transaction in (*self._undo, *self._redo):
+                for entry in transaction:
+                    for path in _entry_paths(entry):
+                        if path.is_relative_to(trash):
+                            parts = path.relative_to(trash).parts
+                            if parts:
+                                sessions.add(parts[0])
+        return sessions
+
+    def rotate_session(self) -> str:
+        """Start a new backup/trash session: later first writes are backed up again into a new folder, and the
+        previous session's folders become purgeable once the undo history no longer points into them."""
+        with self._lock:
+            session_id = time.strftime("%Y%m%d-%H%M%S")
+            if session_id != self.session_id:
+                self.session_id = session_id
+                self.session_started = time.time()
+                self._backed_up = set()
+            return self.session_id
+
     def _execute(self, entries: list) -> tuple[list[str], bool]:
         """Apply a new transaction forward and make it undoable as one unit."""
         with self._lock:
             result = self._run_transaction(entries, "redo")
             if entries:
-                self._undo.append(entries)
-                self._redo.clear()
+                self._push_history(entries)
             return result
 
     def _run_transaction(self, entries: list, direction: str) -> tuple[list[str], bool]:

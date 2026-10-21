@@ -1,0 +1,54 @@
+# systemd unit for the YOLO Workbench server. Install: see docs/server.md.
+#   sudo cp deploy/yolo-workbench.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now yolo-workbench
+
+[Unit]
+Description=YOLO Workbench (dataset annotation and training server)
+Documentation=file:///opt/yolo-workbench/current/docs/server.md
+After=network-online.target
+Wants=network-online.target
+# the projects folder's disk must be mounted first; the server refuses to start on a missing folder
+RequiresMountsFor=/srv/yolo-workbench /var/cache/yolo-workbench
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=yolo-workbench
+Group=yolo-workbench
+WorkingDirectory=/srv/yolo-workbench
+EnvironmentFile=-/etc/yolo-workbench/yolo-workbench.env
+ExecStart=/opt/yolo-workbench/current/.venv/bin/yolo-workbench-server run --config /etc/yolo-workbench/config.toml
+Restart=on-failure
+RestartSec=10
+
+# Stopping: SIGTERM goes to the server only (KillMode=mixed). It asks the active training run to pause
+# at its next checkpoint, waits up to [training] pause_deadline_s, closes everything else within
+# shutdown_deadline_s, and exits. Whatever is left (a run that did not reach its checkpoint, dataloader
+# workers) gets SIGKILL at TimeoutStopSec; the run then resumes from its previous checkpoint at the next
+# start. Keep TimeoutStopSec above pause_deadline_s + shutdown_deadline_s (600 + 60 by default).
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=720
+
+# Logs go to the journal: journalctl -u yolo-workbench
+StandardOutput=journal
+StandardError=journal
+
+# Hardening. The account may write only the projects folder and the cache; the code is read-only.
+# Check GPU training after changing any of these (PrivateDevices would hide /dev/nvidia*).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/srv/yolo-workbench /var/cache/yolo-workbench
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# PyTorch dataloader workers share memory through /dev/shm; PrivateTmp leaves it alone.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

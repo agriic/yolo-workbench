@@ -242,9 +242,9 @@ async function openCompare() {
 function renderQueuePanel() {
   const panel = $("queue-panel");
   if (!panel) return;
-  const { active, queued } = queueState;
-  panel.hidden = !queued.length;
-  if (!queued.length) return;
+  const { active, queued, held, held_reason: heldReason, pausing } = queueState;
+  panel.hidden = !queued.length && !held && !active;
+  if (panel.hidden) return;
   const mine = item => state.mode !== "projects" || item.project === state.project;
   const row = (item, index) => `<li class="queue-item ${mine(item) ? "" : "other-project"}">
       <span class="queue-pos">${index + 1}</span>
@@ -255,15 +255,33 @@ function renderQueuePanel() {
         ${mine(item) ? `<button type="button" class="icon-btn mini" data-queue-remove="${esc(item.id)}" title="Remove from queue" aria-label="Remove ${esc(item.name)} from the queue">×</button>` : ""}
       </span>
     </li>`;
-  panel.innerHTML = `<div class="panel-head"><h3>Queue</h3><span class="muted">${active ? `after ${esc(active.name)}` : ""}</span></div>
-    <ol class="queue-list">${queued.map(row).join("")}</ol>`;
+  // a held queue starts nothing new (also after a restart); "Hold & pause" also pauses the active run at its
+  // next checkpoint, and it resumes by itself once the queue is released (maintenance)
+  const holdButtons = held
+    ? `<button type="button" class="link-btn" data-queue-hold="release" title="Let queued runs start again">Release</button>`
+    : `<button type="button" class="link-btn" data-queue-hold="hold" title="Start nothing new until released, also after a restart">Hold</button>${active && !pausing ? ` · <button type="button" class="link-btn" data-queue-hold="pause" title="Hold the queue and pause the active run at its next checkpoint; it resumes when the queue is released">Hold &amp; pause</button>` : ""}`;
+  const notes = [
+    held ? `<div class="queue-note">${esc(heldReason || "Held")}: nothing new starts until it is released.</div>` : "",
+    pausing && active ? `<div class="queue-note">${esc(active.name)} pauses at its next checkpoint and resumes once the queue is released.</div>` : "",
+  ].join("");
+  panel.innerHTML = `<div class="panel-head"><h3>Queue${held ? " · held" : ""}</h3><span class="muted">${active && queued.length ? `after ${esc(active.name)}` : ""}</span><span class="queue-hold">${holdButtons}</span></div>
+    ${notes}${queued.length ? `<ol class="queue-list">${queued.map(row).join("")}</ol>` : ""}`;
 }
 
 async function onQueueClick(e) {
   const move = e.target.closest("[data-queue-move]");
   const remove = e.target.closest("[data-queue-remove]");
+  const hold = e.target.closest("[data-queue-hold]");
   try {
-    if (move) {
+    if (hold) {
+      const action = hold.dataset.queueHold;
+      if (action === "pause" && !confirm("Hold the queue and pause the active run at its next checkpoint? It resumes when the queue is released.")) return;
+      queueState = await api("/api/v1/training/queue/hold", { method: "POST", body: JSON.stringify({ held: action !== "release", pause_active: action === "pause" }) });
+      renderQueuePanel();
+      renderChip(queueState.active, queueState.queued.length, queueState.held);
+      deps.toast(action === "release" ? "Queue released" : action === "pause" ? "Queue held; the active run pauses at its next checkpoint" : "Queue held");
+      loadRuns();
+    } else if (move) {
       const index = +move.dataset.queueMove;
       const target = index + +move.dataset.delta;
       const keys = queueState.queued.map(item => item.key);
@@ -958,7 +976,7 @@ async function pollQueue() {
     const queue = await api("/api/v1/training/queue");
     queueState = queue;
     if (visible()) renderQueuePanel();
-    renderChip(queue.active, queue.queued.length);
+    renderChip(queue.active, queue.queued.length, queue.held);
     const here = queue.active && (state.mode !== "projects" || queue.active.project === state.project);
     applyLock(here ? { reason: `training run '${queue.active.name}' is in progress`, run_id: queue.active.id, run: queue.active.name } : null);
   } catch { /* the chip is informational; try again later */ }
@@ -966,16 +984,22 @@ async function pollQueue() {
 }
 
 let chipRun = null;
-function renderChip(active, queued) {
+function renderChip(active, queued, held = false) {
   chipRun = active;
   const chip = $("training-chip");
+  if (!active && held) {
+    chip.hidden = false;
+    chip.innerHTML = `<span class="chip-text">Training queue held</span>${queued ? `<span class="chip-queue">+${queued}</span>` : ""}`;
+    chip.title = "The training queue is held: nothing new starts until it is released (Training tab)";
+    return;
+  }
   if (!active) { chip.hidden = true; return; }
   chip.hidden = false;
   const metric = active.best_metrics?.[primaryMetric()] ?? null;
   const elsewhere = state.mode === "projects" && active.project !== state.project;
   const progress = active.status === "training" ? `${active.epoch ?? 0}/${active.epochs ?? "?"}` : STATUS_LABEL[active.status] ?? active.status;
   chip.innerHTML = `<span class="live-dot" aria-hidden="true"></span><span class="chip-text">${elsewhere ? `${esc(active.project_name)} · ` : ""}${esc(active.name)} · ${esc(progress)}${metric !== null ? ` · ★ ${formatValue(metric)}` : ""}</span>${queued ? `<span class="chip-queue">+${queued}</span>` : ""}`;
-  chip.title = `Training ${active.name}${elsewhere ? ` (project ${active.project_name})` : ""}${queued ? `; ${queued} queued` : ""} — open the run`;
+  chip.title = `Training ${active.name}${elsewhere ? ` (project ${active.project_name})` : ""}${queued ? `; ${queued} queued` : ""}${held ? "; queue held" : ""} — open the run`;
 }
 
 function openActiveRun() {

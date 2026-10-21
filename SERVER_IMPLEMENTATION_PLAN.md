@@ -7,6 +7,24 @@ stages 6–9 add **multi-user** support; stage 10 is a backlog.
 
 Checked against the repository on 2026-10-21 (after `7b7c4a9`, which unloads models before training).
 
+## Implementation status (2026-10-21)
+
+Stages 1–4 and 6 are implemented (uncommitted at the time of writing); stage 5 needs the real server.
+Operator documentation: `docs/server.md`.
+
+| Stage | State | Where / notes |
+| --- | --- | --- |
+| 1 | done | `config.py`, `server.py` (`run`, `check`), `ownership.py` (desktop CLI takes the lock too), `logs.py`, `runtime.py`; `/healthz`, `/readyz`; cache dirs and `YOLO_AUTOINSTALL=false` set before heavy imports; path import off and no cwd model scan in server mode. Added `[logging] access_log` (off: the UI polls every few seconds). |
+| 2 | done | `lifecycle.py` + FastAPI lifespan in both factories; `TrainingManager.begin_shutdown`/`wait_for_pause`, `set_hold` (persisted), `auto_resume`, active entry saved before `Popen` and `_find_runner` reattach, `hold_queue_after_crash`; `JobManager.close`; `DatasetSession.close`. Interrupted imports are logged with `cancelled`. The desktop keeps its old behavior on exit (runs keep training). |
+| 3 | done | streamed uploads (413/507), staging cleanup in every open project, `fsutil.ensure_free_space`, bounded undo, daily session rotation, retention (trash/backups 30 days, deleted projects 30 days as answered), idle unload of SAM and prediction models, GPU warning or refusal, model upload into `models/`, disk warning banner (`status.js`). |
+| 4 | done | `pyproject.toml` (`dev` group, `psutil`, `tomli`, `yolo-workbench-server` script), `deploy/install.sh`, `deploy/yolo-workbench.service`, `deploy/config.example.toml`, `deploy/yolo-workbench.env`, `docs/server.md`, README/CLAUDE.md. The unit's hardening options are untested on Linux. |
+| 5 | to do on the server | checklist at the end of `docs/server.md`. Not verified here: systemd/`KillMode=mixed` behavior, real Ultralytics/RF-DETR pause and resume under `systemctl restart`, `install.sh`, a 24–72 h soak. A real-process test covers start, readiness, duplicate-owner refusal and signal shutdown (on Windows here). |
+| 6 | done (pulled forward) | `Workspace.sessions` pool (`max_open_projects`, LRU close of idle projects, `close_idle`), unload before training and `max_loaded_models` across open projects. |
+
+Tests: `tests/test_server.py` (config, lock, lifespan and guards, service stop/resume, holds, launch reconciliation,
+jobs, uploads, GPU policy, undo budget, sessions and retention, maintenance, idle unload, the example config, a real
+server process), plus updated `test_workspace.py`/`test_training.py`.
+
 ## Decisions taken
 
 | Topic | Decision | Consequence for the plan |

@@ -75,6 +75,8 @@
                     <div id="model-menu" class="model-menu" hidden></div>
                   </div></label>
                   <button id="load-model" class="secondary" title="Load prediction model">Load</button>
+                  <button id="upload-model" class="secondary" type="button" title="Upload a model file (.pt, .pth, .onnx) into this dataset's models/ folder and load it">Upload…</button>
+                  <input id="upload-model-file" type="file" accept=".pt,.pth,.onnx" hidden>
                 </div>
                 <div id="predictor-status" class="popover-status" role="status" aria-live="polite"></div>
                 <div class="predict-row">

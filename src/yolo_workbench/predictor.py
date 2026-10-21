@@ -5,8 +5,11 @@ from __future__ import annotations
 import gc
 import importlib.util
 import json
+import logging
+import re
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +20,8 @@ from .dataset import Dataset, DatasetError
 from .imaging import upright_rgb
 from .masks import drop_specks, mask_outlines, simplify_polygon
 from .models import ImageRecord
+
+log = logging.getLogger(__name__)
 
 
 def ultralytics_available() -> bool:
@@ -36,7 +41,26 @@ def free_gpu_memory() -> None:
 
 
 MODEL_EXTENSIONS = {".pt", ".pth"}
+UPLOAD_MODEL_EXTENSIONS = MODEL_EXTENSIONS | {".onnx"}
 UNLOAD_WAIT = 10.0  # seconds an unload waits for a batch run's current image
+
+
+def model_upload_target(dataset: Dataset, name: str) -> Path:
+    """Where an uploaded model goes: the dataset's models/ folder (a project's models/), under a free name.
+    Weights files are pickles: loading one runs code from it, so only trusted users may upload them."""
+    if dataset.category == "classification":
+        raise DatasetError("Model-assisted labeling is not supported for classification datasets")
+    clean = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(name).replace("\\", "/").rsplit("/", 1)[-1]).strip(" ._")
+    suffix = Path(clean).suffix.lower()
+    if not clean or suffix not in UPLOAD_MODEL_EXTENSIONS:
+        raise DatasetError(f"Upload a model file ({', '.join(sorted(UPLOAD_MODEL_EXTENSIONS))})")
+    directory = (dataset.yaml_path if dataset.yaml_path.is_dir() else dataset.yaml_path.parent) / "models"
+    directory.mkdir(parents=True, exist_ok=True)
+    target, counter = directory / clean, 2
+    while target.exists():
+        target = directory / f"{Path(clean).stem}-{counter}{suffix}"
+        counter += 1
+    return target
 SCAN_DEPTH = 4
 SCAN_LIMIT = 50
 DEDUP_IOU = 0.6  # predictions matching an existing same-class annotation at or above this IoU are dropped
@@ -225,8 +249,9 @@ class PredictorManager:
         self.error: str | None = None
         self.backend = None
         self.model_path: str | None = None
-        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU)
+        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU, or it sat idle)
         self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
+        self.last_used = time.monotonic()  # for the idle unload (and least-recently-used unload across projects)
         self.conf = 0.25
         self.iou = 0.45
         # segmentation: pending polygons are simplified to at most this many points (None = as the model drew them)
@@ -343,12 +368,15 @@ class PredictorManager:
             self._failed_image_ids = []
             self._cancel_event.clear()
             self.status = "ready"
+            self.last_used = time.monotonic()
         self._remember_model(model_path.as_posix())
+        log.info("predictor: loaded %s for %s", model_path.name, self.dataset.root.name)
         return self.payload()
 
-    def unload(self, run: str) -> bool:
-        """Drop the model so a training run gets the GPU; cancels a batch run and waits for its current image.
-        Pending predictions, the class mapping and the model path stay. False when nothing was loaded."""
+    def unload(self, run: str, reason: str | None = None) -> bool:
+        """Drop the model so a training run gets the GPU (or because it sat idle: `reason`); cancels a batch run
+        and waits for its current image. Pending predictions, the class mapping and the model path stay.
+        False when nothing was loaded."""
         with self._lock:
             if self.backend is None and self.status != "loading":
                 return False
@@ -359,10 +387,42 @@ class PredictorManager:
             thread = self._thread
             self.backend = None
             self.status = "idle"
-            self.unloaded = f"The model was unloaded to free memory for training run '{run}'; load it again"
+            self.unloaded = reason or f"The model was unloaded to free memory for training run '{run}'; load it again"
         if thread is not None:
             thread.join(UNLOAD_WAIT)
+        log.info("predictor: unloaded the model of %s (%s)", self.dataset.root.name, reason or f"training run '{run}'")
         return True
+
+    def busy(self) -> bool:
+        """In use right now: a batch run, Label QA's analysis, or an inference."""
+        with self._lock:
+            running = self.job["state"] == "running" or bool(self.external_busy)
+        return running or self.backend_lock.locked()
+
+    def unload_if_idle(self, idle_seconds: float) -> bool:
+        """Unload a model nobody used for `idle_seconds` (the maintenance thread calls this)."""
+        if self.busy():
+            self.last_used = time.monotonic()  # the countdown starts when the batch or Label QA ends
+            return False
+        with self._lock:
+            if self.backend is None or self.status != "ready" or time.monotonic() - self.last_used < idle_seconds:
+                return False
+        minutes = round(idle_seconds / 60)
+        return self.unload("", reason=f"The model was unloaded after {minutes} minute{'s' if minutes != 1 else ''} without use to free memory; load it again")
+
+    def close(self, timeout: float) -> None:
+        """Shutdown: cancel a batch run, wait for it, and drop the model."""
+        with self._lock:
+            self._generation += 1
+            if self.job["state"] == "running":
+                self._cancel_event.set()
+                self.job["cancel_requested"] = True
+            thread = self._thread
+            self.backend = None
+            if self.status != "unavailable":
+                self.status = "idle"
+        if thread is not None:
+            thread.join(timeout)
 
     @property
     def _recents_path(self) -> Path:
@@ -527,6 +587,7 @@ class PredictorManager:
             self.job = self._new_job("running", len(records))
             self._failed_image_ids = []
             self._cancel_event.clear()
+            self.last_used = time.monotonic()
             self._thread = threading.Thread(target=self._run_batch, args=(records, self.backend), daemon=True)
             self._thread.start()
         return self.payload()
@@ -588,6 +649,7 @@ class PredictorManager:
         with self._lock:
             self.job["state"] = "cancelled" if self._cancel_event.is_set() else "done"
             self.job["cancel_requested"] = False
+            self.last_used = time.monotonic()
 
     def _prediction(self, record: ImageRecord, item: dict, names: dict) -> dict:
         self._counter += 1
@@ -613,6 +675,7 @@ class PredictorManager:
             if self.job["state"] == "running":
                 raise DatasetError("A prediction run is already in progress")
             backend = self.backend
+            self.last_used = time.monotonic()
         try:
             with self.backend_lock:
                 raw = backend.predict(record.path)

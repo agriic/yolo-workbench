@@ -71,6 +71,7 @@ export function bindManage() {
     const files = entries.length ? await collectEntries(entries) : [...e.dataTransfer.files].map(file => ({ file, path: file.name }));
     uploadFiles(files);
   });
+  $("import-path-form").hidden = !state.features.path_import;  // a server takes browser uploads only
   $("import-path-form").onsubmit = e => {
     e.preventDefault();
     const path = $("import-path").value.trim();
@@ -296,13 +297,14 @@ export async function loadStorage() {
 function renderStorage(data) {
   $("storage-total").textContent = data.total_bytes ? formatBytes(data.total_bytes) : "";
   const when = item => item.started ? new Date(item.started).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : item.session;
-  const section = (kind, title, items) => `<div class="storage-kind"><h3>${title}</h3>${items.length ? items.map(item => `
+  const kept = kind => data.retention_days?.[kind] ? `<p class="panel-note">Earlier sessions are deleted automatically after ${plural(data.retention_days[kind], "day")}.</p>` : "";
+  const section = (kind, title, items) => `<div class="storage-kind"><h3>${title}</h3>${kept(kind)}${items.length ? items.map(item => `
     <div class="storage-row">
       <div><strong>${esc(when(item))}</strong>${item.current ? ' <span class="pill">this session</span>' : ""}
         <div class="muted">${kind === "trash" && item.images ? `${plural(item.images, "image")} · ` : ""}${plural(item.files, "file")} · ${formatBytes(item.bytes)}</div></div>
       <span class="row-actions">
         ${kind === "trash" ? `<button class="secondary mini" data-restore="${esc(item.session)}" title="Move these files back to where they were deleted from">Restore</button>` : ""}
-        ${item.current ? `<span class="muted" title="The current session's undo history uses these files">Ctrl+Z undoes</span>`
+        ${item.current || item.in_undo ? `<span class="muted" title="The undo history uses these files">Ctrl+Z undoes</span>`
           : `<button class="danger-btn mini" data-kind="${kind}" data-purge="${esc(item.session)}" title="Delete these files for good">Delete</button>`}
       </span>
     </div>`).join("") : `<p class="panel-note">Empty.</p>`}</div>`;

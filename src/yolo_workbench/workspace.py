@@ -12,18 +12,22 @@
   .training/queue.json           the training queue shared by all projects
     .yolo-workbench/             backups, size index, trash, staging, imports.jsonl, cover.jpg
 
-Only one project is open at a time; opening another closes the current one when it is idle.
+Several projects can be open at once (`max_open`): a request for a project not yet open opens it, and
+when the pool is full the least recently used idle project closes. Projects with nothing running close
+by themselves after `idle_close` seconds without requests (the maintenance thread calls `close_idle`).
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import shutil
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import yaml
@@ -43,17 +47,23 @@ CATEGORIES = ("detection", "segmentation", "classification")
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 COVER_SIZE = 480
 COVER_VERSION = 2  # bump when cover rendering changes; 2: EXIF-upright
+TRASH_STAMP = "%Y%m%d-%H%M%S"
+
+log = logging.getLogger(__name__)
 
 
 class Workspace:
-    def __init__(self, root: Path, jobs: JobManager | None = None, background_probe: bool = True, session_factory=None, training_options: dict | None = None):
+    def __init__(self, root: Path, jobs: JobManager | None = None, background_probe: bool = True, session_factory=None, training_options: dict | None = None, max_open: int = 4):
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.jobs = jobs or JobManager()
         self.background_probe = background_probe
         self._session_factory = session_factory or self._default_session
         self._lock = threading.RLock()
-        self.active: DatasetSession | None = None
+        self.max_open = max(1, int(max_open))
+        self.sessions: OrderedDict[str, DatasetSession] = OrderedDict()  # open projects, least recently used first
+        self.staging_max_age = 24 * 3600.0
+        self.session_close_timeout = 5.0
         # one queue for all projects (one GPU); runs outlive project switches, so it is not per session
         self.training = TrainingManager(self.root / ".training", self.training_target, jobs=self.jobs, **(training_options or {}))
 
@@ -107,15 +117,15 @@ class Workspace:
             "yaml": data.get("yaml", "data.yaml"),
             "summary": data.get("summary") or {},
             "has_cover": (directory / WORKBENCH_DIR / "cover.jpg").is_file(),
-            "active": self.active is not None and self.active.slug == slug,
+            "active": slug in self.sessions,  # open in this server
         }
 
     # ---------- listing ----------
 
     def list_projects(self) -> dict:
         with self._lock:
-            if self.active is not None:
-                self.refresh_summary(self.active)
+            for session in list(self.sessions.values()):
+                self.refresh_summary(session)
             projects, unmanaged = [], []
             for directory in sorted(self.root.iterdir(), key=lambda item: item.name):
                 if not directory.is_dir() or directory.name.startswith("."):
@@ -235,8 +245,8 @@ class Workspace:
                 data["description"] = str(description)
             data["updated"] = _now()
             self._write_project(directory, data)
-            if self.active is not None and self.active.slug == slug:
-                self.active.project = self._card(slug, directory, data)
+            if slug in self.sessions:
+                self.sessions[slug].project = self._card(slug, directory, data)
             return self.info(slug)
 
     def adopt(self, slug: str, category: str, name: str | None = None) -> dict:
@@ -282,10 +292,10 @@ class Workspace:
             reason = self.training.project_busy(slug)
             if reason:
                 raise WriteConflict(f"Project '{data.get('name', slug)}' cannot be deleted: {reason}")
-            if self.active is not None and self.active.slug == slug:
-                self.close_active()
+            if slug in self.sessions:
+                self.close(slug)
             self.trash_root.mkdir(exist_ok=True)
-            entry = f"{slug}--{time.strftime('%Y%m%d-%H%M%S')}"
+            entry = f"{slug}--{time.strftime(TRASH_STAMP)}"
             target = self.trash_root / entry
             counter = 2
             while target.exists():
@@ -336,6 +346,26 @@ class Workspace:
             shutil.rmtree(path)
             return {"purged": entry}
 
+    def purge_expired_trash(self, days: float) -> list[str]:
+        """Delete trashed projects older than `days` for good (0: keep them)."""
+        if days <= 0 or not self.trash_root.is_dir():
+            return []
+        cutoff = time.time() - days * 86400
+        purged = []
+        for item in self.list_trash():
+            try:
+                deleted = time.mktime(time.strptime(item["deleted"][:15], TRASH_STAMP))
+            except ValueError:
+                continue
+            if deleted < cutoff:
+                try:
+                    self.purge(item["entry"])
+                    purged.append(item["entry"])
+                    log.info("workspace: deleted trashed project %s for good (older than %g days)", item["entry"], days)
+                except (KeyError, OSError) as exc:
+                    log.warning("workspace: could not delete trashed project %s: %s", item["entry"], exc)
+        return purged
+
     # ---------- sessions ----------
 
     def _default_session(self, slug: str, directory: Path, data: dict) -> DatasetSession:
@@ -343,29 +373,45 @@ class Workspace:
         dataset = Dataset(yaml_path, data["category"], background_probe=self.background_probe, allow_empty=True)
         return DatasetSession.open(dataset, slug=slug)
 
+    @property
+    def active(self) -> DatasetSession | None:
+        """The most recently used open project."""
+        with self._lock:
+            return next(reversed(self.sessions.values()), None)
+
+    def open_sessions(self) -> list[DatasetSession]:
+        """A snapshot of the open projects. Lock-free on purpose: the training manager calls it (to unload models
+        before a run) while holding its own lock, and the workspace calls into training while holding this one."""
+        return list(self.sessions.values())
+
     def busy_reason(self, session: DatasetSession) -> str | None:
         if self.jobs.running(session.slug, "import"):
             return "an import is running"
         return session.busy_reason()
 
     def session(self, slug: str) -> DatasetSession:
+        """The open project `slug`, opening it (and closing the least recently used idle one when the pool is full)."""
         with self._lock:
-            if self.active is not None and self.active.slug == slug:
-                return self.active
+            session = self.sessions.get(slug)
+            if session is not None:
+                self.sessions.move_to_end(slug)
+                session.touch()
+                return session
             directory = self.project_dir(slug)
             data = self._read_project(directory)
-            if self.active is not None:
-                reason = self.busy_reason(self.active)
-                if reason:
-                    raise WriteConflict(f"Project '{self.active.project.get('name', self.active.slug)}' is still open and busy ({reason}); wait or cancel it before opening another project")
-                self.close_active()
-            _clean_staging(directory)
+            while len(self.sessions) >= self.max_open:
+                idle = next((open_slug for open_slug, other in self.sessions.items() if not self.busy_reason(other)), None)
+                if idle is None:
+                    names = ", ".join(f"'{other.project.get('name', other.slug)}'" for other in self.sessions.values())
+                    raise WriteConflict(f"{len(self.sessions)} projects are open and all are busy ({names}); wait for one to finish before opening another project")
+                self.close(idle)
+            _clean_staging(directory, self.staging_max_age)
             session = self._session_factory(slug, directory, data)
             self.training.attach(session.dataset)  # read-only from the start if one of its runs is training
+            self.sessions[slug] = session
             session.project = self._card(slug, directory, data)
-            self.active = session
-            session.project["active"] = True
             self.refresh_summary(session)
+            log.info("workspace: opened project %s (%d open)", slug, len(self.sessions))
             return session
 
     def training_target(self, slug: str | None) -> TrainingTarget:
@@ -377,23 +423,63 @@ class Workspace:
         yaml_path = (directory / data.get("yaml", "data.yaml")).resolve()
 
         def dataset() -> Dataset:
-            active = self.active
-            if active is not None and active.slug == slug:
-                return active.dataset
+            session = self.sessions.get(slug)
+            if session is not None:
+                return session.dataset
             return Dataset(yaml_path, data["category"], background_probe=True, allow_empty=True)
 
         return TrainingTarget(slug, data.get("name") or slug, data["category"], yaml_path, directory / "runs", dataset)
 
-    def close_active(self) -> None:
+    def close(self, slug: str) -> None:
+        """Close an open project (refused while something runs in it)."""
         with self._lock:
-            session, self.active = self.active, None
+            session = self.sessions.get(slug)
             if session is None:
                 return
             reason = self.busy_reason(session)
             if reason:
-                self.active = session
-                raise WriteConflict(f"Project is busy ({reason}); wait or cancel it first")
+                raise WriteConflict(f"Project '{session.project.get('name', slug)}' is busy ({reason}); wait or cancel it first")
+            del self.sessions[slug]
             self.refresh_summary(session)
+        session.close(self.session_close_timeout)
+        log.info("workspace: closed project %s", slug)
+
+    def close_active(self) -> None:
+        """Close the most recently used project."""
+        session = self.active
+        if session is not None:
+            self.close(session.slug)
+
+    def close_idle(self, idle_seconds: float) -> list[str]:
+        """Close projects without requests for `idle_seconds` that have nothing running (0: never)."""
+        if idle_seconds <= 0:
+            return []
+        now = time.monotonic()
+        closed = []
+        for session in self.open_sessions():
+            if now - session.last_used >= idle_seconds and not self.busy_reason(session):
+                try:
+                    self.close(session.slug)
+                    closed.append(session.slug)
+                except WriteConflict:
+                    pass  # became busy meanwhile
+        return closed
+
+    def close_all(self, timeout: float = 5.0) -> None:
+        """Shutdown: persist every open project's summary and stop its background work (busy or not)."""
+        with self._lock:
+            sessions, self.sessions = list(self.sessions.values()), OrderedDict()
+        for session in sessions:
+            try:
+                self.refresh_summary(session)
+            except Exception:
+                log.exception("workspace: could not save the summary of %s", session.slug)
+            session.close(timeout)
+
+    def clean_staging(self) -> None:
+        """Remove abandoned browser uploads (untouched for `staging_max_age`) in every open project."""
+        for session in self.open_sessions():
+            _clean_staging(self.project_dir(session.slug), self.staging_max_age)
 
     def refresh_summary(self, session: DatasetSession) -> None:
         """Persist the counts shown on project cards, and the cover image (the first image)."""
@@ -446,16 +532,9 @@ def _write_cover(image_path: Path, cover: Path) -> None:
 
 
 def _clean_staging(directory: Path, max_age: float = 24 * 3600) -> None:
-    staging = directory / WORKBENCH_DIR / "staging"
-    if not staging.is_dir():
-        return
-    now = time.time()
-    for entry in staging.iterdir():
-        try:
-            if now - entry.stat().st_mtime > max_age:
-                shutil.rmtree(entry, ignore_errors=True)
-        except OSError:
-            pass
+    from .importer import clean_staging
+
+    clean_staging(directory / WORKBENCH_DIR / "staging", max_age)
 
 
 def _now() -> str:

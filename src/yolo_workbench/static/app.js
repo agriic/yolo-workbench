@@ -1,3 +1,4 @@
+import { watchServerStatus } from "./status.js";
 import { $, api, apiUrl, setApiBase, esc, debounce, classColor } from "./api.js";
 import { state } from "./state.js";
 import { VirtualGallery } from "./grid.js";
@@ -12,7 +13,7 @@ import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor,
   drawPredictions, hitPrediction, loadEditorPredictions, loadModel, maxPointsChanged, predictImage,
   refreshPredictor, rejectPredictions, renderModelMenu, renderPredList,
-  retryPredict, runPredict,
+  retryPredict, runPredict, uploadModel,
 } from "./predictor.js";
 import {
   computeEmbeddings, configureEmbeddings, embedPointerCancel, embedPointerDown, embedPointerMove,
@@ -49,6 +50,9 @@ export function classOptions(selectedId) {
 async function init() {
   const info = await api("/api/v1/app");
   state.mode = info.mode;
+  state.server = !!info.server;
+  state.features = { ...state.features, ...(info.features || {}) };
+  watchServerStatus();
   if (info.mode === "projects") {
     const slug = new URLSearchParams(location.search).get("project");
     if (!slug) { location.replace("/projects.html"); return; }
@@ -289,6 +293,8 @@ function bind() {
 
   // model-assisted labeling
   $("load-model").onclick = loadModel;
+  $("upload-model").onclick = () => $("upload-model-file").click();
+  $("upload-model-file").onchange = e => { uploadModel(e.target.files[0]); e.target.value = ""; };
   $("model-path").addEventListener("keydown", e => { if (e.key === "Enter") loadModel(); });
   $("model-browse").onclick = () => {
     const menu = $("model-menu");

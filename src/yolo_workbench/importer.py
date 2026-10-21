@@ -12,10 +12,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import random
 import re
 import secrets
 import shutil
+import threading
 import time
 from pathlib import Path, PurePosixPath
 
@@ -24,7 +26,9 @@ from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
 from . import classes
 from .dataset import IMAGE_EXTENSIONS, WORKBENCH_DIR, Dataset, DatasetError
+from .fsutil import ensure_free_space, replace
 from .jobs import Job
+from .runtime import RUNTIME
 
 SPLIT_ALIASES = {"train": "train", "training": "train", "val": "val", "valid": "val", "validation": "val", "test": "test", "testing": "test"}
 UPLOAD_EXTENSIONS = IMAGE_EXTENSIONS | {".txt", ".yaml", ".yml", ".json"}
@@ -70,18 +74,113 @@ def safe_relative(raw: str) -> PurePosixPath:
     return clean
 
 
-def write_staged_file(dataset: Dataset, staging_id: str, relative: str, content: bytes) -> dict:
+class UploadTooLarge(DatasetError):
+    """An upload over the configured limits (HTTP 413)."""
+
+
+_usage_lock = threading.Lock()
+_usage: dict[str, list[int]] = {}  # staging dir -> [files, bytes] received so far
+
+
+def _staging_usage(root: Path) -> list[int]:
+    """Files and bytes already in a staging dir (counted once, then kept up to date). Caller holds _usage_lock."""
+    key = str(root)
+    if key not in _usage:
+        files = [path for path in root.rglob("*") if path.is_file() and not path.name.startswith(".")]
+        _usage[key] = [len(files), sum(path.stat().st_size for path in files)]
+    return _usage[key]
+
+
+def staged_target(dataset: Dataset, staging_id: str, relative: str) -> tuple[Path, Path, str]:
+    """Where an uploaded file goes: (staging root, target path, clean relative path). Checks the upload's file
+    count and free disk space before anything is received."""
     root = staging_dir(dataset, staging_id)
-    target = root.joinpath(*safe_relative(relative).parts)
+    clean = safe_relative(relative)
+    target = root.joinpath(*clean.parts)
     if not target.resolve().is_relative_to(root.resolve()):
         raise DatasetError(f"Invalid upload path: {relative!r}")
+    with _usage_lock:
+        files, _ = _staging_usage(root)
+    if RUNTIME.max_upload_files and files >= RUNTIME.max_upload_files and not target.exists():
+        raise UploadTooLarge(f"This upload already has {files} files, the most one import takes; import them first")
+    ensure_free_space(root, what="the upload")
+    return root, target, str(PurePosixPath(*clean.parts))
+
+
+def upload_budget(root: Path) -> int:
+    """How many more bytes this upload may receive in one file (per-file limit and what is left of the total)."""
+    limit = RUNTIME.max_upload_file_bytes
+    if RUNTIME.max_upload_total_bytes:
+        with _usage_lock:
+            _, used = _staging_usage(root)
+        limit = min(limit, max(0, RUNTIME.max_upload_total_bytes - used))
+    return limit
+
+
+def partial_path(target: Path) -> Path:
+    """The temporary file an upload streams into (dot-prefixed, so a scan skips it)."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(content)
-    return {"path": str(PurePosixPath(*safe_relative(relative).parts)), "size": len(content)}
+    return target.with_name(f".{target.name}.{secrets.token_hex(4)}.part")
+
+
+def commit_staged_file(root: Path, partial: Path, target: Path, size: int, relative: str) -> dict:
+    """Move a completely received upload into place and count it."""
+    previous = target.stat().st_size if target.exists() else None
+    replace(partial, target)
+    with _usage_lock:
+        usage = _staging_usage(root)
+        if previous is None:
+            usage[0] += 1
+            usage[1] += size
+        else:
+            usage[1] += size - previous
+    _touch(root)
+    return {"path": relative, "size": size}
+
+
+def write_staged_file(dataset: Dataset, staging_id: str, relative: str, content: bytes) -> dict:
+    root, target, clean = staged_target(dataset, staging_id, relative)
+    if len(content) > upload_budget(root):
+        raise UploadTooLarge(f"{target.name} is larger than this server accepts")
+    partial = partial_path(target)
+    try:
+        partial.write_bytes(content)
+        return commit_staged_file(root, partial, target, len(content), clean)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _touch(path: Path) -> None:
+    """Mark a staging dir as in use (cleanup goes by its modification time)."""
+    try:
+        os.utime(path)
+    except OSError:
+        pass
 
 
 def discard_staging(dataset: Dataset, staging_id: str) -> None:
-    shutil.rmtree(staging_dir(dataset, staging_id), ignore_errors=True)
+    root = staging_dir(dataset, staging_id)
+    shutil.rmtree(root, ignore_errors=True)
+    with _usage_lock:
+        _usage.pop(str(root), None)
+
+
+def clean_staging(staging: Path, max_age: float) -> list[str]:
+    """Remove upload dirs untouched for `max_age` seconds (every received file touches its dir)."""
+    if not staging.is_dir():
+        return []
+    removed = []
+    now = time.time()
+    for entry in staging.iterdir():
+        try:
+            if now - entry.stat().st_mtime > max_age:
+                shutil.rmtree(entry, ignore_errors=True)
+                removed.append(entry.name)
+                with _usage_lock:
+                    _usage.pop(str(entry), None)
+        except OSError:
+            pass
+    return removed
 
 
 # ---------- scanning ----------
@@ -92,6 +191,8 @@ def resolve_source(dataset: Dataset, path: str | None, staging_id: str | None) -
         return staging_dir(dataset, staging_id)
     if not path:
         raise DatasetError("Choose a folder to import from")
+    if not RUNTIME.allow_path_import:
+        raise DatasetError("Importing from a folder on the server is turned off; upload the files from your browser instead")
     source = Path(path).expanduser()
     if not source.is_dir():
         raise DatasetError(f"Folder not found: {source}")
@@ -558,6 +659,7 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
     if not items:
         raise DatasetError("No images found in the selected folder")
     _assign_splits(items, options, allowed)
+    ensure_free_space(dataset.root, sum(item["image"].stat().st_size for item in items if item["image"].is_file()), "the import")
     # each split may have several folders; the caller picks one per split (default: the first)
     chosen = options.get("folders") or {}
     folders = {split: dataset.resolve_folder(split, chosen.get(split)) for split in {item["target"] for item in items}}
@@ -580,6 +682,8 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
         if job and not job.cancel_requested:
             job.progress(message="Indexing…")
         rescan = dataset.rescan()
+        if job and job.cancel_requested:
+            stats["cancelled"] = True  # cancelled (or the server stopped): only the files copied so far came in
         _log(dataset, source, options, mapping, stats)
     return {**stats, "rescan": rescan}
 

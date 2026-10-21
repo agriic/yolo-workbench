@@ -9,6 +9,8 @@ import typer
 import uvicorn
 
 from .dataset import Dataset, DatasetError
+from .logs import configure_desktop_logging
+from .ownership import AlreadyOwned, OwnerLock
 from .web import create_app, create_workspace_app
 from .workspace import Workspace
 
@@ -31,6 +33,7 @@ def main(
     if (dataset_yaml is None) == (projects is None):
         typer.echo("Error: pass either a dataset (DATASET_YAML) or --projects DIR", err=True)
         raise typer.Exit(2)
+    configure_desktop_logging()
     url = f"http://{host}:{port}"
     # binding a wildcard address means the user wants LAN access, so the Host check cannot apply
     allowed_hosts = None if host in {"0.0.0.0", "::"} else LOCAL_HOSTS | {host}
@@ -41,6 +44,8 @@ def main(
             raise typer.Exit(2)
         if not projects.exists() and not typer.confirm(f"Create projects folder {projects}?", default=True):
             raise typer.Exit(1)
+        projects.mkdir(parents=True, exist_ok=True)
+        lock = _own(OwnerLock(projects.resolve() / ".workbench"))
         workspace = Workspace(projects)
         typer.echo(f"Projects folder {workspace.root}. Workbench: {url}")
         app_instance = create_workspace_app(workspace, **guard)
@@ -56,6 +61,7 @@ def main(
         except DatasetError as exc:
             typer.echo(f"Error: {exc}", err=True)
             raise typer.Exit(2) from exc
+        lock = _own(OwnerLock(dataset.root / ".yolo-workbench"))
         typer.echo(f"Indexed {len(dataset.images)} images. Workbench: {url}")
         app_instance = create_app(dataset, **guard)
         if model is not None:
@@ -64,10 +70,23 @@ def main(
                 typer.echo(f"Loaded model {model}")
             except DatasetError as exc:
                 typer.echo(f"Warning: {exc}", err=True)
-    app_instance.state.training.start()  # advances the training queue; runs themselves are separate processes
+    app_instance.state.owner_lock = lock
+    # the app's lifespan starts the training supervisor; runs are separate processes that outlive this one
     if not no_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app_instance, host=host, port=port)
+    try:
+        uvicorn.run(app_instance, host=host, port=port)
+    finally:
+        lock.release()
+
+
+def _own(lock: OwnerLock) -> OwnerLock:
+    """One workbench per folder: a second one (desktop or server) would not see this one's edits."""
+    try:
+        return lock.acquire()
+    except AlreadyOwned as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
 
 if __name__ == "__main__":

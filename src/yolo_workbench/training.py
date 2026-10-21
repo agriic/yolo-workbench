@@ -9,7 +9,12 @@ runs from their training_config.json/metrics.csv.
 `TrainingManager` owns the queue (`queue.json` under its state dir): one active run, launched as a
 detached subprocess (own session, so it survives server restarts and Ctrl+C), the rest FIFO.
 `tick()` advances it: it notices when the active process is gone, releases the dataset lock,
-and launches the next entry. It runs on API reads and from a supervisor thread (CLI only).
+and launches the next entry. It runs on API reads and from a supervisor thread (`start()`, called by
+the app's lifespan). Constructing the manager launches nothing.
+
+The queue can be held (persisted in queue.json): nothing launches until it is released. A run paused
+for a service stop or a maintenance hold is listed in `auto_resume` and goes back to the front of the
+queue once launching is allowed again.
 
 While a run is active its dataset is read-only: `attach(dataset)` installs a write guard that
 makes every write path raise `DatasetLocked` (HTTP 409).
@@ -19,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -47,8 +53,11 @@ from .frameworks import (  # noqa: F401  (re-exported: the Ultralytics argument 
     ultralytics_defaults,
     validate_args,
 )
-from .fsutil import WINDOWS, replace
+from .fsutil import WINDOWS, ensure_free_space, replace
 from .jobs import Job, JobCancelled, JobManager
+from .media_cache import default_weights_dir
+
+log = logging.getLogger(__name__)
 
 META_DIR = "workbench"
 ACTIVE_STATES = {"starting", "preparing", "training", "validating", "testing"}
@@ -245,6 +254,24 @@ def _process_alive(info: dict | None) -> bool:
         return False
 
 
+def _find_runner(spec_path: Path) -> dict | None:
+    """A live runner started on this spec.json whose process.json was never written (the server stopped
+    between launching it and recording it)."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    target = str(spec_path)
+    for process in psutil.process_iter(["pid", "cmdline", "create_time", "status"]):
+        try:
+            command = process.info.get("cmdline") or []
+            if process.info.get("status") != psutil.STATUS_ZOMBIE and target in command and any("train_runner" in part for part in command):
+                return {"pid": process.info["pid"], "create_time": process.info["create_time"], "started": process.info["create_time"]}
+        except Exception:
+            continue
+    return None
+
+
 # ---------- the manager ----------
 
 
@@ -256,7 +283,7 @@ class TrainingManager:
         self.launcher = launcher or launch_subprocess
         self.exporter = exporter or launch_export
         self._exports: dict[Path, str] = {}  # run dir -> its latest ONNX export job
-        self.weights_dir = weights_dir or Path.home() / ".cache" / "yolo-workbench" / "weights"
+        self.weights_dir = weights_dir or default_weights_dir()
         # called with a run's name right before it launches: the app unloads SAM and prediction models (one GPU)
         self.before_launch: Callable[[str], None] | None = None
         self._lock = threading.RLock()
@@ -266,8 +293,11 @@ class TrainingManager:
         self._devices: tuple[float, list] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._draining = False  # set while the server shuts down: nothing new launches (not persisted)
+        self.resume_after_service_stop = True  # a run paused by a service stop resumes at the next start
+        self.hold_queue_after_crash = False  # hold the queue when the active run dies unexpectedly
         self._queue = self._load_queue()
-        self.tick()
+        self._refresh_lock()  # a run that kept training while the server was down keeps its dataset read-only
 
     @classmethod
     def for_dataset(cls, dataset: Dataset, **kwargs) -> "TrainingManager":
@@ -287,21 +317,32 @@ class TrainingManager:
     # ---------- supervisor ----------
 
     def start(self, interval: float = 2.0) -> None:
+        """Reconcile the queue with the processes still running, then keep advancing it in a thread."""
         if self._thread is not None:
             return
+        self._stop.clear()
+        self._draining = False
+        try:
+            self.tick()
+        except Exception:
+            log.exception("training supervisor: first tick failed")
 
         def loop():
             while not self._stop.wait(interval):
                 try:
                     self.tick()
-                except Exception as exc:  # the supervisor must keep going
-                    print(f"training supervisor: {exc}", file=sys.stderr)
+                except Exception:  # the supervisor must keep going
+                    log.exception("training supervisor: tick failed")
 
         self._thread = threading.Thread(target=loop, daemon=True, name="training-supervisor")
         self._thread.start()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Stop the supervisor thread (training runs are separate processes and are not touched)."""
         self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
 
     # ---------- queue file ----------
 
@@ -313,16 +354,23 @@ class TrainingManager:
         data = _read_json(self._queue_path) or {}
         queue = [entry for entry in data.get("queue", []) if isinstance(entry, dict) and entry.get("dir")]
         active = data.get("active") if isinstance(data.get("active"), dict) else None
-        return {"active": active, "queue": queue}
+        auto_resume = [key for key in data.get("auto_resume", []) if isinstance(key, str) and "/" in key]
+        return {"active": active, "queue": queue, "held": bool(data.get("held")), "held_reason": data.get("held_reason"), "auto_resume": auto_resume}
 
     def _save_queue(self) -> None:
-        if self._queue["active"] is None and not self._queue["queue"] and not self._queue_path.exists():
+        empty = self._queue["active"] is None and not self._queue["queue"] and not self._queue["held"] and not self._queue["auto_resume"]
+        if empty and not self._queue_path.exists():
             return
         _write_json(self._queue_path, {"version": 1, **self._queue})
 
     @staticmethod
     def _key(entry: dict) -> str:
         return f"{entry.get('project') or ''}/{entry['dir']}"
+
+    @staticmethod
+    def _entry_of(key: str) -> dict:
+        project, directory = key.split("/", 1)
+        return {"project": project or None, "dir": directory}
 
     def _entry_dir(self, entry: dict) -> tuple[TrainingTarget, Path]:
         target = self.resolve(entry.get("project"))
@@ -365,12 +413,19 @@ class TrainingManager:
 
     # ---------- lifecycle ----------
 
+    def _launch_allowed(self) -> bool:
+        return not self._draining and not self._queue["held"]
+
     def tick(self) -> None:
-        """Reap a finished active run and launch the next queued one."""
+        """Reap a finished active run and launch the next queued one (unless the queue is held or the server stops)."""
         with self._lock:
             active = self._queue["active"]
             if active is not None and not self._active_alive(active):
                 self._finish_active(active)
+            if not self._launch_allowed():
+                self._refresh_lock()
+                return
+            self._apply_auto_resume()
             while self._queue["active"] is None and self._queue["queue"]:
                 entry = self._queue["queue"][0]
                 try:
@@ -396,7 +451,16 @@ class TrainingManager:
             _, run_dir = self._entry_dir(active)
         except KeyError:
             return False
-        return _process_alive(_read_json(run_dir / META_DIR / "process.json"))
+        info = _read_json(run_dir / META_DIR / "process.json")
+        if info is None:
+            # launched, but the server stopped before recording the process: find it by its spec path
+            info = _find_runner(run_dir / META_DIR / "spec.json")
+            if info is None:
+                return False
+            _write_json(run_dir / META_DIR / "process.json", info)
+            log.info("training: reattached to run '%s' (pid %s), which was launched right before the server stopped", active["dir"], info["pid"])
+            return True
+        return _process_alive(info)
 
     def _write_state(self, run_dir: Path, replace: bool = False, **changes) -> dict:
         path = run_dir / META_DIR / "state.json"
@@ -412,22 +476,47 @@ class TrainingManager:
             _, run_dir = self._entry_dir(active)
         except KeyError:
             run_dir = None
+        status = None
         if run_dir is not None and (run_dir / META_DIR).is_dir():
             workdir = run_dir / META_DIR
             state = _read_json(workdir / "state.json") or {}
             control = _read_json(workdir / "control.json") or {}
-            if state.get("status") not in TERMINAL_STATES:
+            status = state.get("status")
+            if status not in TERMINAL_STATES:
                 killed = control.get("action") == "kill"
-                self._write_state(
-                    run_dir,
-                    status="stopped" if killed else "interrupted",
-                    phase="stopped" if killed else "interrupted",
-                    finished=time.time(),
-                    eta=None,
-                    error=state.get("error") or ("Stopped by user" if killed else "The training process exited unexpectedly; see the log"),
-                )
+                if status == "starting" and not killed and not (workdir / "process.json").exists():
+                    # never recorded and never reported (the runner writes "preparing" first thing): it did not start
+                    status, error = "failed", "The training process did not start (the server stopped while launching it); start the run again"
+                else:
+                    status = "stopped" if killed else "interrupted"
+                    error = state.get("error") or ("Stopped by user" if killed else "The training process exited unexpectedly; see the log")
+                self._write_state(run_dir, status=status, phase=status, finished=time.time(), eta=None, error=error)
             (workdir / "control.json").unlink(missing_ok=True)
+            log.info("training: run '%s' ended (%s)", active["dir"], status)
+        key = self._key(active)
+        if active.get("auto_resume") and status in ("paused", "interrupted") and key not in self._queue["auto_resume"]:
+            self._queue["auto_resume"].append(key)  # paused for a service stop or a maintenance hold
+        elif status == "interrupted" and self.hold_queue_after_crash and not self._queue["held"]:
+            self._queue["held"] = True
+            self._queue["held_reason"] = f"Held because run '{active['dir']}' was interrupted; resume it or release the queue"
         self._queue["active"] = None
+        self._save_queue()
+
+    def _apply_auto_resume(self) -> None:
+        """Runs paused by a service stop or a maintenance hold go back to the front of the queue. Caller holds the lock."""
+        if not self._queue["auto_resume"]:
+            return
+        keys, self._queue["auto_resume"] = self._queue["auto_resume"], []
+        for key in reversed(keys):  # the first paused run ends up first
+            entry = self._entry_of(key)
+            try:
+                target, run_dir = self._entry_dir(entry)
+                summary = self._summary(target, run_dir)
+            except (KeyError, OSError):
+                continue
+            if summary["resumable"]:
+                self._queue_resume(entry["project"], run_dir, front=True)
+                log.info("training: resuming run '%s' after a service stop or queue hold", entry["dir"])
         self._save_queue()
 
     def _launch(self, entry: dict, target: TrainingTarget, run_dir: Path) -> None:
@@ -455,14 +544,19 @@ class TrainingManager:
                 meta["dataset"] = {"fingerprint": plan["fingerprint"], "splits": plan["counts"], "names": plan["names"], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 _write_json(workdir / "run.json", meta)
                 (workdir / "control.json").unlink(missing_ok=True)
+                (workdir / "process.json").unlink(missing_ok=True)
                 self._write_state(run_dir, replace=True, status="starting", phase="starting", resumed=bool(spec.get("resume")), queued_at=None)
                 self._queue["queue"].pop(0)
                 self._queue["active"] = entry
                 self._refresh_lock()
+            ensure_free_space(run_dir, what=f"training run '{meta.get('name', run_dir.name)}'")
             self._free_models(meta.get("name", run_dir.name))
+            # recorded as active before the process exists: a server stopping right after the launch finds the
+            # runner again by its spec path (see _active_alive) instead of launching the run a second time
+            self._save_queue()
             self._handle = self.launcher(workdir / "spec.json", run_dir, self.weights_dir)
             _write_json(workdir / "process.json", {"pid": self._handle.pid, "create_time": _process_create_time(self._handle.pid), "started": time.time()})
-            self._save_queue()
+            log.info("training: launched run '%s' (pid %s)", meta.get("name", run_dir.name), self._handle.pid)
         except Exception as exc:
             if self._queue["active"] is entry:
                 self._queue["active"] = None
@@ -472,14 +566,15 @@ class TrainingManager:
             self._write_state(run_dir, status="failed", phase="failed", error=f"Could not start: {exc}", finished=time.time())
             self._save_queue()
             self._refresh_lock()
+            log.warning("training: could not start run '%s': %s", run_dir.name, exc)
 
     def _free_models(self, run: str) -> None:
         if self.before_launch is None:
             return
         try:
             self.before_launch(run)
-        except Exception as exc:  # the run starts anyway; it may just have less GPU memory
-            print(f"training: could not unload models before '{run}': {exc}", file=sys.stderr)
+        except Exception:  # the run starts anyway; it may just have less GPU memory
+            log.exception("training: could not unload models before '%s'", run)
 
     # ---------- dataset → training data ----------
 
@@ -891,6 +986,8 @@ class TrainingManager:
             output = best.with_suffix(".onnx")
             spec_path = workdir / "export-spec.json"
             scratch = workdir / "export-tmp"
+            shutil.rmtree(scratch, ignore_errors=True)  # left over from an export the server stopped
+            ensure_free_space(run_dir, best.stat().st_size * 2, "the ONNX export")
             _write_json(spec_path, {"framework": framework.id, "weights": best.as_posix(), "output": output.as_posix(), "scratch": scratch.as_posix(), **options})
 
             def work(job: Job) -> dict:
@@ -1070,6 +1167,7 @@ class TrainingManager:
             raise DatasetError("; ".join(check["errors"]))
         if check["warnings"] and not confirm:
             return {"queued": False, "warnings": check["warnings"], "notes": check["notes"]}
+        ensure_free_space(target.runs_root, what="a new training run")
         with self._lock:
             target.runs_root.mkdir(parents=True, exist_ok=True)
             existing = {path.name for path in target.runs_root.iterdir()}
@@ -1095,17 +1193,108 @@ class TrainingManager:
             summary = self._summary(target, run_dir)
             if not summary["resumable"]:
                 raise DatasetError("This run cannot be resumed (it finished, is queued or running, or has no resumable last.pt)")
-            workdir = run_dir / META_DIR
-            spec = _read_json(workdir / "spec.json") or {}
-            spec["resume"] = True
-            _write_json(workdir / "spec.json", spec)
-            (workdir / "control.json").unlink(missing_ok=True)
-            self._write_state(run_dir, replace=True, status="queued", phase="queued", resumed=True, queued_at=time.time())
-            self._queue["queue"].append({"project": project, "dir": run_dir.name})
+            self._queue_resume(project, run_dir)
             self._save_queue()
         self.tick()
         with self._lock:
             return self._summary(target, run_dir)
+
+    def _queue_resume(self, project: str | None, run_dir: Path, front: bool = False) -> None:
+        """Queue a resumable run to continue from its checkpoint. Caller holds the lock and saves the queue."""
+        workdir = run_dir / META_DIR
+        spec = _read_json(workdir / "spec.json") or {}
+        spec["resume"] = True
+        _write_json(workdir / "spec.json", spec)
+        (workdir / "control.json").unlink(missing_ok=True)
+        self._write_state(run_dir, replace=True, status="queued", phase="queued", resumed=True, queued_at=time.time())
+        entry = {"project": project, "dir": run_dir.name}
+        key = self._key(entry)
+        self._queue["auto_resume"] = [item for item in self._queue["auto_resume"] if item != key]
+        self._queue["queue"].insert(0, entry) if front else self._queue["queue"].append(entry)
+
+    # ---------- holding the queue, service stops ----------
+
+    def _request_pause(self, active: dict, by: str) -> str | None:
+        """Ask the active run to pause at its next checkpoint and resume it automatically later. Caller holds the lock."""
+        try:
+            _, run_dir = self._entry_dir(active)
+        except KeyError:
+            return None
+        workdir = run_dir / META_DIR
+        control = _read_json(workdir / "control.json") or {}
+        if control.get("action") not in ("finish", "kill"):  # a finishing or killed run keeps doing that
+            _write_json(workdir / "control.json", {"action": "pause", "by": by, "at": time.time()})
+        active["auto_resume"] = True
+        self._save_queue()
+        return (_read_json(workdir / "run.json") or {}).get("name") or run_dir.name
+
+    def set_hold(self, held: bool, pause_active: bool = False) -> dict:
+        """Hold the queue (nothing new launches; persisted across restarts) or release it. With `pause_active`
+        the active run also pauses at its next checkpoint and resumes by itself once the queue is released."""
+        with self._lock:
+            self._queue["held"] = bool(held)
+            self._queue["held_reason"] = "Held for maintenance" if held else None
+            if held and pause_active and self._queue["active"] is not None and self._active_alive(self._queue["active"]):
+                name = self._request_pause(self._queue["active"], "hold")
+                log.info("training: queue held; pausing run '%s'", name)
+            else:
+                log.info("training: queue %s", "held" if held else "released")
+            self._save_queue()
+        self.tick()
+        return self.queue()
+
+    def begin_shutdown(self, pause: bool) -> str | None:
+        """The server is stopping: launch nothing more and, with `pause`, ask the active run to pause at its next
+        checkpoint (a planned service stop). Returns the name of the run asked to pause, if any."""
+        with self._lock:
+            self._draining = True
+            active = self._queue["active"]
+            if not pause or active is None or not self._active_alive(active):
+                return None
+            if self.resume_after_service_stop:
+                name = self._request_pause(active, "service")
+            else:
+                name = active["dir"]
+                try:
+                    _, run_dir = self._entry_dir(active)
+                    _write_json(run_dir / META_DIR / "control.json", {"action": "pause", "by": "service", "at": time.time()})
+                except KeyError:
+                    pass
+        log.info("training: pausing run '%s' for the service stop", name)
+        return name
+
+    def wait_for_pause(self, deadline: float, poll: float = 0.5) -> str:
+        """Wait up to `deadline` seconds for the active run to exit after begin_shutdown(pause=True). Returns
+        "idle", "paused" (the runner exited), or "timeout" (still running; the service manager's kill leaves it
+        interrupted, resumable from its last checkpoint)."""
+        with self._lock:
+            active = self._queue["active"]
+        if active is None:
+            return "idle"
+        end = time.monotonic() + deadline
+        while True:
+            with self._lock:
+                if not self._active_alive(active):
+                    if self._queue["active"] is active:
+                        self._finish_active(active)
+                        self._refresh_lock()
+                    return "paused"
+            if time.monotonic() >= end:
+                break
+            time.sleep(poll)
+        log.warning("training: run '%s' did not reach a checkpoint within %.0f s; it will be interrupted", active["dir"], deadline)
+        return "timeout"
+
+    def pause_for_shutdown(self, deadline: float, poll: float = 0.5) -> str:
+        """begin_shutdown(pause=True) and wait_for_pause(deadline)."""
+        if self.begin_shutdown(pause=True) is None:
+            return "idle"
+        return self.wait_for_pause(deadline, poll)
+
+    def active_run_name(self) -> str | None:
+        """The name of the run training right now (lock-free snapshot), for GPU warnings."""
+        info = next(iter(self._locked.values()), None)
+        return info["run"] if info else None
 
     def stop(self, project: str | None, run_id: str, mode: str) -> dict:
         if mode not in {"pause", "finish", "kill"}:
@@ -1181,7 +1370,8 @@ class TrainingManager:
 
             active = describe(self._queue["active"]) if self._queue["active"] else None
             queued = [item for item in map(describe, self._queue["queue"]) if item is not None]
-            return {"active": active, "queued": queued}
+            pausing = bool(self._queue["active"] and self._queue["active"].get("auto_resume"))
+            return {"active": active, "queued": queued, "held": self._queue["held"], "held_reason": self._queue["held_reason"], "pausing": pausing, "auto_resume": list(self._queue["auto_resume"])}
 
     def reorder(self, keys: list[str]) -> dict:
         with self._lock:

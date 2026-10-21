@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import json
 import math
+import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 from typing import Callable, Literal
@@ -14,14 +16,20 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 from . import augment_preview, classes, importer, rfdetr_augment, storage
 from .dataset import Dataset, DatasetError, WriteConflict
+from .fsutil import InsufficientSpace, ensure_free_space, replace
 from .imaging import upright_rgb
+from .importer import UploadTooLarge
 from .jobs import JobManager
+from .lifecycle import Lifecycle, LifecycleOptions
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
-from .predictor import PredictorManager, free_gpu_memory
+from .predictor import PredictorManager, free_gpu_memory, model_upload_target
+from .runtime import RUNTIME
 from .sam import SamManager
 from .session import DatasetSession
 from .training import TrainingManager, ultralytics_defaults
@@ -238,11 +246,43 @@ class TrainingReorderPayload(BaseModel):
     order: list[str]
 
 
+class TrainingHoldPayload(BaseModel):
+    held: bool
+    pause_active: bool = False  # also pause the active run at its next checkpoint; it resumes once released
+
+
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 CSRF_HEADER = "x-workbench"
+HEALTH_PATHS = {"/healthz", "/readyz"}
 
 
-def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager, sam: SamManager) -> APIRouter:
+async def receive_file(request: Request, target: Path, limit: int, commit) -> dict | Response:
+    """Stream a request body into a temporary file beside `target` (413 past `limit` bytes, nothing kept on an
+    error or a dropped connection) and hand the complete file to `commit(partial, size)`."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise UploadTooLarge(f"{target.name} is larger than this server accepts ({limit / 2**20:,.0f} MB at most)")
+    await run_in_threadpool(ensure_free_space, target.parent, int(declared) if declared and declared.isdigit() else 0, "the upload")
+    partial = await run_in_threadpool(importer.partial_path, target)
+    size = 0
+    try:
+        stream = await run_in_threadpool(open, partial, "wb")
+        try:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    raise UploadTooLarge(f"{target.name} is larger than this server accepts ({limit / 2**20:,.0f} MB at most)")
+                await run_in_threadpool(stream.write, chunk)
+        finally:
+            await run_in_threadpool(stream.close)
+        return await run_in_threadpool(commit, partial, size)
+    except ClientDisconnect:
+        return JSONResponse(status_code=400, content={"detail": "The upload was interrupted"})
+    finally:
+        await run_in_threadpool(lambda: partial.unlink(missing_ok=True))
+
+
+def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager, sam: SamManager, lifecycle: Callable[[], Lifecycle | None] = lambda: None) -> APIRouter:
     """Every per-dataset endpoint; mounted at /api/v1 (single mode) or /api/v1/projects/{slug}."""
     router = APIRouter()
     current = Depends(get_session)
@@ -467,8 +507,10 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.put("/import/staging/{staging_id}/files")
     async def staging_upload(request: Request, staging_id: str, path: str, session: DatasetSession = current):
-        content = await request.body()
-        return importer.write_staged_file(session.dataset, staging_id, path, content)
+        """One uploaded file, streamed to disk (the body is the file)."""
+        root, target, relative = await run_in_threadpool(importer.staged_target, session.dataset, staging_id, path)
+        limit = await run_in_threadpool(importer.upload_budget, root)
+        return await receive_file(request, target, limit, lambda partial, size: importer.commit_staged_file(root, partial, target, size, relative))
 
     @router.delete("/import/staging/{staging_id}")
     def staging_discard(staging_id: str, session: DatasetSession = current):
@@ -511,9 +553,14 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     # ---------- model-assisted labeling ----------
 
+    def predictor_payload(session: DatasetSession, payload: dict) -> dict:
+        app_lifecycle = lifecycle()
+        payload["gpu_warning"] = app_lifecycle.gpu_warning(payload.get("status") == "ready") if app_lifecycle else None
+        return payload
+
     @router.get("/predictor")
     def predictor_state(session: DatasetSession = current):
-        return session.predictor.payload()
+        return predictor_payload(session, session.predictor.payload())
 
     @router.get("/predictor/models")
     def predictor_models(session: DatasetSession = current):
@@ -521,7 +568,25 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/predictor/load")
     def predictor_load(payload: PredictorLoadPayload, session: DatasetSession = current):
-        return session.predictor.load(payload.path, payload.conf, payload.iou)
+        app_lifecycle = lifecycle()
+        refused = app_lifecycle.refuse_gpu_load() if app_lifecycle else None
+        if refused:
+            raise DatasetError(refused)
+        result = session.predictor.load(payload.path, payload.conf, payload.iou)
+        if app_lifecycle is not None:
+            app_lifecycle.enforce_model_limit(session)
+        return predictor_payload(session, result)
+
+    @router.put("/models/upload")
+    async def model_upload(request: Request, name: str, session: DatasetSession = current):
+        """A model file (.pt, .pth, .onnx) streamed into the dataset's models/ folder; load it by the returned path."""
+        target = await run_in_threadpool(model_upload_target, session.dataset, name)
+
+        def commit(partial: Path, size: int) -> dict:
+            replace(partial, target)
+            return {"path": target.as_posix(), "name": target.name, "size": size}
+
+        return await receive_file(request, target, RUNTIME.max_model_upload_bytes, commit)
 
     @router.put("/predictor/options")
     def predictor_options(payload: PredictorOptionsPayload, session: DatasetSession = current):
@@ -752,13 +817,40 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     return router
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Startup and ordered shutdown of the background work (see lifecycle.py); uvicorn runs it, the tests' ASGITransport does not."""
+    lifecycle = getattr(app.state, "lifecycle", None)
+    if lifecycle is not None:
+        await run_in_threadpool(lifecycle.startup)
+    app.state.ready = True
+    try:
+        yield
+    finally:
+        app.state.ready = False
+        app.state.stopping = True
+        if lifecycle is not None:
+            await run_in_threadpool(lifecycle.shutdown)
+
+
 def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, require_header: bool) -> FastAPI:
-    app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0")
+    app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0", lifespan=_lifespan)
     app.state.jobs = jobs
+    app.state.ready = False
+    app.state.stopping = False
+    app.state.owner_lock = None  # the OwnerLock the CLI/server holds, for /readyz
 
     @app.exception_handler(DatasetError)
     async def dataset_error(_, exc: DatasetError):
         return Response(content=f'{{"detail": {json_string(str(exc))}}}', status_code=400, media_type="application/json")
+
+    @app.exception_handler(UploadTooLarge)
+    async def upload_too_large(_, exc: UploadTooLarge):
+        return JSONResponse(status_code=413, content={"detail": str(exc)})
+
+    @app.exception_handler(InsufficientSpace)
+    async def insufficient_space(_, exc: InsufficientSpace):
+        return JSONResponse(status_code=507, content={"detail": str(exc)})
 
     @app.exception_handler(WriteConflict)
     async def conflict_error(_, exc: WriteConflict):
@@ -770,7 +862,36 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
 
     @app.get("/api/v1/app")
     def app_info():
-        return {"mode": mode, "version": app.version}
+        return {"mode": mode, "version": app.version, "server": RUNTIME.server_mode, "features": {"path_import": RUNTIME.allow_path_import, "model_upload": True}}
+
+    @app.get("/healthz")
+    def healthz():
+        """Liveness: the process answers."""
+        return {"status": "ok"}
+
+    @app.get("/readyz")
+    def readyz():
+        """Readiness: startup finished, not stopping, the data folder writable, the owner lock held. Image
+        indexing, the GPU and MongoDB do not count: the app is usable without them."""
+        problems = []
+        if app.state.stopping:
+            problems.append("stopping")
+        elif not app.state.ready:
+            problems.append("starting")
+        lifecycle = getattr(app.state, "lifecycle", None)
+        if lifecycle is not None and not os.access(lifecycle.data_root, os.W_OK):
+            problems.append(f"{lifecycle.data_root} is not writable")
+        lock = app.state.owner_lock
+        if lock is not None and not lock.held:
+            problems.append("the owner lock is not held")
+        return JSONResponse(status_code=503 if problems else 200, content={"status": "unavailable" if problems else "ready", "problems": problems})
+
+    @app.get("/api/v1/status")
+    def server_status():
+        """Warnings for every page (low disk space) and whether the server is stopping."""
+        lifecycle = getattr(app.state, "lifecycle", None)
+        status = lifecycle.status() if lifecycle is not None else {"disk": None, "warnings": [], "stopping": False}
+        return {**status, "ready": app.state.ready}
 
     @app.get("/api/v1/jobs")
     def job_list(project: str | None = None):
@@ -794,12 +915,17 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
     async def guard(request: Request, call_next):
         # The API can write anywhere in the dataset (and the projects folder): refuse requests
         # that a web page in the same browser could forge (DNS rebinding, cross-site POSTs).
-        if allowed_hosts is not None:
-            host = (request.headers.get("host") or "").rsplit(":", 1)[0] if not (request.headers.get("host") or "").startswith("[") else (request.headers.get("host") or "").split("]")[0] + "]"
+        path = request.url.path
+        if allowed_hosts is not None and path not in HEALTH_PATHS:
+            raw = (request.headers.get("host") or "").lower()
+            host = raw.split("]")[0] + "]" if raw.startswith("[") else raw.rsplit(":", 1)[0]
             if host not in allowed_hosts:
                 return JSONResponse(status_code=403, content={"detail": "Host not allowed"})
-        if require_header and request.method in MUTATING_METHODS and request.url.path.startswith("/api/") and request.headers.get(CSRF_HEADER) != "1":
+        mutating = request.method in MUTATING_METHODS and path.startswith("/api/")
+        if require_header and mutating and request.headers.get(CSRF_HEADER) != "1":
             return JSONResponse(status_code=403, content={"detail": "Missing X-Workbench header"})
+        if mutating and app.state.stopping:
+            return JSONResponse(status_code=503, content={"detail": "The server is shutting down; try again once it is back"})
         response = await call_next(request)
         if not request.url.path.startswith("/api/"):
             # the UI ships with the package; stale cached scripts break new endpoints
@@ -821,14 +947,18 @@ def _training_routes(app: FastAPI, training: TrainingManager) -> None:
     def training_reorder(payload: TrainingReorderPayload):
         return training.reorder(payload.order)
 
+    @app.post("/api/v1/training/queue/hold")
+    def training_hold(payload: TrainingHoldPayload):
+        """Hold the queue (maintenance: nothing new starts, also after a restart) or release it."""
+        return training.set_hold(payload.held, payload.pause_active)
 
-def _unload_before_training(training: TrainingManager, sam: SamManager, current_session: Callable[[], DatasetSession | None]) -> None:
-    """A run about to start gets the GPU: SAM and the open dataset's prediction model are unloaded first."""
+
+def _unload_before_training(training: TrainingManager, sam: SamManager, open_sessions: Callable[[], list[DatasetSession]]) -> None:
+    """A run about to start gets the GPU: SAM and every open dataset's prediction model are unloaded first."""
 
     def unload(run: str) -> None:
-        session = current_session()
         freed = sam.unload(run)
-        if session is not None:
+        for session in open_sessions():
             freed = session.unload_models(run) or freed
         if freed:
             free_gpu_memory()
@@ -845,16 +975,25 @@ def _sam_routes(app: FastAPI, sam: SamManager) -> None:
     """One SAM model for the whole app (in projects mode it outlives switching projects)."""
     app.state.sam = sam
 
+    def payload(state: dict) -> dict:
+        lifecycle = getattr(app.state, "lifecycle", None)
+        state["gpu_warning"] = lifecycle.gpu_warning(state.get("status") in ("ready", "loading")) if lifecycle else None
+        return state
+
     @app.get("/api/v1/sam")
     def sam_state():
-        return sam.payload()
+        return payload(sam.payload())
 
     @app.post("/api/v1/sam/start")
     def sam_start():
-        return sam.start()
+        lifecycle = getattr(app.state, "lifecycle", None)
+        refused = lifecycle.refuse_gpu_load() if lifecycle else None
+        if refused and sam.payload()["status"] in ("idle", "error"):
+            raise DatasetError(refused)
+        return payload(sam.start())
 
 
-def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None, sam: SamManager | None = None) -> FastAPI:
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None, sam: SamManager | None = None, lifecycle_options: LifecycleOptions | None = None) -> FastAPI:
     """Single-dataset mode: the dataset API lives directly under /api/v1."""
     jobs = jobs or JobManager()
     app = _base_app("single", jobs, allowed_hosts, require_header)
@@ -864,26 +1003,28 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     sam = sam or SamManager()
     _sam_routes(app, sam)
     session = DatasetSession.open(dataset, predictor)
-    _unload_before_training(training, sam, lambda: session)
+    _unload_before_training(training, sam, lambda: [session])
+    app.state.lifecycle = Lifecycle(training, jobs, sam, lambda: [session], dataset.root, lifecycle_options)
     app.state.dataset = dataset
     app.state.session = session
     app.state.predictor = session.predictor
     app.state.embeddings = session.embeddings
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
-    app.include_router(dataset_router(lambda: session, cache, jobs, training, sam), prefix="/api/v1")
+    app.include_router(dataset_router(lambda: session, cache, jobs, training, sam, lambda: app.state.lifecycle), prefix="/api/v1")
     _mount_static(app)
     return app
 
 
-def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, sam: SamManager | None = None) -> FastAPI:
+def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, sam: SamManager | None = None, lifecycle_options: LifecycleOptions | None = None) -> FastAPI:
     """Projects mode: workspace endpoints plus the dataset API under /api/v1/projects/{slug}."""
     app = _base_app("projects", workspace.jobs, allowed_hosts, require_header)
     app.state.workspace = workspace
     _training_routes(app, workspace.training)
     sam = sam or SamManager()
     _sam_routes(app, sam)
-    _unload_before_training(workspace.training, sam, lambda: workspace.active)
+    _unload_before_training(workspace.training, sam, workspace.open_sessions)
+    app.state.lifecycle = Lifecycle(workspace.training, workspace.jobs, sam, workspace.open_sessions, workspace.root, lifecycle_options, workspace=workspace)
     cache = media_cache or MediaCache()
     app.state.media_cache = cache
 
@@ -926,7 +1067,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
 
     @app.get("/api/v1/trash")
     def trash_list():
-        return {"items": workspace.list_trash()}
+        return {"items": workspace.list_trash(), "retention_days": app.state.lifecycle.options.project_trash_retention_days}
 
     @app.post("/api/v1/trash/{entry}/restore")
     def trash_restore(entry: str):
@@ -936,7 +1077,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     def trash_purge(entry: str):
         return not_found(lambda: workspace.purge(entry))
 
-    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training, sam), prefix="/api/v1/projects/{slug}")
+    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training, sam, lambda: app.state.lifecycle), prefix="/api/v1/projects/{slug}")
     _mount_static(app)
     return app
 

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "yolo-workbench"
 version = "0.1.0"
-description = "Local YOLO dataset annotation, exploration, and repair tool"
+description = "YOLO dataset annotation, exploration, repair and training workbench (desktop or server)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -15,6 +15,10 @@ dependencies = [
   "pyyaml>=6",
   "typer>=0.12",
   "uvicorn>=0.30",
+  # training runner supervision (process identity, tree kill on Windows)
+  "psutil>=5.9",
+  # server configuration file (tomllib is in the standard library from 3.11)
+  "tomli>=2; python_version < '3.11'",
   # embeddings
   "fiftyone>=0.25",
   "umap-learn>=0.5",
@@ -29,13 +33,18 @@ dependencies = [
   "rfdetr[train,onnx,augment]>=1.11.2,<1.12",
   # ONNX export of trained weights (rfdetr[onnx] brings onnx + onnxruntime; Ultralytics simplifies with onnxslim)
   "onnxslim>=0.1.82",
-  # tests
+]
+
+[dependency-groups]
+# installed by `uv sync`; a server release leaves them out with `uv sync --frozen --no-dev`
+dev = [
   "httpx>=0.27",
   "pytest>=8",
 ]
 
 [project.scripts]
 yolo-workbench = "yolo_workbench.cli:app"
+yolo-workbench-server = "yolo_workbench.server:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/yolo_workbench"]

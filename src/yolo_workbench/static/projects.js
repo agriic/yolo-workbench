@@ -1,3 +1,4 @@
+import { watchServerStatus } from "./status.js";
 import { $, api, esc } from "./api.js";
 
 let projects = [];
@@ -18,6 +19,7 @@ const openUrl = slug => `/?project=${encodeURIComponent(slug)}`;
 async function init() {
   const info = await api("/api/v1/app");
   if (info.mode !== "projects") { location.replace("/"); return; }
+  watchServerStatus();
   const message = sessionStorage.getItem("projects-message");
   if (message) {
     sessionStorage.removeItem("projects-message");
@@ -35,7 +37,7 @@ async function load() {
   $("projects-root").title = data.root;
   renderProjects();
   renderUnmanaged(data.unmanaged);
-  renderTrash(trash.items);
+  renderTrash(trash.items, trash.retention_days);
   pollTraining();
 }
 
@@ -102,9 +104,10 @@ function renderUnmanaged(items) {
     </div>`).join("");
 }
 
-function renderTrash(items) {
+function renderTrash(items, retentionDays = 0) {
   $("trash-section").hidden = !items.length;
   $("trash-count").textContent = items.length || "";
+  $("trash-retention").textContent = retentionDays ? ` They are deleted permanently by themselves ${plural(retentionDays, "day")} after deletion.` : "";
   $("trash-list").innerHTML = items.map(item => `<div class="plain-row">
       <strong>${esc(item.name)}</strong>
       <span class="muted">${esc(item.category || "")} · ${plural(item.summary?.images, "image")} · deleted ${esc(formatStamp(item.deleted))}</span>

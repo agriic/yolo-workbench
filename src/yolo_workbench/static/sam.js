@@ -61,6 +61,8 @@ function applySamState(data) {
     error: data.error || "SAM failed to load — click to retry",
     ready: `Smart annotation with ${data.model}${data.device ? ` on ${data.device}` : ""} (S)`,
   }[s.status] || s.unloaded || "Smart annotation: click objects, SAM outlines them (S)";
+  if (data.gpu_warning) button.title += ` — ${data.gpu_warning}`;
+  if (data.gpu_warning && s.status === "ready" && !wasReady) deps.toast(data.gpu_warning);
   button.classList.toggle("loading", s.status === "loading");
   clearTimeout(s.poll);
   if (s.status === "loading") s.poll = setTimeout(refreshSam, 1000);

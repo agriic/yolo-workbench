@@ -9,7 +9,9 @@ Results are never written here: the editor adds them as annotations through the 
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 
@@ -19,7 +21,10 @@ from PIL import Image, ImageOps
 from . import libraries
 from .dataset import DatasetError
 from .masks import drop_specks, mask_box, mask_outlines
+from .media_cache import default_weights_dir
 from .predictor import ultralytics_available
+
+log = logging.getLogger(__name__)
 
 LARGE, BASE = "sam2.1_l.pt", "sam2.1_b.pt"
 FEATURE_CACHE = 4  # encoded images kept; SAM 2.1 features are ~16 MB each
@@ -82,18 +87,16 @@ def _gpu_available() -> bool:
         return False
 
 
-WEIGHTS_DIR = Path.home() / ".cache" / "yolo-workbench" / "weights"  # shared with training's pretrained weights
-
-
 def weights_path(name: str) -> Path:
     """An existing copy (ours, or Ultralytics' weights dir) or where to download it."""
     libraries.load("ultralytics.utils")
     from ultralytics.utils import SETTINGS
 
-    for directory in (WEIGHTS_DIR, Path(SETTINGS["weights_dir"])):
+    weights_dir = default_weights_dir()  # shared with training's pretrained weights
+    for directory in (weights_dir, Path(SETTINGS["weights_dir"])):
         if (directory / name).is_file():
             return directory / name
-    return WEIGHTS_DIR / name
+    return weights_dir / name
 
 
 def _default_factory(name: str):
@@ -120,8 +123,9 @@ class SamManager:
         self.model: str | None = None
         self.device: str | None = None
         self.backend = None
-        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU)
+        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU, or it sat idle)
         self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
+        self.last_used = time.monotonic()
         self._features: OrderedDict[tuple, tuple] = OrderedDict()  # (path, mtime_ns, size) -> (features, (h, w))
 
     def payload(self) -> dict:
@@ -166,6 +170,8 @@ class SamManager:
                 self.device = getattr(backend, "device", None)
                 self.status = "ready"
                 self.message = None
+                self.last_used = time.monotonic()
+            log.info("sam: loaded %s on %s", name, self.device)
             return
         with self._lock:
             if generation != self._generation:
@@ -174,8 +180,9 @@ class SamManager:
             self.message = None
             self.error = "Failed to load SAM — " + "; ".join(errors)
 
-    def unload(self, run: str) -> bool:
-        """Drop the model (and the encoded images) so a training run gets the GPU. False when nothing was loaded."""
+    def unload(self, run: str, reason: str | None = None) -> bool:
+        """Drop the model (and the encoded images) so a training run gets the GPU, or because it sat idle
+        (`reason`). False when nothing was loaded."""
         with self._lock:
             if self.status not in ("ready", "loading"):
                 return False
@@ -185,10 +192,30 @@ class SamManager:
             self.device = None
             self.status = "idle"
             self.message = None
-            self.unloaded = f"Smart annotation was unloaded to free memory for training run '{run}'; turn it on again to load it"
+            self.unloaded = reason or f"Smart annotation was unloaded to free memory for training run '{run}'; turn it on again to load it"
         with self._run_lock:  # an in-flight encode or decode finishes first
             self._features.clear()
+        log.info("sam: unloaded (%s)", reason or f"training run '{run}'")
         return True
+
+    def unload_if_idle(self, idle_seconds: float) -> bool:
+        """Unload a model nobody prompted for `idle_seconds` (the maintenance thread calls this)."""
+        with self._lock:
+            if self.status != "ready" or self._run_lock.locked() or time.monotonic() - self.last_used < idle_seconds:
+                return False
+        minutes = round(idle_seconds / 60)
+        return self.unload("", reason=f"Smart annotation was unloaded after {minutes} minute{'s' if minutes != 1 else ''} without use to free memory; turn it on again to load it")
+
+    def close(self, timeout: float) -> None:
+        """Shutdown: drop the model; a load in progress is discarded when it finishes."""
+        with self._lock:
+            self._generation += 1
+            self.backend = None
+            if self.status in ("ready", "loading"):
+                self.status = "idle"
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
 
     def _require_backend(self):
         with self._lock:
@@ -218,6 +245,7 @@ class SamManager:
 
     def encode(self, path: Path) -> dict:
         self._require_backend()
+        self.last_used = time.monotonic()
         with self._run_lock:
             self._encoded(path)
         return {"encoded": True}
@@ -235,6 +263,7 @@ class SamManager:
             x1, y1, x2, y2 = (min(max(float(value), 0.0), 1.0) for value in box)
             box = [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
         backend = self._require_backend()
+        self.last_used = time.monotonic()
         with self._run_lock:
             features, (height, width) = self._encoded(path)
             pixels = [[point["x"] * width, point["y"] * height] for point in points]

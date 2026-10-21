@@ -14,8 +14,8 @@ from yolo_workbench.web import create_workspace_app
 from yolo_workbench.workspace import Workspace
 
 
-def make_workspace(tmp_path: Path) -> Workspace:
-    return Workspace(tmp_path / "projects", jobs=JobManager(synchronous=True), background_probe=False)
+def make_workspace(tmp_path: Path, **kwargs) -> Workspace:
+    return Workspace(tmp_path / "projects", jobs=JobManager(synchronous=True), background_probe=False, **kwargs)
 
 
 def client_for(app):
@@ -84,8 +84,8 @@ def test_classification_project_and_adopt(tmp_path):
     assert workspace.session("loose").dataset.names == {0: "ant"}
 
 
-def test_single_open_project_refuses_switch_while_busy(tmp_path):
-    workspace = make_workspace(tmp_path)
+def test_full_pool_refuses_opening_while_busy(tmp_path):
+    workspace = make_workspace(tmp_path, max_open=1)
     workspace.create("One", "detection", ["a"])
     workspace.create("Two", "detection", ["a"])
     first = workspace.session("one")
@@ -96,7 +96,47 @@ def test_single_open_project_refuses_switch_while_busy(tmp_path):
         workspace.trash("one")
     first.predictor.job = {"state": "done"}
     assert workspace.session("two").slug == "two"
-    assert workspace.active.slug == "two"
+    assert workspace.active.slug == "two" and list(workspace.sessions) == ["two"]
+
+
+def test_several_projects_stay_open_and_the_least_recently_used_idle_one_closes(tmp_path):
+    workspace = make_workspace(tmp_path, max_open=2)
+    for name in ("One", "Two", "Three"):
+        slug = workspace.create(name, "detection", ["a"])["slug"]
+        Image.new("RGB", (8, 8)).save(workspace.root / slug / "images" / "train" / "a.jpg")
+    one, two = workspace.session("one"), workspace.session("two")
+    image = next(iter(one.dataset.images))
+    one.dataset.replace_annotations(image, [{"class_id": 0, "points": [0.5, 0.5, 0.2, 0.2]}])
+    # alternating between two open projects keeps both, with their undo history
+    assert workspace.session("one") is one and workspace.session("two") is two
+    assert one.dataset.history_state()["can_undo"]
+    assert workspace.info("one")["active"] and workspace.info("two")["active"]
+    workspace.session("one")  # two is now the least recently used
+    two.predictor.job = {"state": "running"}
+    workspace.session("three")  # two is busy, so one closes instead
+    assert list(workspace.sessions) == ["two", "three"] and not workspace.info("one")["active"]
+    two.predictor.job = {"state": "done"}
+    # idle projects close by themselves; busy ones stay
+    workspace.sessions["three"].last_used -= 3600
+    two.last_used -= 3600
+    two.predictor.job = {"state": "running"}
+    assert workspace.close_idle(1800) == ["three"] and list(workspace.sessions) == ["two"]
+    two.predictor.job = {"state": "done"}
+    workspace.close_all()
+    assert workspace.sessions == {}
+
+
+def test_trashed_projects_expire(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Old", "detection", ["a"])
+    workspace.create("New", "detection", ["a"])
+    old = workspace.trash("old")["entry"]
+    workspace.trash("new")
+    aged = workspace.trash_root / "old--20000101-000000"
+    (workspace.trash_root / old).rename(aged)
+    assert workspace.purge_expired_trash(0) == []
+    assert workspace.purge_expired_trash(30) == [aged.name]
+    assert [item["slug"] for item in workspace.list_trash()] == ["new"]
 
 
 def test_scan_suggests_mapping_by_name(tmp_path):

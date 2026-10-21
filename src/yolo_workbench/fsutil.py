@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import time
 
 WINDOWS = os.name == "nt"
@@ -25,6 +26,31 @@ def replace(src, dst) -> None:
         except PermissionError:
             time.sleep(delay)
     os.replace(src, dst)
+
+
+def ensure_free_space(path, needed: int = 0, what: str = "this") -> None:
+    """Raise OSError(ENOSPC) when the disk holding `path` would drop below the configured minimum
+    (runtime.min_free_bytes) after writing `needed` more bytes. No check when no minimum is set."""
+    from .runtime import RUNTIME
+
+    if not RUNTIME.min_free_bytes:
+        return
+    probe = os.fspath(path)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        return  # cannot tell: let the write itself fail if it must
+    if free - needed < RUNTIME.min_free_bytes:
+        raise InsufficientSpace(f"Not enough free disk space for {what}: {free / 2**30:.1f} GB free, at least {RUNTIME.min_free_bytes / 2**30:.1f} GB must stay free")
+
+
+class InsufficientSpace(OSError):
+    pass
 
 
 def occupied(path, source) -> bool:

@@ -22,7 +22,10 @@ class EmbeddingsManager:
         self.dataset = dataset
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
-        self.status = "idle" if fiftyone_available() else "unavailable"
+        from .runtime import RUNTIME
+
+        self.enabled = RUNTIME.embeddings_enabled
+        self.status = "idle" if self.enabled and fiftyone_available() else "unavailable"
         self.error: str | None = None
         self.items: list[dict] | None = None
         self.source_generation: int | None = None
@@ -51,7 +54,7 @@ class EmbeddingsManager:
     def start(self) -> dict:
         with self._lock:
             if self.status == "unavailable":
-                self.error = "fiftyone is not installed. Run 'uv sync' to install all dependencies"
+                self.error = "fiftyone is not installed. Run 'uv sync' to install all dependencies" if self.enabled else "Embeddings are turned off on this server ([embeddings] enabled = false)"
             elif self.status != "computing":
                 self.status = "computing"
                 self.error = None
@@ -59,6 +62,12 @@ class EmbeddingsManager:
                 self._thread = threading.Thread(target=self._run, args=(generation,), daemon=True)
                 self._thread.start()
         return self.payload()
+
+    def close(self, timeout: float) -> None:
+        """Wait (up to `timeout` seconds) for a running computation; FiftyOne/UMAP cannot be interrupted."""
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
 
     def _run(self, generation: int) -> None:
         try:
