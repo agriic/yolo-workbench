@@ -30,7 +30,7 @@ class DatasetSession:
 
     @classmethod
     def open(cls, dataset: Dataset, predictor: PredictorManager | None = None, slug: str | None = None, project: dict | None = None) -> "DatasetSession":
-        predictor = predictor or PredictorManager(dataset)
+        predictor = predictor or PredictorManager(dataset, project_only=slug is not None)
         # a test may pass a stand-in predictor without the real manager's state; Label QA needs the real one
         labelqa = LabelQAManager(dataset, predictor) if isinstance(predictor, PredictorManager) else None
         return cls(dataset, predictor, EmbeddingsManager(dataset), slug, project or {}, labelqa)

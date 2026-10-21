@@ -18,6 +18,10 @@ queue once launching is allowed again.
 
 While a run is active its dataset is read-only: `attach(dataset)` installs a write guard that
 makes every write path raise `DatasetLocked` (HTTP 409).
+
+A run may train on some of the dataset's split folders only (detection/segmentation): spec.json's
+`folders` ({split: [folder as Dataset.folder_label shows it]}; absent = everything) is applied at
+every launch, so a queued or resumed run trains on the same folders.
 """
 
 from __future__ import annotations
@@ -526,7 +530,7 @@ class TrainingManager:
         try:
             dataset = target.dataset()
             with dataset._lock:  # in-flight writes finish before the guard flips
-                plan = self._data_plan(target, dataset, framework)
+                plan = self._data_plan(target, dataset, framework, spec.get("folders"))
                 if plan["errors"]:
                     raise DatasetError("; ".join(plan["errors"]))
                 if framework is frameworks.RFDETR:
@@ -541,7 +545,7 @@ class TrainingManager:
                     spec["cache_files"] = plan["cache_files"]
                 _write_json(workdir / "spec.json", spec)
                 meta = _read_json(workdir / "run.json") or {}
-                meta["dataset"] = {"fingerprint": plan["fingerprint"], "splits": plan["counts"], "names": plan["names"], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                meta["dataset"] = {"fingerprint": plan["fingerprint"], "splits": plan["counts"], "names": plan["names"], "folders": plan["folders"], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
                 _write_json(workdir / "run.json", meta)
                 (workdir / "control.json").unlink(missing_ok=True)
                 (workdir / "process.json").unlink(missing_ok=True)
@@ -578,13 +582,17 @@ class TrainingManager:
 
     # ---------- dataset → training data ----------
 
-    def _data_plan(self, target: TrainingTarget, dataset: Dataset, framework: frameworks.Framework = frameworks.ULTRALYTICS) -> dict:
-        """What the run will train on, plus blocking errors and confirmable warnings."""
+    def _data_plan(self, target: TrainingTarget, dataset: Dataset, framework: frameworks.Framework = frameworks.ULTRALYTICS, folders: dict[str, list[str]] | None = None) -> dict:
+        """What the run will train on, plus blocking errors and confirmable warnings. `folders` ({split: [folder label]})
+        keeps only the images of those split folders; None trains on the whole dataset."""
         errors: list[str] = []
         warnings: list[str] = []
         notes: list[str] = []
         names = dataset.names
         records = list(dataset.images.values())
+        if folders is not None:
+            folders = {split: list(dict.fromkeys(labels)) for split, labels in folders.items()}
+            records = self._folder_subset(target, dataset, folders, records, errors, notes)
         splits = {split: sorted((record for record in records if record.split == split), key=lambda record: str(record.path)) for split in ("train", "val", "test")}
         counts = {split: len(items) for split, items in splits.items()}
         if not names:
@@ -595,9 +603,8 @@ class TrainingManager:
             errors.append("The train split has no images")
         if target.category == "classification":
             root = dataset.root
-            folders = dataset._split_folders
             for split in ("train", "val", "test"):
-                listed = folders.get(split, [])
+                listed = dataset._split_folders.get(split, [])
                 if listed and listed != [root / split]:
                     errors.append(f"Classification training needs the {split} images in {root / split} (one folder per split)")
             if not counts["val"] and not counts["test"]:
@@ -613,7 +620,8 @@ class TrainingManager:
                 errors.append(f"Ultralytics would not find the labels of {mismatched} image(s): their labels are next to the images inside an images/ folder; move them to the parallel labels/ folder")
         if not has_test:
             notes.append("No test split: the run is evaluated on val only")
-        issue_errors = sum(1 for issue in dataset.issues() if issue.get("severity") == "error")
+        planned = {record.id for record in records} if folders is not None else None
+        issue_errors = sum(1 for issue in dataset.issues() if issue.get("severity") == "error" and (planned is None or issue.get("image_id") in planned))
         if issue_errors:
             skipped = "broken lines are left out" if framework is frameworks.RFDETR else "Ultralytics skips or repairs broken labels"
             warnings.append(f"{issue_errors} validation error(s) in the dataset ({skipped}; see the Validation tab)")
@@ -640,7 +648,30 @@ class TrainingManager:
             "fingerprint": digest.hexdigest()[:12],
             "cache_files": cache_files,
             "root": str(dataset.root),
+            "folders": folders,
         }
+
+    @staticmethod
+    def _folder_subset(target: TrainingTarget, dataset: Dataset, folders: dict[str, list[str]], records: list, errors: list[str], notes: list[str]) -> list:
+        """The records inside the chosen split folders (images of .txt lists are in none of them)."""
+        if target.category == "classification":
+            errors.append("Classification runs train on every folder; choosing folders is for detection and segmentation")
+            return records
+        label_of = {folder: dataset.folder_label(folder) for folder in dataset._all_folders()}
+        known = {(split, label_of[folder]) for split, listed in dataset._split_folders.items() for folder in listed}
+        chosen = {(split, label) for split, labels in folders.items() for label in labels}
+        gone = sorted(chosen - known)
+        if gone:
+            errors.append(f"No longer a folder of the dataset: {', '.join(f'{label} ({split})' for split, label in gone)}")
+        if not chosen:
+            errors.append("Choose at least one folder to train on")
+        kept = []
+        for record in records:
+            folder = dataset._folder_of(record)
+            if folder is not None and (record.split, label_of[folder]) in chosen:
+                kept.append(record)
+        notes.append(f"Training on {len(chosen & known)} of {len(known)} folders; {len(records) - len(kept)} image(s) left out")
+        return kept
 
     def _write_data(self, target: TrainingTarget, plan: dict, workdir: Path) -> dict:
         if target.category == "classification":
@@ -817,6 +848,7 @@ class TrainingManager:
             "has_weights": {kind: kind in weights for kind in ("best", "last")},
             "onnx": self._onnx_info(run_dir, weights.get("best")),
             "dataset": meta.get("dataset"),
+            "folders": spec.get("folders"),  # the split folders it trains on; None = the whole dataset
         }
 
     @staticmethod
@@ -1076,9 +1108,10 @@ class TrainingManager:
         target = self.resolve(project)
         run_dir = self._require_run(target, run_id)
         framework = frameworks.of_run(run_dir)
-        args = self._run_args(framework, run_dir, _read_json(run_dir / META_DIR / "spec.json") or {})
+        spec = _read_json(run_dir / META_DIR / "spec.json") or {}
+        args = self._run_args(framework, run_dir, spec)
         ordered = framework.copy_args(args, target.category)
-        return {"args": ordered, "framework": framework.id, "yaml": args_to_yaml(ordered), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
+        return {"args": ordered, "framework": framework.id, "yaml": args_to_yaml(ordered), "folders": spec.get("folders"), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
 
     # ---------- options and validation ----------
 
@@ -1111,6 +1144,8 @@ class TrainingManager:
             "frameworks": list(available.values()),
             "runs": previous,
             "devices": self.devices(),
+            # the split folders a run can be limited to (classification trains on every folder)
+            "folders": [] if target.category == "classification" else dataset.folders()["items"],
             "weights_dir": self.weights_dir.as_posix(),
             "next_name": _next_name(None, {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set()),
         }
@@ -1137,11 +1172,11 @@ class TrainingManager:
         result["yaml"] = args_to_yaml(result["args"]) if not result["errors"] else text
         return result
 
-    def preflight(self, project: str | None, dataset: Dataset, args: dict | None = None) -> dict:
+    def preflight(self, project: str | None, dataset: Dataset, args: dict | None = None, folders: dict[str, list[str]] | None = None) -> dict:
         target = self.resolve(project)
         framework = frameworks.for_args(args or {})
         with dataset._lock:
-            plan = self._data_plan(target, dataset, framework)
+            plan = self._data_plan(target, dataset, framework, folders)
         warnings = list(plan["warnings"])
         errors = list(plan["errors"])
         if framework is frameworks.RFDETR and (args or {}).get("batch_size") == "auto" and frameworks.rfdetr_device((args or {}).get("device")) in (None, "cuda") and not self.devices():
@@ -1157,13 +1192,13 @@ class TrainingManager:
 
     # ---------- queue operations ----------
 
-    def enqueue(self, project: str | None, dataset: Dataset, name: str, notes: str, text: str, confirm: bool = False) -> dict:
+    def enqueue(self, project: str | None, dataset: Dataset, name: str, notes: str, text: str, confirm: bool = False, folders: dict[str, list[str]] | None = None) -> dict:
         target = self.resolve(project)
         parsed = frameworks.validate(target.category, text)
         framework = frameworks.get(parsed["framework"])
         if parsed["errors"]:
             raise DatasetError("; ".join(f"line {error['line']}: {error['message']}" if error.get("line") else error["message"] for error in parsed["errors"]))
-        check = self.preflight(project, dataset, parsed["args"])
+        check = self.preflight(project, dataset, parsed["args"], folders)
         if check["errors"]:
             raise DatasetError("; ".join(check["errors"]))
         if check["warnings"] and not confirm:
@@ -1179,7 +1214,10 @@ class TrainingManager:
             workdir.mkdir(parents=True)
             now = time.strftime("%Y-%m-%dT%H:%M:%S")
             _write_json(workdir / "run.json", {"version": 1, "name": display, "notes": notes or "", "created": now, "source": "workbench", "framework": framework.id, "category": target.category, "task": TASKS[target.category], "base_model": framework.base_model(parsed["args"]), "created_by": identity.who()})
-            _write_json(workdir / "spec.json", {"version": 1, "framework": framework.id, "args": parsed["args"], "resume": False})
+            spec = {"version": 1, "framework": framework.id, "args": parsed["args"], "resume": False}
+            if folders is not None:
+                spec["folders"] = folders
+            _write_json(workdir / "spec.json", spec)
             self._write_state(run_dir, replace=True, status="queued", phase="queued", queued_at=time.time())
             self._queue["queue"].append({"project": project, "dir": directory})
             self._save_queue()

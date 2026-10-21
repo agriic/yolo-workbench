@@ -2,7 +2,8 @@
 // (a value equal to the framework's default is dropped, so only real choices are kept), and the
 // raw YAML mode round-trips through the server's validator (POST /training/args/validate).
 // The framework (Ultralytics YOLO or RF-DETR) follows `model:` — an RF-DETR variant such as
-// rfdetr-medium — and decides the fields, the defaults and the model picker.
+// rfdetr-medium — and decides the fields, the defaults and the model picker. The Training data panel
+// limits the run to some of the dataset's split folders (not part of the args: sent as `folders`).
 import { $, api, esc, debounce } from "./api.js";
 import { state } from "./state.js";
 import { augmentationArgChanged, augmentationHtml, mountAugmentations } from "./augments.js";
@@ -130,6 +131,7 @@ let options = null;   // GET /training/options
 let args = {};        // the run's arguments (non-default values + model)
 let mode = "gui";     // "gui" | "raw"
 let modelSource = "pretrained";
+let folders = null;   // {split: [folder]} the run trains on; null = the whole dataset
 let check = { errors: [], warnings: [], notes: [], splits: null, argErrors: [] };
 let checkToken = 0;
 let queueAhead = 0;
@@ -192,9 +194,11 @@ export async function openRunForm(source = {}) {
     let name = loaded.next_name;
     let notes = "";
     Object.keys(argsByFramework).forEach(key => delete argsByFramework[key]);
+    folders = null;
     if (source.runId) {
       const copied = await api(`/training/runs/${encodeURIComponent(source.runId)}/args`);
       args = { ...copied.args };
+      folders = fitFolders(copied.folders);
       name = copied.name;
       if (source.from === "finetune") {
         const run = loaded.runs.find(item => item.id === source.runId);
@@ -274,6 +278,7 @@ function renderForm(name, notes, source) {
           <label class="field grow-2">Notes<input id="run-notes" type="text" value="${esc(notes)}" placeholder="What this experiment tries"></label>
         </div>
       </div>
+      <div id="form-data" class="stats-panel form-panel"></div>
       <div id="form-gui"></div>
       <div id="form-raw" hidden>
         <div class="stats-panel form-panel">
@@ -287,6 +292,7 @@ function renderForm(name, notes, source) {
         <button type="submit" class="primary-btn" id="run-form-submit">Start</button>
       </div>
     </form>`;
+  renderFolders();
   renderGui();
   const form = $("run-form");
   form.addEventListener("submit", e => { e.preventDefault(); submit(); });
@@ -304,6 +310,50 @@ function subtitleText() {
 const rawHelp = () => framework() === "rfdetr"
   ? "One <code>key: value</code> per line: RF-DETR's training arguments, plus <code>model</code> (the variant), <code>pretrain_weights</code>, <code>resolution</code> and <code>device</code>. <code>dataset_dir</code> and <code>output_dir</code> are set by the workbench."
   : "One <code>key: value</code> per line, as in <code>args.yaml</code>. <code>data</code>, <code>project</code> and <code>name</code> are set by the workbench.";
+
+// ---------- training data: the split folders the run trains on ----------
+
+const SPLITS = ["train", "val", "test"];
+const folderItems = () => (options.folders ?? []).filter(item => SPLITS.includes(item.split));
+const folderChosen = item => folders === null || (folders[item.split] ?? []).includes(item.path);
+const foldersSummary = () => folders === null
+  ? "All folders"
+  : `${folderItems().filter(folderChosen).length} of ${folderItems().length} folders <button type="button" class="link-btn" data-all-folders>Use all</button>`;
+
+// a copied run's folders that still exist; all of them → null (the whole dataset)
+function fitFolders(selection) {
+  if (!selection) return null;
+  const kept = {};
+  for (const item of folderItems()) if ((selection[item.split] ?? []).includes(item.path)) (kept[item.split] ??= []).push(item.path);
+  return folderItems().every(item => (kept[item.split] ?? []).includes(item.path)) ? null : kept;
+}
+
+function renderFolders() {
+  const el = $("form-data");
+  const items = folderItems();
+  // with one folder per split there is nothing to choose (unless a copied run used a subset)
+  el.hidden = folders === null && !SPLITS.some(split => items.filter(item => item.split === split).length > 1);
+  if (el.hidden) { el.innerHTML = ""; return; }
+  el.innerHTML = `
+    <div class="panel-head"><h2>Training data</h2><span class="muted" id="folders-summary">${foldersSummary()}</span></div>
+    <div class="train-folders">
+      ${SPLITS.filter(split => items.some(item => item.split === split)).map(split => `
+        <div class="train-folder-split"><span class="split-badge">${split}</span>
+          ${items.filter(item => item.split === split).map(item => `<label class="toggle train-folder" title="${esc(item.path)}">
+            <input type="checkbox" data-train-split="${esc(split)}" data-train-folder="${esc(item.path)}" ${folderChosen(item) ? "checked" : ""}>
+            <code>${esc(item.path)}</code><span class="muted">${item.images.toLocaleString()}</span></label>`).join("")}
+        </div>`).join("")}
+    </div>
+    <p class="panel-note">The run trains, validates and tests only on the images in the ticked folders.</p>`;
+}
+
+function readFolders() {
+  const boxes = [...$("form-data").querySelectorAll("input[data-train-folder]")];
+  if (boxes.every(box => box.checked)) return null;
+  const selection = {};
+  for (const box of boxes) if (box.checked) (selection[box.dataset.trainSplit] ??= []).push(box.dataset.trainFolder);
+  return selection;
+}
 
 function renderGui() {
   const changed = group => fields().filter(field => field.group === group && field.key in args).length;
@@ -508,6 +558,11 @@ function onInput(e) {
 
 async function onChange(e) {
   const target = e.target;
+  if (target.matches("input[data-train-folder]")) {
+    folders = readFolders();
+    $("folders-summary").innerHTML = foldersSummary();
+    return scheduleCheck();
+  }
   if (target.name === "form-mode") return switchMode(target.value, target);
   if (target.name === "framework") return switchFramework(target.value);
   if (target.name === "model-source" && framework() === "rfdetr") {
@@ -559,6 +614,11 @@ async function onChange(e) {
 }
 
 function onClick(e) {
+  if (e.target.closest("[data-all-folders]")) {
+    folders = null;
+    renderFolders();
+    return scheduleCheck(0);
+  }
   const remove = e.target.closest("[data-remove-arg]");
   if (remove) {
     delete args[remove.dataset.removeArg];
@@ -627,7 +687,7 @@ const runCheck = async () => {
   try {
     const [validation, preflight] = await Promise.all([
       api("/training/args/validate", { method: "POST", body: JSON.stringify({ yaml }) }),
-      api("/training/preflight", { method: "POST", body: JSON.stringify({ yaml }) }),
+      api("/training/preflight", { method: "POST", body: JSON.stringify({ yaml, folders }) }),
     ]);
     if (token !== checkToken || !$("run-form")) return;
     check = { ...preflight, argErrors: validation.errors.concat(validation.warnings.map(item => ({ ...item, warning: true }))) };
@@ -687,7 +747,7 @@ async function submit() {
   try {
     const result = await api("/training/runs", {
       method: "POST",
-      body: JSON.stringify({ name, notes: $("run-notes").value.trim(), yaml: currentYaml(), confirm: check.warnings.length > 0 }),
+      body: JSON.stringify({ name, notes: $("run-notes").value.trim(), yaml: currentYaml(), confirm: check.warnings.length > 0, folders }),
     });
     if (!result.queued) {
       // new warnings since the last check (e.g. the dataset changed): show them and let the user confirm

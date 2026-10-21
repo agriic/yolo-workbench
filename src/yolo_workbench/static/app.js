@@ -130,6 +130,7 @@ function renderMetaControls() {
     select.innerHTML = `<option value="all">All splits</option>` + Object.keys(meta.split_counts).map(split => `<option>${esc(split)}</option>`).join("");
     select.value = [...select.options].some(option => option.value === previous) ? previous : "all";
   }
+  renderFolderFilter();
   // move targets are split folders; the folder is only spelled out when a split has several
   const folders = meta.capabilities.folders || {};
   $("image-move-split").innerHTML = meta.capabilities.splits.map(split => (folders[split] || []).map(folder =>
@@ -139,6 +140,21 @@ function renderMetaControls() {
   renderReviewerFilter();
   if (imageGallery) imageGallery.emptyMessage = imageEmptyMessage();
   renderManageMeta();
+}
+
+// "Folder": the split folders of the chosen split (all splits: grouped by split); shown when a split has several
+function renderFolderFilter() {
+  const select = $("image-folder");
+  const folders = state.meta.capabilities.folders || {};
+  const split = $("image-split").value;
+  const splits = Object.keys(folders).filter(name => split === "all" || name === split);
+  const options = name => folders[name].map(path => `<option value="${esc(path)}">${esc(path)}</option>`).join("");
+  const previous = select.value;
+  select.innerHTML = `<option value="">All folders</option>` + (split === "all"
+    ? splits.map(name => `<optgroup label="${esc(name)}">${options(name)}</optgroup>`).join("")
+    : splits.map(options).join(""));
+  select.value = [...select.options].some(option => option.value === previous) ? previous : "";
+  $("image-folder-field").hidden = !Object.values(folders).some(paths => paths.length > 1) && !select.value;
 }
 
 // "Reviewed by": the people whose review statuses the images have (with sign-in), you first
@@ -306,7 +322,8 @@ function renderShortcuts() {
 
 function bind() {
   document.querySelectorAll(".tab").forEach(button => button.onclick = () => showTab(button.dataset.tab));
-  [$("image-split"), $("image-class"), $("filter-predictions"), $("image-review"), $("image-reviewer"), $("image-issues")].forEach(el => el.onchange = () => loadImages({ reset: true }));
+  [$("image-folder"), $("image-class"), $("filter-predictions"), $("image-review"), $("image-reviewer"), $("image-issues")].forEach(el => el.onchange = () => loadImages({ reset: true }));
+  $("image-split").onchange = () => { renderFolderFilter(); loadImages({ reset: true }); };
   $("refresh-activity").onclick = loadActivity;
   $("start-review").onclick = () => openNextUnreviewed(0);
   $("image-review-done").onclick = () => reviewSelection("done");
@@ -316,7 +333,8 @@ function bind() {
   $("image-search").oninput = debounce(() => loadImages({ reset: true }), 250);
   [$("label-min"), $("label-max")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
   $("image-filters-reset").onclick = () => {
-    for (const [id, value] of [["image-split", "all"], ["image-class", ""], ["image-review", ""], ["image-reviewer", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
+    for (const [id, value] of [["image-split", "all"], ["image-folder", ""], ["image-class", ""], ["image-review", ""], ["image-reviewer", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
+    renderFolderFilter();
     $("filter-predictions").checked = false;
     loadImages({ reset: true });
   };
@@ -670,6 +688,7 @@ function setupVirtualGalleries() {
 // The Annotation tab's filters as query parameters (the image list and "next unreviewed" share them).
 function imageFilterParams() {
   const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value });
+  if ($("image-folder").value) params.set("folder", $("image-folder").value);
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   if ($("filter-predictions").checked) params.set("has_predictions", "true");
   if ($("image-review").value) params.set("review", $("image-review").value);

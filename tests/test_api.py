@@ -78,6 +78,33 @@ def test_images_endpoint_filters_by_label_count(tmp_path):
 
     asyncio.run(run())
 
+def test_images_endpoint_filters_by_folder(tmp_path):
+    root = tmp_path / "ds"
+    for folder, count in (("images/a", 2), ("images/b", 3), ("images/val", 1), ("extra", 1)):
+        (root / folder).mkdir(parents=True)
+        for index in range(count):
+            Image.new("RGB", (16, 16)).save(root / folder / f"{folder.replace('/', '-')}-{index}.jpg")
+    (root / "listed.txt").write_text("extra/extra-0.jpg\n")
+    (root / "data.yaml").write_text("train: [images/a, images/b, listed.txt]\nval: images/val\nnames: [cat]\n")
+    dataset = Dataset(root / "data.yaml", "detection")
+    assert dataset.capabilities()["folders"] == {"train": ["images/a", "images/b"], "val": ["images/val"]}
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=make_app(dataset, tmp_path)), base_url="http://test") as client:
+            async def names(**params):
+                return sorted(item["name"] for item in (await client.get("/api/v1/images", params={"limit": 50, **params})).json()["items"])
+
+            assert await names(folder="images/b") == ["images-b-0.jpg", "images-b-1.jpg", "images-b-2.jpg"]
+            assert await names(folder="images/b", search="-1") == ["images-b-1.jpg"]
+            assert await names(folder="images/b", split="val") == []
+            assert await names(folder="images/missing") == []
+            assert len(await names(folder="")) == 7  # a .txt list's image is in no folder, but listed without the filter
+            following = (await client.get("/api/v1/images/next-unreviewed", params={"folder": "images/a"})).json()
+            assert following["total"] == 2 and following["item"]["name"] == "images-a-0.jpg"
+
+    asyncio.run(run())
+
+
 def test_image_and_object_endpoints_support_random_access_slices(tmp_path):
     dataset, _ = make_dataset(tmp_path)
     split = tmp_path / "train"

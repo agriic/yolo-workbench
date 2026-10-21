@@ -231,11 +231,20 @@ class TrainingArgsPayload(BaseModel):
     yaml: str = ""
 
 
+# the split folders a run trains on, as the dataset's folder list names them; None = the whole dataset
+TrainingFolders = dict[Literal["train", "val", "test"], list[str]] | None
+
+
+class TrainingPreflightPayload(TrainingArgsPayload):
+    folders: TrainingFolders = None
+
+
 class TrainingStartPayload(BaseModel):
     name: str = ""
     notes: str = ""
     yaml: str
     confirm: bool = False  # start despite preflight warnings
+    folders: TrainingFolders = None
 
 
 class TrainingRunUpdatePayload(BaseModel):
@@ -347,10 +356,10 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def statistics(session: DatasetSession = current):
         return session.dataset.statistics()
 
-    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, session: DatasetSession = current) -> dict:
+    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, session: DatasetSession = current) -> dict:
         """The gallery filters, shared by the image list and "next unreviewed"."""
         prediction_ids = session.predictor.pending_image_ids() if has_predictions else None
-        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None, "reviewer": reviewer or None}
+        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None, "reviewer": reviewer or None, "folder": folder or None}
 
     @router.get("/images")
     def images(filters: dict = Depends(image_filters), offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
@@ -785,8 +794,8 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         return training.validate(session.slug, payload.yaml)
 
     @router.post("/training/preflight")
-    def training_preflight(payload: TrainingArgsPayload, session: DatasetSession = current):
-        return training.preflight(session.slug, session.dataset, training.validate(session.slug, payload.yaml)["args"])
+    def training_preflight(payload: TrainingPreflightPayload, session: DatasetSession = current):
+        return training.preflight(session.slug, session.dataset, training.validate(session.slug, payload.yaml)["args"], payload.folders)
 
     @router.get("/training/augment/original")
     def augment_original(sample: int = Query(0, ge=0), imgsz: int = Query(640, ge=32, le=4096), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
@@ -823,7 +832,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/training/runs")
     def training_start(payload: TrainingStartPayload, session: DatasetSession = current):
-        return training.enqueue(session.slug, session.dataset, payload.name, payload.notes, payload.yaml, payload.confirm)
+        return training.enqueue(session.slug, session.dataset, payload.name, payload.notes, payload.yaml, payload.confirm, payload.folders)
 
     @router.get("/training/runs/{run_id}")
     def training_run(run_id: str, session: DatasetSession = current):

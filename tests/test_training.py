@@ -464,6 +464,53 @@ def test_preflight_rejects_labels_ultralytics_cannot_find(tmp_path):
     assert any("would not find the labels of 2" in error for error in check["errors"])
 
 
+def test_a_run_trains_on_the_chosen_folders_only(tmp_path):
+    dataset = make_dataset(tmp_path)
+    root = dataset.root
+    (root / "images" / "extra").mkdir()
+    (root / "labels" / "extra").mkdir()
+    Image.new("RGB", (32, 32), "white").save(root / "images" / "extra" / "extra0.jpg")
+    (root / "labels" / "extra" / "extra0.txt").write_text("0 0.5 0.5 0.2 0.2\nbroken line\n")
+    config = yaml.safe_load((root / "data.yaml").read_text())
+    config["train"] = ["images/train", "images/extra"]
+    (root / "data.yaml").write_text(yaml.safe_dump(config))
+    dataset = Dataset(root / "data.yaml", "detection")
+    launcher = FakeLauncher()
+    manager = make_manager(dataset, tmp_path, launcher)
+
+    listed = manager.options(None, dataset)["folders"]
+    assert [(item["split"], item["path"], item["images"]) for item in listed] == [("train", "images/train", 2), ("train", "images/extra", 1), ("val", "images/val", 2), ("test", "images/test", 2)]
+    assert any("1 validation error" in warning for warning in manager.preflight(None, dataset)["warnings"])
+    chosen = {"train": ["images/train"], "val": ["images/val"]}
+    check = manager.preflight(None, dataset, folders=chosen)
+    assert check["splits"] == {"train": 2, "val": 2, "test": 0}
+    assert check["errors"] == [] and check["warnings"] == []  # the broken label is in a folder left out
+    assert "Training on 2 of 4 folders; 3 image(s) left out" in check["notes"]
+    assert manager.preflight(None, dataset, folders={"train": ["images/train", "images/gone"], "val": ["images/val"]})["errors"] == ["No longer a folder of the dataset: images/gone (train)"]
+    assert "Choose at least one folder to train on" in manager.preflight(None, dataset, folders={})["errors"]
+
+    run = manager.enqueue(None, dataset, "Subset", "", ARGS, folders=chosen)["run"]
+    run_dir = Path(run["path"])
+    assert run["folders"] == chosen
+    spec = json.loads((run_dir / "workbench" / "spec.json").read_text())
+    data = yaml.safe_load(Path(spec["args"]["data"]).read_text())
+    assert Path(data["train"]).read_text().splitlines() == [str(root / "images" / "train" / name) for name in ("train0.jpg", "train1.jpg")]
+    assert "test" not in data and spec["test_eval"] is None
+    meta = json.loads((run_dir / "workbench" / "run.json").read_text())
+    assert meta["dataset"]["folders"] == chosen and meta["dataset"]["splits"] == {"train": 2, "val": 2, "test": 0}
+    assert manager.copy_args(None, run["id"])["folders"] == chosen
+
+    # a resume trains on the same folders, even after images were added to one left out
+    runner_finishes(run_dir, status="paused", epochs=2)
+    launcher.handle.code = 0
+    manager.tick()
+    Image.new("RGB", (32, 32), "white").save(root / "images" / "extra" / "extra1.jpg")
+    dataset.rescan()
+    manager.resume(None, run["id"])
+    spec = json.loads((run_dir / "workbench" / "spec.json").read_text())
+    assert spec["folders"] == chosen and len(Path(yaml.safe_load(Path(spec["args"]["data"]).read_text())["train"]).read_text().splitlines()) == 2
+
+
 def test_classification_trains_on_the_root_folder(tmp_path):
     root = tmp_path / "cls"
     for split in ("train", "val"):
@@ -481,6 +528,8 @@ def test_classification_trains_on_the_root_folder(tmp_path):
     spec = json.loads((run_dir / "workbench" / "spec.json").read_text())
     assert spec["args"]["data"] == str(root) and spec["test_eval"] is None and spec["cache_files"] == []
     assert len(Dataset(root, "classification").images) == 4  # the runs folder is not a class
+    assert manager.options(None, dataset)["folders"] == []
+    assert "Classification runs train on every folder" in manager.preflight(None, dataset, folders={"train": ["train"]})["errors"][0]
 
 
 def test_external_runs_are_listed_and_extra_roots_filtered_by_dataset(tmp_path, monkeypatch):
@@ -928,6 +977,28 @@ def test_single_mode_training_api(tmp_path):
             assert response.status_code == 200 and response.json()["deleted"] == run["id"] and not Path(run["path"]).exists()
             assert (await client.get(f"/api/v1/training/runs/{run['id']}")).status_code == 404
             assert (await client.delete(f"/api/v1/training/runs/{run['id']}")).status_code == 404
+
+    asyncio.run(run())
+
+
+def test_training_api_takes_the_runs_folders(tmp_path):
+    dataset = make_dataset(tmp_path)
+    manager = make_manager(dataset, tmp_path)
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media"), training=manager)
+    chosen = {"train": ["images/train"], "val": ["images/val"]}
+
+    async def run():
+        async with client_for(app) as client:
+            options = (await client.get("/api/v1/training/options")).json()
+            assert [item["path"] for item in options["folders"]] == ["images/train", "images/val", "images/test"]
+            check = (await client.post("/api/v1/training/preflight", json={"yaml": ARGS, "folders": chosen})).json()
+            assert check["splits"] == {"train": 2, "val": 2, "test": 0}
+            assert (await client.post("/api/v1/training/preflight", json={"yaml": ARGS})).json()["splits"] == {"train": 2, "val": 2, "test": 2}
+            assert (await client.post("/api/v1/training/preflight", json={"yaml": ARGS, "folders": {"extra": ["images/train"]}})).status_code == 422
+            run = (await client.post("/api/v1/training/runs", json={"yaml": ARGS, "folders": chosen})).json()["run"]
+            assert run["folders"] == chosen
+            assert (await client.get(f"/api/v1/training/runs/{run['id']}")).json()["folders"] == chosen
+            assert (await client.get(f"/api/v1/training/runs/{run['id']}/args")).json()["folders"] == chosen
 
     asyncio.run(run())
 

@@ -1,6 +1,7 @@
 import json
 import asyncio
 import threading
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -9,9 +10,12 @@ from PIL import Image
 from test_dataset import make_dataset
 from yolo_workbench.dataset import Dataset, DatasetError
 from yolo_workbench.embeddings import EmbeddingsManager
+from yolo_workbench.jobs import JobManager
 from yolo_workbench.media_cache import MediaCache
 from yolo_workbench.predictor import PredictorManager
+from yolo_workbench.runtime import RUNTIME
 from yolo_workbench.web import create_app
+from yolo_workbench.workspace import Workspace
 
 
 class FakeBackend:
@@ -482,6 +486,38 @@ def test_discover_scans_directories_of_recent_models(tmp_path, tmp_path_factory)
     found = manager.discover_models()["items"]
     assert found[0]["path"] == loaded.resolve().as_posix()
     assert any(item["path"] == (outside / "sibling.pt").resolve().as_posix() for item in found)
+
+
+def test_discover_scans_the_working_directory_unless_turned_off(tmp_path, tmp_path_factory, monkeypatch):
+    dataset, _, manager, _ = make_predictor(tmp_path)
+    cwd = tmp_path_factory.mktemp("cwd")
+    (cwd / "here.pt").write_bytes(b"fake")
+    monkeypatch.chdir(cwd)
+    assert any(item["name"] == "here.pt" for item in manager.discover_models()["items"])
+    monkeypatch.setattr(RUNTIME, "scan_cwd_for_models", False)  # the server
+    assert not any(item["name"] == "here.pt" for item in manager.discover_models()["items"])
+
+
+def test_a_projects_models_stay_inside_the_project(tmp_path, monkeypatch):
+    workspace = Workspace(tmp_path / "projects", jobs=JobManager(synchronous=True), background_probe=False)
+    for name in ("Alpha", "Beta"):
+        slug = workspace.create(name, "detection", ["cat"])["slug"]
+        (workspace.root / slug / "models").mkdir(exist_ok=True)
+        (workspace.root / slug / "models" / f"{slug}.pt").write_bytes(b"fake")
+        (workspace.root / slug / "runs" / "exp" / "weights").mkdir(parents=True)
+        (workspace.root / slug / "runs" / "exp" / "weights" / "best.pt").write_bytes(b"fake")
+    (workspace.root / "loose.pt").write_bytes(b"fake")
+    monkeypatch.chdir(workspace.root)  # `yolo-workbench --projects .`
+    alpha = workspace.session("alpha").predictor
+
+    def listed():
+        return {Path(item["path"]).relative_to(workspace.root.resolve()).as_posix() for item in alpha.discover_models()["items"]}
+
+    assert listed() == {"alpha/models/alpha.pt", "alpha/runs/exp/weights/best.pt"}
+    # a model of another project loaded here is listed, but not the rest of its folder
+    alpha._remember_model(str(workspace.root / "beta" / "models" / "beta.pt"))
+    (workspace.root / "beta" / "models" / "other.pt").write_bytes(b"fake")
+    assert listed() == {"alpha/models/alpha.pt", "alpha/runs/exp/weights/best.pt", "beta/models/beta.pt"}
 
 
 def test_discover_lists_trained_runs_by_name(tmp_path):

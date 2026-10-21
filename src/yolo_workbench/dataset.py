@@ -368,8 +368,10 @@ class Dataset:
         return folder.relative_to(self.root).as_posix() if folder.is_relative_to(self.root) else str(folder)
 
     def _folder_of(self, record: ImageRecord) -> Path | None:
+        # a string prefix test: Path.is_relative_to takes seconds over 100k images (gallery filter, folder counts)
+        path = os.path.normcase(record.path)
         for folder in self._split_folders.get(record.split, []):
-            if record.path.is_relative_to(folder):
+            if path.startswith(os.path.normcase(os.path.join(folder, ""))):
                 return folder
         return None
 
@@ -1211,24 +1213,25 @@ class Dataset:
             item.pop("score", None)
         return outliers[:100]
 
-    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None) -> dict:
+    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None) -> dict:
         with self._lock:
-            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer)
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer, folder)
             return {"total": len(records), "items": [{**record.summary(), "v": self._revisions.get(record.label_path, 0)} for record in records[offset : offset + limit]]}
 
-    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None) -> dict:
+    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None) -> dict:
         """The first unreviewed image at or after `start` in the filtered list (wrapping around), with its position."""
         with self._lock:
-            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer)
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer, folder)
             start = min(max(0, start), len(records))
             for index in [*range(start, len(records)), *range(start)]:
                 if records[index].review is None:
                     return {"index": index, "total": len(records), "item": records[index].summary()}
             return {"index": None, "total": len(records), "item": None}
 
-    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer=None) -> list[ImageRecord]:
+    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer=None, folder=None) -> list[ImageRecord]:
         """The gallery's filters, in gallery order. review: done / needs_work / unreviewed; issue: any / none / an
-        issue kind; reviewer: a user name (whose review status the image has)."""
+        issue kind; reviewer: a user name (whose review status the image has); folder: a split folder as
+        folder_label shows it (images of .txt lists are in none)."""
         allowed: set[str] | None = None
         if split != "all":
             allowed = set(self._split_image_ids.get(split, set()))
@@ -1238,6 +1241,9 @@ class Dataset:
         if prediction_ids is not None:
             allowed = set(prediction_ids) if allowed is None else allowed & prediction_ids
         records = [self.images[image_id] for image_id in self._sorted_image_ids if allowed is None or image_id in allowed]
+        if folder:
+            wanted = {candidate for candidate in self._all_folders() if self.folder_label(candidate) == folder}
+            records = [record for record in records if self._folder_of(record) in wanted]
         if search:
             query = search.casefold()
             records = [record for record in records if query in record.name_cf]

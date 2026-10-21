@@ -564,6 +564,10 @@ function destroyCharts() {
   charts = null;
 }
 
+// a run limited to some split folders: "train images/a, images/b · val images/val"
+const foldersText = folders => ["train", "val", "test"].filter(split => folders[split]?.length)
+  .map(split => `${split} ${folders[split].map(path => `<code>${esc(path)}</code>`).join(", ")}`).join(" · ") || "none";
+
 function renderDetailSkeleton() {
   destroyCharts();
   const run = detail;
@@ -577,6 +581,7 @@ function renderDetailSkeleton() {
         <h1>${esc(run.name)} ${pill(run.status)} ${run.source === "external" ? `<span class="split-badge" title="Made outside the workbench">external</span>` : ""}</h1>
         <p class="section-subtitle">${facts.map(esc).join(" · ")}</p>
         <p class="section-subtitle"><code title="Run folder">${esc(run.path)}</code></p>
+        ${run.folders ? `<p class="section-subtitle" title="The run trains only on these split folders">Folders: ${foldersText(run.folders)}</p>` : ""}
       </div>
       <div class="run-actions" id="run-actions"></div>
     </div>

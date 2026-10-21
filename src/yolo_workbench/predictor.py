@@ -20,6 +20,7 @@ from .dataset import Dataset, DatasetError
 from .imaging import upright_rgb
 from .masks import drop_specks, mask_outlines, simplify_polygon
 from .models import ImageRecord
+from .runtime import RUNTIME
 
 log = logging.getLogger(__name__)
 
@@ -247,8 +248,11 @@ class PredictorManager:
     Dataset.replace_annotations, so backups, undo, and conflict detection all apply.
     """
 
-    def __init__(self, dataset: Dataset, backend_factory=None):
+    def __init__(self, dataset: Dataset, backend_factory=None, project_only: bool = False):
         self.dataset = dataset
+        # projects mode: model discovery stays inside the project's folder (the working directory or a recent
+        # model's directory may be the projects folder, or another project's)
+        self.project_only = project_only
         self._backend_factory = backend_factory or self._default_factory
         self._available = (backend_factory is not None or ultralytics_available() or rfdetr_available()) and dataset.category != "classification"
         self._lock = threading.Lock()
@@ -558,7 +562,8 @@ class PredictorManager:
         return {path: label for _, path, label in sorted(found, key=lambda item: item[0], reverse=True)}
 
     def discover_models(self) -> dict:
-        """Recently used models first, then this dataset's trained runs, then .pt files found near the dataset, cwd, and recents' directories."""
+        """Recently used models first, then this dataset's trained runs, then .pt files found near the dataset, cwd, and recents' directories
+        (a project: only inside its own folder)."""
         items: list[dict] = []
         seen: set[Path] = set()
         trained = self._trained_models()
@@ -585,8 +590,12 @@ class PredictorManager:
             add(Path(recent), "recent")
         for path in trained:
             add(path, "run")
-        # also scan the directories models were previously loaded from
-        roots = {self.dataset.root, Path.cwd()} | {Path(recent).parent for recent in recents}
+        roots = {self.dataset.root}
+        if not self.project_only:
+            # also scan the working directory and the directories models were previously loaded from
+            roots |= {Path(recent).parent for recent in recents}
+            if RUNTIME.scan_cwd_for_models:
+                roots.add(Path.cwd())
         found: list[Path] = []
         for root in roots:
             found.extend(self._scan(root))

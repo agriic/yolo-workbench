@@ -1223,6 +1223,13 @@ dialog.plot-dialog { width: min(1200px, calc(100vw - 32px)); }
 .form-group[open] > summary::before { content: "▾"; }
 .form-group > summary h2 { display: inline; }
 .changed-count { font-size: 12px; color: var(--accent-strong); font-weight: 500; }
+.train-folders { display: grid; gap: 6px; }
+.train-folder-split { display: flex; flex-wrap: wrap; align-items: center; gap: 0 18px; min-width: 0; }
+.train-folder-split .split-badge { min-width: 52px; text-align: center; }
+.train-folder { height: 30px; max-width: 100%; min-width: 0; }
+.train-folder code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.train-folder .muted { font-size: 12px; }
+.train-folders + .panel-note { margin: 8px 0 0; }
 .model-source { margin-bottom: 12px; }
 .model-source input:disabled + span { opacity: .45; cursor: default; }
 .model-row { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 18px; }
