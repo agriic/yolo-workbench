@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from . import frameworks, libraries
+from . import frameworks, identity, libraries
 from .dataset import Dataset, DatasetError
 from .imaging import upright_rgb
 from .masks import drop_specks, mask_outlines, simplify_polygon
@@ -33,11 +33,25 @@ def rfdetr_available() -> bool:
 
 
 def free_gpu_memory() -> None:
-    """Hand the memory of dropped models back to the GPU (only when torch is already loaded)."""
+    """Hand the memory of dropped models back to the GPU (only when torch is already loaded), and the freed
+    heap back to the operating system: glibc keeps it otherwise, so loading and unloading models (SAM, a
+    prediction model, around every training run) would grow a long-running server's memory."""
     gc.collect()
     torch = sys.modules.get("torch")
     if torch is not None and torch.cuda.is_available():
         torch.cuda.empty_cache()
+    _trim_heap()
+
+
+def _trim_heap() -> None:
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # not glibc (e.g. musl): nothing to trim
 
 
 MODEL_EXTENSIONS = {".pt", ".pth"}
@@ -250,6 +264,7 @@ class PredictorManager:
         self.backend = None
         self.model_path: str | None = None
         self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU, or it sat idle)
+        self.loaded_by: dict | None = None  # who loaded the model ({name, display_name}, with sign-in)
         self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
         self.last_used = time.monotonic()  # for the idle unload (and least-recently-used unload across projects)
         self.conf = 0.25
@@ -315,6 +330,7 @@ class PredictorManager:
                 "iou": self.iou,
                 "max_points": self.max_points,
                 "unloaded": self.unloaded,
+                "loaded_by": self.loaded_by if self.backend else None,
                 "mapping": {str(key): value for key, value in self.mapping.items()},
                 "job": job,
                 "pending": {image_id: len(items) for image_id, items in self.predictions.items() if items},
@@ -357,6 +373,7 @@ class PredictorManager:
                 raise DatasetError(self.unloaded or "The model was unloaded while loading")
             self.backend = backend
             self.unloaded = None
+            self.loaded_by = identity.who()
             self.model_path = model_path.as_posix()
             if conf is not None:
                 self.conf = conf
@@ -585,6 +602,7 @@ class PredictorManager:
                 raise DatasetError(f"{self.external_busy}; wait for it to finish")
             records = self._select(image_ids, split, only_unlabeled)
             self.job = self._new_job("running", len(records))
+            self.job["started_by"] = identity.who()  # the predictions are shared: everyone sees who ran the batch
             self._failed_image_ids = []
             self._cancel_event.clear()
             self.last_used = time.monotonic()

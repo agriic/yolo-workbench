@@ -75,6 +75,9 @@ class ServerConfig:
     # [projects]
     max_open_projects: int = _setting(4, "projects", "int", minimum=1)
     project_idle_close_min: float = _setting(60.0, "projects", "float")  # 0 keeps idle projects open
+    # [auth]
+    auth_enabled: bool = _setting(True, "auth", "bool", key="enabled")  # sign-in with the accounts of `yolo-workbench-server user`
+    session_days: float = _setting(30.0, "auth", "float", minimum=0.01)  # a sign-in lasts this long after its last use
     # [embeddings]
     embeddings_enabled: bool = _setting(True, "embeddings", "bool", key="enabled")
     mongodb_uri: str | None = _setting(None, "embeddings", "str")
@@ -190,8 +193,9 @@ def _read_file(path: Path) -> dict[str, object]:
     return values
 
 
-def load_config(path: Path | None = None, overrides: dict | None = None, environ=None) -> ServerConfig:
-    """The validated configuration from file, environment, and CLI overrides (None values are ignored)."""
+def load_config(path: Path | None = None, overrides: dict | None = None, environ=None, serving: bool = True) -> ServerConfig:
+    """The validated configuration from file, environment, and CLI overrides (None values are ignored).
+    serving=False (commands that only need the projects folder) skips the checks of how the server listens."""
     environ = os.environ if environ is None else environ
     values: dict[str, object] = {}
     if path is not None:
@@ -208,13 +212,15 @@ def load_config(path: Path | None = None, overrides: dict | None = None, environ
         if value is not None:
             values[name] = _coerce(name, value, Path.cwd())
     config = ServerConfig(**values)
-    validate(config)
+    validate(config, serving)
     return config
 
 
-def validate(config: ServerConfig) -> None:
+def validate(config: ServerConfig, serving: bool = True) -> None:
     if config.projects_root is None:
         raise ConfigError("Set the projects folder: [server] projects_root in the config file, WORKBENCH_PROJECTS_ROOT, or --projects")
+    if not serving:
+        return
     if config.port > 65535:
         raise ConfigError("`port` must be at most 65535")
     if config.wildcard_bind and not config.allowed_hosts:

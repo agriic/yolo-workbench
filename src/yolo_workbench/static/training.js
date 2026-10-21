@@ -3,6 +3,7 @@
 // (training.py); this module only polls it.
 import { $, api, apiUrl, esc, formatBytes } from "./api.js";
 import { state } from "./state.js";
+import { personName } from "./collab.js";
 import { LineChart, formatValue } from "./charts.js";
 import { configureRunForm, loadTrainingOptions, openRunForm, trainingOptions } from "./trainform.js";
 import { MAX_COMPARE, bestEpochRow, destroyCompare, renderCompare, shortModel } from "./compare.js";
@@ -190,7 +191,7 @@ function renderRunList() {
       <span class="run-item-meta">${esc(modelName(run.model))}${run.imgsz ? ` · ${esc(run.imgsz)}px` : ""} · ${run.status === "queued" ? `#${run.queue_position} in queue` : `${run.epochs_done}/${esc(run.epochs ?? "?")} ep`}</span>
       ${metric !== undefined ? `<span class="run-item-metric"><strong>${formatValue(metric)}</strong> ${esc(primaryLabel())} <span class="muted">★${run.best_epoch}</span>${test !== undefined ? ` · test <strong>${formatValue(test)}</strong>` : ""}</span>` : ""}
       ${progress !== null ? `<span class="run-item-progress"><span style="width:${(progress * 100).toFixed(1)}%"></span></span>` : ""}
-      <span class="run-item-time">${esc(relativeTime(run.created))}</span>
+      <span class="run-item-time">${esc(relativeTime(run.created))}${run.created_by && run.created_by.name !== state.user?.name ? ` · ${esc(personName(run.created_by))}` : ""}</span>
     </button></div>`;
   }).join("");
   renderCompareBar();
@@ -569,7 +570,7 @@ function renderDetailSkeleton() {
   const created = run.created ? new Date(run.created).toLocaleString() : "";
   // a fine-tuned RF-DETR run's model is the previous run's weights: its variant says which architecture
   const variant = isRfdetr(run) && run.variant && modelName(run.model) !== run.variant ? run.variant : null;
-  const facts = [modelName(run.model), variant, run.imgsz && `${isRfdetr(run) ? "resolution" : "imgsz"} ${run.imgsz}`, run.batch !== undefined && run.batch !== null && `batch ${run.batch}`, created].filter(Boolean);
+  const facts = [modelName(run.model), variant, run.imgsz && `${isRfdetr(run) ? "resolution" : "imgsz"} ${run.imgsz}`, run.batch !== undefined && run.batch !== null && `batch ${run.batch}`, created, run.created_by && `by ${personName(run.created_by)}`].filter(Boolean);
   $("run-detail").innerHTML = `
     <div class="run-head">
       <div class="run-title">

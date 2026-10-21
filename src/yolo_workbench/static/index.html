@@ -57,6 +57,7 @@
                   <label class="field">Split<select id="image-split"><option value="all">All splits</option></select></label>
                   <label class="field">Class<select id="image-class"><option value="">All classes</option></select></label>
                   <label class="field" title="Review status of the images">Review<select id="image-review"><option value="">All</option><option value="unreviewed">Unreviewed</option><option value="needs_work">Needs work</option><option value="done">Done</option></select></label>
+                  <label class="field" id="image-reviewer-field" title="Images whose review status this person set" hidden>Reviewed by<select id="image-reviewer"><option value="">Anyone</option></select></label>
                   <label class="field" title="Images with validation issues (see the Validation tab)">Issues<select id="image-issues"><option value="">All</option></select></label>
                   <div class="field" id="label-count-field" title="Number of labels per image (of the selected class, if one is chosen)">Labels<div class="count-range">
                     <input id="label-min" type="number" min="0" step="1" inputmode="numeric" placeholder="min" aria-label="Minimum labels">
@@ -266,6 +267,11 @@
             <p class="panel-note">Deleted images go to the dataset trash, and the first edit of each label file in a session is backed up. Ctrl+Z covers the current session; restore or delete earlier sessions here.</p>
             <div id="storage-list"></div>
           </article>
+          <article class="stats-panel manage-panel" id="activity-panel" hidden>
+            <div class="panel-head"><h2>Recent activity</h2><button id="refresh-activity" class="secondary mini" type="button">Refresh</button></div>
+            <p class="panel-note">Who changed what in this project, newest first. Everyone undoes only their own changes.</p>
+            <div id="activity-list" class="activity-list"></div>
+          </article>
         </div>
       </div>
     </section>
@@ -344,6 +350,7 @@
       <div class="editor-title-group">
         <button id="close-editor" class="icon-btn" title="Close (Esc)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
         <div class="editor-title-text"><span id="editor-position" title="Position in the image list (with the current filters) / images in the list" hidden></span><strong id="editor-title"></strong><span id="editor-subtitle"></span></div>
+        <span id="editor-people" class="editor-people" role="status" hidden></span>
       </div>
       <div class="toolbar">
         <div class="tool-group">
@@ -375,8 +382,10 @@
     <div class="editor-body">
       <div id="canvas-wrap"><canvas id="canvas"></canvas></div>
       <aside class="inspector">
+        <div id="editor-notice" class="editor-notice" role="alert" hidden></div>
         <div class="inspector-section grow">
           <h2><span>Annotations <span id="annotation-count"></span></span><button id="edit-label-text" class="link-btn" type="button" title="Edit the raw label file of this image">Edit file</button></h2>
+          <div id="editor-attribution" class="editor-attribution" hidden></div>
           <div id="label-warning" class="label-warning" hidden></div>
           <div id="annotation-list"></div>
         </div>

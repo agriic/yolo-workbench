@@ -93,7 +93,7 @@ async function saveLabelText() {
   const button = $("label-text-save");
   button.disabled = true;
   try {
-    const detail = await api(`/images/${imageId}/label-text`, { method: "PUT", body: JSON.stringify({ revision, text: $("label-text-input").value }) });
+    const detail = await api(`/images/${imageId}/label-text`, { method: "PUT", body: JSON.stringify({ revision, schema_generation: state.meta.schema_generation, text: $("label-text-input").value }) });
     $("label-text-dialog").close();
     const malformed = detail.issues.filter(issue => issue.kind === "malformed_label").length;
     deps.toast(malformed ? `Saved · ${malformed} line${malformed === 1 ? "" : "s"} still malformed — Ctrl+Z undoes` : "Label file saved — Ctrl+Z undoes", malformed ? "error" : "info");

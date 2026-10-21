@@ -3,7 +3,11 @@ export const state = {
   server: false,       // started by yolo-workbench-server
   features: { path_import: true, model_upload: true },  // from /api/v1/app
   project: null,       // project slug in projects mode
+  user: null,          // the signed-in user {name, display_name, admin}, or null without sign-in
   meta: null,
+  revision: 0,         // the dataset revision this page has seen (collab.js polls for later changes)
+  feed: null,          // which opening of the dataset `revision` counts in (a reopened project starts again)
+  presence: {},        // image id -> other people who have it open in their editor
   imageSelection: new Map(),  // image id -> image item (Annotation grid bulk actions)
   lastImageIndex: null,
   imageSelectionBusy: false,

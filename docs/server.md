@@ -5,8 +5,10 @@ under systemd, needs no terminal or logged-in user, and is used from other machi
 `http://<server>:8765`. The desktop command (`yolo-workbench`) is unchanged.
 
 This guide assumes one Linux host with local storage (and usually one NVIDIA GPU) on a trusted internal
-network. The server has no login yet: anyone who can reach the port can use every project, and model
-files (`.pt`/`.pth`) run code when loaded. Keep the port reachable only from the network that should use it.
+network. Everyone signs in with an account made on the server (`yolo-workbench-server user add`), but over
+plain HTTP: passwords and session cookies cross the network unencrypted, every signed-in user can use every
+project, and model files (`.pt`/`.pth`) run code when loaded. Keep the port reachable only from the network
+that should use it.
 
 ## What the server does differently
 
@@ -14,7 +16,9 @@ files (`.pt`/`.pth`) run code when loaded. Keep the port reachable only from the
 | --- | --- | --- |
 | Start | opens a browser, may ask before creating the projects folder | never prompts; a missing projects folder stops it (unless `create_projects_root`) |
 | Network | `127.0.0.1` | `0.0.0.0` with a required Host allow-list (`allowed_hosts`) |
+| Sign-in | none | everyone signs in (`[auth]`); changes, reviews and jobs are attributed |
 | Open projects | several (up to 4) | `max_open_projects`, idle ones close after `project_idle_close_min` |
+| Several people in one project | one undo history | each person undoes only their own changes; others' changes, and who has an image open, show up within seconds |
 | Import from a server folder by path | yes | off: images arrive by browser upload |
 | Stop with a run training | the run keeps going (it outlives the desktop app) | the run pauses at its next checkpoint and resumes at the next start |
 | Maintenance | none | idle models unload, daily backup/trash sessions, retention, abandoned uploads removed, disk checks |
@@ -46,18 +50,22 @@ and the systemd unit. Then:
 
 1. Edit `/etc/yolo-workbench/config.toml`: at least `allowed_hosts` — the names and addresses people type in
    the browser (e.g. `["gpu-server", "gpu-server.example.local", "10.0.0.20"]`).
-2. Check everything without starting the server:
+2. Create your account (and one for each colleague; see [Users and sign-in](#users-and-sign-in)):
+   ```bash
+   sudo -u yolo-workbench /opt/yolo-workbench/current/.venv/bin/yolo-workbench-server user add alice --admin --display-name "Alice Smith" --config /etc/yolo-workbench/config.toml
+   ```
+3. Check everything without starting the server:
    ```bash
    sudo -u yolo-workbench /opt/yolo-workbench/current/.venv/bin/yolo-workbench-server check --config /etc/yolo-workbench/config.toml
    ```
-   It reports the configuration, the projects folder (writable, free space, not in use), the cache folder,
-   what it listens on, the GPU torch sees, Ultralytics/RF-DETR, and MongoDB when embeddings are enabled.
-   It exits non-zero on a failure.
-3. Start it now and at every boot:
+   It reports the configuration, the projects folder (writable, free space, not in use), the accounts, the
+   cache folder, what it listens on, the GPU torch sees, Ultralytics/RF-DETR, and MongoDB when embeddings
+   are enabled. It exits non-zero on a failure.
+4. Start it now and at every boot:
    ```bash
    sudo systemctl enable --now yolo-workbench
    ```
-4. Open the port for the people who use it (and nothing else), e.g. `sudo ufw allow from 10.0.0.0/24 to any port 8765 proto tcp`.
+5. Open the port for the people who use it (and nothing else), e.g. `sudo ufw allow from 10.0.0.0/24 to any port 8765 proto tcp`.
 
 To bring existing datasets in, copy their folders into `/srv/yolo-workbench/projects/` (owned by
 `yolo-workbench`) and use **Adopt** on the projects page, or create a project and upload the images.
@@ -71,7 +79,7 @@ To bring existing datasets in, copy their folders into `/srv/yolo-workbench/proj
 | `/opt/yolo-workbench/python/` | the Python uv installed for the releases |
 | `/etc/yolo-workbench/config.toml` | configuration |
 | `/etc/yolo-workbench/yolo-workbench.env` | environment for the unit (optional overrides, proxy, `CUDA_VISIBLE_DEVICES`) |
-| `/srv/yolo-workbench/projects/` | every project, `.training/` (the queue), `.trash/` (deleted projects), `.workbench/` (owner lock) |
+| `/srv/yolo-workbench/projects/` | every project, `.training/` (the queue), `.trash/` (deleted projects), `.workbench/` (owner lock, `users.json` accounts, `sessions.json` sign-ins) |
 | `/var/cache/yolo-workbench/` | thumbnails, downloaded weights, torch/Ultralytics/matplotlib caches — rebuildable |
 
 ## Configuration
@@ -107,6 +115,8 @@ variable is `WORKBENCH_` plus the name in the first column (`WORKBENCH_PORT=9000
 | `max_loaded_models` | `[models]` | `2` | prediction models across open projects |
 | `max_open_projects` | `[projects]` | `4` | projects open at once |
 | `project_idle_close_min` | `[projects]` | `60` | close idle projects (0 = never; closing ends their undo history) |
+| `auth_enabled` | `[auth] enabled` | `true` | sign-in; off: anyone who reaches the port can use everything, unattributed |
+| `session_days` | `[auth]` | `30` | a sign-in stays valid this long after it was last used |
 | `embeddings_enabled` | `[embeddings] enabled` | `true` | the Embeddings tab |
 | `mongodb_uri` | `[embeddings]` | — | MongoDB for FiftyOne |
 | `log_level`, `log_format` | `[logging] level`, `format` | `info`, `text` | `json` for one object per line |
@@ -136,8 +146,9 @@ One run trains at a time; the queue is shared by all projects. On `systemctl sto
 3. imports, exports and prediction batches are cancelled, open projects save their state;
 4. the server waits up to `pause_deadline_s` for the run to pause, then exits.
 
-If the epoch takes longer, systemd kills what is left at `TimeoutStopSec` (720 s in the unit) and the run is
-**interrupted**: it resumes from the previous epoch's checkpoint, losing the epoch in progress. Either way,
+If the epoch takes longer, the server exits anyway and systemd kills what is left of the run right away
+(`KillMode=mixed`); the run is **interrupted**: it resumes from the previous epoch's checkpoint, losing the
+epoch in progress. `TimeoutStopSec` (720 s in the unit) only bounds the server itself. Either way,
 with `resume_after_service_stop` the run goes back to the front of the queue at the next start. A run
 interrupted by a crash, a power loss or the OOM killer is shown as interrupted and waits for **Resume** in the
 Training tab (or holds the whole queue, with `hold_queue_after_crash`). A run without any checkpoint yet
@@ -153,7 +164,12 @@ The Training tab's queue panel has **Hold** (nothing new starts, also across res
 header shows "Training queue held" while it is held. Use **Hold & pause** before maintenance that needs the
 GPU or a reboot, wait for the run to show *paused*, do the work, then **Release**.
 
-The same through the API: `curl -X POST -H 'X-Workbench: 1' -H 'Content-Type: application/json' -d '{"held": true, "pause_active": true}' localhost:8765/api/v1/training/queue/hold`.
+The same through the API, signed in with an account (the cookie file keeps the session):
+
+```bash
+curl -c /tmp/wb -H 'X-Workbench: 1' -H 'Content-Type: application/json' -d '{"name": "alice", "password": "…"}' localhost:8765/api/v1/auth/login
+curl -b /tmp/wb -X POST -H 'X-Workbench: 1' -H 'Content-Type: application/json' -d '{"held": true, "pause_active": true}' localhost:8765/api/v1/training/queue/hold
+```
 
 ### GPU
 
@@ -177,12 +193,53 @@ earlier sessions are deleted after `trash_retention_days` / `backup_retention_da
 history can still put back. Deleted projects stay in `<projects>/.trash/` for `project_trash_retention_days`.
 Training runs and models are never deleted automatically.
 
+### Users and sign-in
+
+Every page and API request needs a signed-in session, except the login page, `/healthz` and `/readyz`.
+Accounts live in `<projects>/.workbench/users.json` (scrypt password hashes) and are managed on the server,
+as the service account (or as root: the files keep the projects folder's owner):
+
+```bash
+WB="sudo -u yolo-workbench /opt/yolo-workbench/current/.venv/bin/yolo-workbench-server"
+$WB user add bob --display-name "Bob Jones" --config /etc/yolo-workbench/config.toml   # asks for the password twice
+$WB user list --config /etc/yolo-workbench/config.toml
+$WB user passwd bob --config /etc/yolo-workbench/config.toml      # a forgotten password; ends bob's sign-ins
+$WB user admin bob [--revoke] --config /etc/yolo-workbench/config.toml
+$WB user remove bob --config /etc/yolo-workbench/config.toml      # his changes stay attributed to "bob"
+```
+
+`--password-stdin` reads the password from the first line of stdin instead (for scripts). Changes take
+effect at once; the running server re-reads the file. Passwords need at least 8 characters. Everyone can
+change their own password from the menu under their initials (top right); that ends their other sign-ins.
+
+A sign-in lasts `session_days` after it was last used and survives restarts (`.workbench/sessions.json`
+keeps only digests of the session tokens; deleting the file while the service is stopped signs everybody
+out). The cookie is `HttpOnly` and `SameSite=Lax` but not `Secure`, as the server speaks plain HTTP.
+
+All accounts can do everything. The `admin` mark is reserved for administrator-only features that do not
+exist yet.
+
 ### Several people
 
-Several projects can be open at once (`max_open_projects`); people working on different projects do not
-disturb each other. Two people in the same project at once is possible but not yet coordinated: saves are
-conflict-checked (an edit of a file someone else changed is refused with "reload before saving"), but undo
-and the gallery do not know about the other person's edits until a reload.
+Several projects can be open at once (`max_open_projects`), and several people can work in the same project:
+
+- **Undo is per person**: Ctrl+Z undoes your own latest change, never someone else's. If someone changed the
+  same images (or the class list) after you, your undo is refused with who did it; once they undo theirs,
+  yours works again. Likewise a class rename, reorder, merge or removal cannot be undone while others' label
+  changes made for the new class list are still in place, nor after an import.
+- **Changes show up**: every open page asks the server every few seconds what others changed. The gallery
+  refreshes (thumbnails included); an editor showing an image someone else just changed says so and offers
+  **Reload** (saving over their change would be refused); a class rename, reorder or removal reloads the
+  class list everywhere without closing the editor, and a save made against the old class list is refused
+  rather than written with stale class ids.
+- **Who is where**: the editor shows who else has its image open, and the gallery marks those images with the
+  person's initials. Nothing is locked: two people can still edit the same image; the second save after a
+  change is refused and reloads.
+- **Who did what**: the editor shows who last edited and who reviewed an image; the gallery filters by
+  reviewer ("Reviewed by" under Filters); imports, prediction batches, Label QA analyses, embeddings and
+  training runs show who started them; the Dataset tab lists recent activity, kept in
+  `<project>/.yolo-workbench/activity.jsonl` (rotated past 16 MB).
+- Pending predictions are shared: everyone in the project sees and can accept or reject them.
 
 ### Embeddings (optional)
 
@@ -198,8 +255,9 @@ and set `[embeddings] mongodb_uri = "mongodb://127.0.0.1:27017"`. It holds nothi
 ## Backup and restore
 
 Back up **the whole projects folder** — images, labels, `data.yaml`, `project.json`, every project's
-`.yolo-workbench/` (review status, Label QA, backups, trash), `models/` and `runs/`, plus the hidden
-`.training/` (queue) and `.trash/` — and `/etc/yolo-workbench/`. The cache folder and
+`.yolo-workbench/` (review status and who edited what, the activity log, Label QA, backups, trash), `models/`
+and `runs/`, plus the hidden `.training/` (queue), `.trash/` and `.workbench/` (accounts) — and
+`/etc/yolo-workbench/`. The cache folder and
 `<project>/.yolo-workbench/staging/` can be skipped.
 
 For a consistent copy, take it from a filesystem snapshot (LVM, ZFS, btrfs), or stop the service while
@@ -232,7 +290,12 @@ release that launched it); delete them by hand afterwards.
 | `Configuration error: …` in the journal, service fails | a setting is wrong or unknown; `yolo-workbench-server check` names it |
 | `the projects folder … does not exist (is its disk mounted?)` | mount missing; the unit also waits for `/srv/yolo-workbench` |
 | `… is already in use by process …` | another server or a desktop session uses the folder |
+| the service stopped by itself and came back 10 s later, `low memory! … sending SIGTERM` in `journalctl` | an OOM killer (earlyoom, systemd-oomd) asked the server to stop: the active run paused at its checkpoint and resumes after the restart (`Restart=always`). Give the host more memory, or load fewer models during training (`gpu_models_during_training = "refuse"`, a lower `max_loaded_models`) |
+| `start request repeated too quickly` / `start of the service was attempted too often` | more than 10 starts within 5 minutes (a crash loop, or many restarts); fix the cause, then `sudo systemctl reset-failed yolo-workbench` and start it |
 | browser shows `{"detail":"Host not allowed"}` | add the name you typed to `allowed_hosts` |
+| the login page says "No user accounts exist yet" | create one: `yolo-workbench-server user add <name> --admin` (see [Users and sign-in](#users-and-sign-in)) |
+| someone forgot their password | `yolo-workbench-server user passwd <name>` sets a new one |
+| "Cannot undo your last change: … changed the same images since" | someone else edited those images after you; they can undo theirs first, or edit by hand |
 | uploads fail with "Not enough free disk space" | free space below `min_free_disk_gb` |
 | a run shows *interrupted* after a restart | its epoch did not finish within `pause_deadline_s`; it resumes from the previous checkpoint |
 | GPU not found by `check` | driver/CUDA mismatch, or `CUDA_VISIBLE_DEVICES` hides it; `nvidia-smi` as the service account |
@@ -242,10 +305,14 @@ release that launched it); delete them by hand afterwards.
 
 Before people rely on a new installation (and after major upgrades):
 
-- [ ] `check` passes with the GPU listed.
-- [ ] From another machine: project list, create a project, upload images, annotate and save, a 409 on a
-      conflicting save, thumbnails, smart annotation, a prediction model (upload and load), Label QA,
-      training progress, downloading best weights, embeddings on or reported off.
+- [ ] `check` passes with the GPU listed and at least one administrator account.
+- [ ] From another machine: sign in (a wrong password is refused), project list, create a project, upload
+      images, annotate and save, a 409 on a conflicting save, thumbnails, smart annotation, a prediction model
+      (upload and load), Label QA, training progress, downloading best weights, embeddings on or reported off,
+      change password, sign out.
+- [ ] Two people in one project (two browsers, two accounts): each sees the other's edits and presence within
+      seconds, undo only takes back one's own change and is refused after the other edited the same image, a
+      class rename by one reloads the other's classes.
 - [ ] With a tiny dataset, for Ultralytics **and** RF-DETR: `systemctl restart` during an epoch (pauses,
       resumes), `kill -9` of the server process (systemd restarts it; the run is interrupted and **Resume** continues from its checkpoint), a host reboot,
       an ONNX export interrupted by a restart (fails cleanly, can be repeated).

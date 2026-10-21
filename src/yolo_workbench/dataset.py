@@ -4,9 +4,11 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import tempfile
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +16,8 @@ from pathlib import Path
 import yaml
 from PIL import Image, UnidentifiedImageError
 
+from . import identity
+from .activity import ActivityLog
 from .fsutil import occupied, replace
 from .imaging import upright_size
 from .models import Annotation, Category, ImageRecord
@@ -24,6 +28,8 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 WORKBENCH_DIR = ".yolo-workbench"  # per-dataset state: backups, size index, trash, upload staging
 SIZE_INDEX_VERSION = 2  # 2: sizes are EXIF-upright
 SIZE_INDEX_SAVE_INTERVAL = 5.0  # seconds between size-index saves while probing
+CHANGE_LOG_SIZE = 5000  # changes kept for other browsers' polls (older polls reload everything)
+REVIEW_SAVE_DELAY = 5.0  # seconds: "last edited by" bookkeeping is saved at most this often
 
 
 class DatasetError(ValueError):
@@ -36,6 +42,16 @@ class WriteConflict(RuntimeError):
 
 class DatasetLocked(WriteConflict):
     """A write was refused because the dataset is read-only right now (a training run uses it)."""
+
+
+class SchemaChanged(WriteConflict):
+    """A save made against an older class list: `mapping` translates its class ids to the current ones
+    (old id -> new id, None = removed), or is None when that is not known."""
+
+    def __init__(self, message: str, generation: int, mapping: dict[int, int | None] | None):
+        super().__init__(message)
+        self.generation = generation
+        self.mapping = mapping
 
 
 @dataclass
@@ -119,6 +135,30 @@ class SchemaEntry:
         return {new: old for old, new in self.mapping.items() if new is not None}
 
 
+class Transaction(list):
+    """One undoable unit: the entries applied together, who made it, and its place in the history's order.
+
+    `seq` orders the history: it is renumbered whenever the transaction is applied again (pushed, redone)
+    or undone. `names` is the class list its label contents were written for (non-schema transactions)."""
+
+    def __init__(self, entries=(), action: str = "edit"):
+        super().__init__(entries)
+        self.user = identity.current_user_name()
+        self.who = identity.who()
+        self.action = action
+        self.time = time.time()
+        self.seq = 0
+        self.revision: int | None = None  # the dataset revision right after it was last applied or undone
+        self.names: dict[int, str] | None = None
+
+    @property
+    def schema(self) -> bool:
+        return any(isinstance(entry, SchemaEntry) and not entry.layout_only for entry in self)
+
+    def paths(self) -> set[Path]:
+        return {path for entry in self for path in _entry_paths(entry)}
+
+
 def _transaction_bytes(transaction: list) -> int:
     """Roughly what a transaction holds in memory: its label/YAML contents plus a little per entry."""
     return sum(256 + sum(len(value) for value in vars(entry).values() if isinstance(value, str)) for entry in transaction)
@@ -190,6 +230,13 @@ class Dataset:
         self._redo: list[list] = []
         self._history_bytes: dict[int, int] = {}  # id(transaction) -> its estimated size (for the undo budget)
         self.history_trimmed = 0  # transactions dropped from the bottom of the undo stack
+        self._history_seq = 0
+        # what other browsers poll (changes()): every change bumps the revision
+        self.revision = 0
+        self.feed_id = secrets.token_hex(4)  # revisions restart when the dataset is opened again: pages notice by this
+        self._change_log: deque = deque(maxlen=CHANGE_LOG_SIZE)
+        self._schema_log: deque = deque(maxlen=500)  # (generation after a class change, its mapping or None, who)
+        self.activity: ActivityLog | None = None  # created once the dataset root is known (see _load)
         self.session_id = time.strftime("%Y%m%d-%H%M%S")
         self.session_started = time.time()
         self._backed_up: set[Path] = set()
@@ -197,6 +244,7 @@ class Dataset:
         self._probe_thread: threading.Thread | None = None
         self.reviews: ReviewStore | None = None  # created once the dataset root is known (see _load)
         self._reviews_dirty = False
+        self._reviews_timer: threading.Timer | None = None
         self.indexing: dict[str, int] = {"done": 0, "total": 0}
         self._load()
         pending = [record for record in self.images.values() if record.width == 0 and record.probe_error is None]
@@ -213,11 +261,13 @@ class Dataset:
             self._probe_all(pending)
 
     def close(self, timeout: float = 5.0) -> None:
-        """Stop probing image sizes (what was probed is saved) before the dataset is dropped."""
+        """Stop probing image sizes (what was probed is saved) and save pending bookkeeping before the dataset
+        is dropped."""
         self._closing = True
         thread = self._probe_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout)
+        self._flush_reviews()
 
     def _read_config(self) -> dict:
         if not self.yaml_path.is_file():
@@ -403,11 +453,13 @@ class Dataset:
         record = ImageRecord(record_id, split, image_path, label_path)
         record.name_cf = image_path.name.casefold()
         record.review = self.reviews.get(image_path) if self.reviews else None
+        record.reviewed_by = self.reviews.reviewer(image_path) if self.reviews else None
         return record
 
     def _load(self) -> None:
         discovered = self._discover()
         self.reviews = ReviewStore(self.root / WORKBENCH_DIR / "review.json", self.root)
+        self.activity = ActivityLog(self.root / WORKBENCH_DIR / "activity.jsonl")
         size_index = self._load_size_index()
         for split, image_path in discovered:
             record = self._make_record(split, image_path)
@@ -478,6 +530,7 @@ class Dataset:
             self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
             names_changed = before_names != self.names
             updated = 0
+            updated_ids: list[str] = []
             added_ids = {record.id for record in added}
             for record in self.images.values():
                 if record.id in added_ids:
@@ -486,6 +539,7 @@ class Dataset:
                 if names_changed or (current.st_mtime_ns if current else None) != self._mtimes.get(record.label_path):
                     self._read_record(record)
                     updated += 1
+                    updated_ids.append(record.id)
             self._resort()
             self._find_orphans()
             self._rebuild_orphan_issues()
@@ -498,6 +552,9 @@ class Dataset:
                 self.annotation_generation += 1
             if names_changed:
                 self.schema_generation += 1
+                self._schema_log.append((self.schema_generation, None, identity.who()))  # edited on disk: ids may mean anything
+            if changed:
+                self._record_change([*(record.id for record in added), *(record.id for record in removed), *updated_ids], structure=True, schema=names_changed, kind="rescan")
         self._start_probe(pending)
         if changed:
             self._notify_changes([record.id for record in added])
@@ -822,6 +879,88 @@ class Dataset:
             except Exception:
                 pass  # cache invalidation must never make a committed label write fail
 
+    # ---------- changes other browsers see, and who made them ----------
+
+    def _record_change(self, image_ids, structure: bool = False, schema: bool = False, kind: str = "labels") -> None:
+        """A change other browsers should pick up (changes()), logged with its author when someone is signed
+        in (activity log; the images' "last edited by"). Caller holds the lock."""
+        ids = list(dict.fromkeys(image_ids))
+        who = identity.who()
+        self.revision += 1
+        self._change_log.append((self.revision, tuple(ids), who, identity.current_client(), time.time(), structure, schema, kind))
+        if who is None:
+            return
+        if self.activity is not None:
+            self.activity.append(who, identity.current_action(), ids, kind, structure=structure or None, schema=schema or None)
+        if kind == "labels" and not schema and self.reviews is not None and ids:
+            for image_id in ids:
+                record = self.images.get(image_id)
+                if record is not None:
+                    self.reviews.edited(record.path, who)
+            self._reviews_dirty = True
+            if self._reviews_timer is None and not self._closing:
+                self._reviews_timer = threading.Timer(REVIEW_SAVE_DELAY, self._flush_reviews)
+                self._reviews_timer.daemon = True
+                self._reviews_timer.start()
+
+    def _flush_reviews(self) -> None:
+        with self._lock:
+            timer, self._reviews_timer = self._reviews_timer, None
+            if timer is not None:
+                timer.cancel()
+            if self._reviews_dirty and self.reviews is not None:
+                self._save_reviews()
+
+    def changes(self, since: int, feed: str | None = None) -> dict:
+        """What others changed after revision `since` of feed `feed` (changes made from the requesting browser tab
+        are left out). `reset`: too old to tell (or another feed: the dataset was opened again), reload
+        everything; `structure`: images were added, removed or moved; `schema`: the class list changed;
+        `images`: image id -> who changed it, when, and what (labels/review)."""
+        with self._lock:
+            me = identity.current_client()
+            base = {"feed": self.feed_id, "revision": self.revision, "schema_generation": self.schema_generation, "annotation_generation": self.annotation_generation}
+            if feed is not None and feed != self.feed_id:
+                return {**base, "reset": True, "structure": True, "schema": True, "images": {}}
+            if since >= self.revision:
+                return {**base, "reset": False, "structure": False, "schema": False, "images": {}}
+            oldest = self._change_log[0][0] if self._change_log else self.revision + 1
+            if since < oldest - 1 or since < 0:
+                return {**base, "reset": True, "structure": True, "schema": True, "images": {}}
+            images: dict[str, dict] = {}
+            structure = schema = False
+            for revision, ids, who, client, at, moved, renamed, kind in self._change_log:
+                if revision <= since or (me is not None and client == me):
+                    continue
+                structure |= moved
+                schema |= renamed
+                for image_id in ids:
+                    images[image_id] = {"by": who, "at": at, "kind": kind}
+            return {**base, "reset": False, "structure": structure, "schema": schema, "images": images}
+
+    def schema_mapping(self, since: int) -> dict[int, int | None] | None:
+        """How class ids of class list `since` became today's (old -> new, None = removed); None if unknown."""
+        with self._lock:
+            if since == self.schema_generation:
+                return {class_id: class_id for class_id in self.names}
+            steps = [item for item in self._schema_log if item[0] > since]
+            if since > self.schema_generation or [item[0] for item in steps] != list(range(since + 1, self.schema_generation + 1)) or any(item[1] is None for item in steps):
+                return None
+            mapping: dict[int, int | None] = {class_id: class_id for class_id in steps[0][1]}
+            for _, step, _ in steps:
+                mapping = {old: (None if current is None else step.get(current)) for old, current in mapping.items()}
+            return mapping
+
+    def check_schema(self, generation: int | None) -> None:
+        """Refuse a save whose class ids were chosen from an older class list (SchemaChanged)."""
+        if generation is None or generation == self.schema_generation:
+            return
+        who = next((item[2] for item in reversed(self._schema_log) if item[0] > generation), None)
+        by = f" by {who['display_name']}" if who else ""
+        raise SchemaChanged(f"The class list was changed{by} since this page loaded it; the classes were reloaded, check the labels and save again", self.schema_generation, self.schema_mapping(generation))
+
+    def recent_activity(self, limit: int = 100, image_id: str | None = None, user: str | None = None) -> list[dict]:
+        return self.activity.recent(limit, image_id, user) if self.activity is not None else []
+
     def metadata(self) -> dict:
         with self._lock:
             return {
@@ -837,8 +976,10 @@ class Dataset:
                 "schema_generation": self.schema_generation,
                 "capabilities": self.capabilities(),
                 "review_counts": self.review_counts(),
-                "can_undo": bool(self._undo),
-                "can_redo": bool(self._redo),
+                "reviewers": self.reviewers(),
+                "revision": self.revision,
+                "feed": self.feed_id,
+                **self.history_state(),
             }
 
     def capabilities(self) -> dict:
@@ -1070,23 +1211,24 @@ class Dataset:
             item.pop("score", None)
         return outliers[:100]
 
-    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None) -> dict:
+    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None) -> dict:
         with self._lock:
-            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue)
-            return {"total": len(records), "items": [record.summary() for record in records[offset : offset + limit]]}
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer)
+            return {"total": len(records), "items": [{**record.summary(), "v": self._revisions.get(record.label_path, 0)} for record in records[offset : offset + limit]]}
 
-    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None) -> dict:
+    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None) -> dict:
         """The first unreviewed image at or after `start` in the filtered list (wrapping around), with its position."""
         with self._lock:
-            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue)
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer)
             start = min(max(0, start), len(records))
             for index in [*range(start, len(records)), *range(start)]:
                 if records[index].review is None:
                     return {"index": index, "total": len(records), "item": records[index].summary()}
             return {"index": None, "total": len(records), "item": None}
 
-    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue) -> list[ImageRecord]:
-        """The gallery's filters, in gallery order. review: done / needs_work / unreviewed; issue: any / none / an issue kind."""
+    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer=None) -> list[ImageRecord]:
+        """The gallery's filters, in gallery order. review: done / needs_work / unreviewed; issue: any / none / an
+        issue kind; reviewer: a user name (whose review status the image has)."""
         allowed: set[str] | None = None
         if split != "all":
             allowed = set(self._split_image_ids.get(split, set()))
@@ -1111,6 +1253,8 @@ class Dataset:
         if review:
             wanted = None if review == "unreviewed" else review
             records = [record for record in records if record.review == wanted]
+        if reviewer:
+            records = [record for record in records if record.reviewed_by == reviewer]
         if issue == "any":
             records = [record for record in records if record.issues]
         elif issue == "none":
@@ -1125,10 +1269,14 @@ class Dataset:
             raise DatasetError(f"Review status must be one of {', '.join(REVIEW_STATUSES)}, or empty")
         with self._lock:
             records = [self.require_image(image_id) for image_id in dict.fromkeys(image_ids)]
+            who = identity.who()
             for record in records:
                 record.review = status
-                self.reviews.set(record.path, status)
+                record.reviewed_by = who["name"] if who and status else None
+                self.reviews.set(record.path, status, who)
             self._save_reviews(strict=True)
+            with identity.action(f"review: {status or 'clear'}"):
+                self._record_change([record.id for record in records], kind="review")
             return {"updated": len(records), "status": status, "review_counts": self.review_counts()}
 
     def review_counts(self) -> dict:
@@ -1139,6 +1287,18 @@ class Dataset:
                     counts[record.review] += 1
             counts["unreviewed"] = len(self.images) - sum(counts.values())
             return counts
+
+    def reviewers(self) -> list[dict]:
+        """Who set the review statuses images have now ({name, display_name, count}), for the gallery filter."""
+        with self._lock:
+            counts: dict[str, int] = {}
+            for record in self.images.values():
+                if record.reviewed_by:
+                    counts[record.reviewed_by] = counts.get(record.reviewed_by, 0) + 1
+            if not counts:
+                return []
+            display = {entry["by"]["name"]: entry["by"].get("display_name") for entry in self.reviews.entries.values() if isinstance(entry.get("by"), dict) and entry["by"].get("name") in counts}
+            return [{"name": name, "display_name": display.get(name) or name, "count": count} for name, count in sorted(counts.items())]
 
     def _save_reviews(self, strict: bool = False) -> None:
         self._reviews_dirty = False
@@ -1166,7 +1326,15 @@ class Dataset:
                 "revision": self._revisions[record.label_path],
                 "annotations": [a.as_dict() for a in record.annotations],
                 "issues": list(record.issues),
+                **self._attribution(record),
             }
+
+    def _attribution(self, record: ImageRecord) -> dict:
+        info = self.reviews.info(record.path) if self.reviews else {}
+        return {
+            "edited": {"by": info["edited_by"], "at": info.get("edited_at")} if info.get("edited_by") else None,
+            "reviewed": {"by": info["by"], "at": info.get("time")} if record.review and info.get("by") else None,
+        }
 
     def require_image(self, image_id: str) -> ImageRecord:
         try:
@@ -1174,8 +1342,9 @@ class Dataset:
         except KeyError as exc:
             raise KeyError("Image not found") from exc
 
-    def replace_annotations(self, image_id: str, raw_annotations: list[dict], expected_revision: int | None = None) -> dict:
+    def replace_annotations(self, image_id: str, raw_annotations: list[dict], expected_revision: int | None = None, schema_generation: int | None = None) -> dict:
         with self._lock:
+            self.check_schema(schema_generation)
             record = self.require_image(image_id)
             if self.category == "classification":
                 if len(raw_annotations) != 1 or raw_annotations[0].get("points"):
@@ -1211,7 +1380,7 @@ class Dataset:
             if history:
                 self._execute(entries)
             else:
-                self._run_transaction(entries, "redo")
+                self._run_transaction(entries, "redo", fresh=True)
 
     @staticmethod
     def _move_file(src: Path, dst: Path) -> None:
@@ -1273,9 +1442,10 @@ class Dataset:
                 raise DatasetError(f"Cannot read {record.label_path.name}: {exc}") from exc
             return {"image_id": record.id, "name": record.label_path.name, "path": self.folder_label(record.label_path), "exists": exists, "text": text, "revision": self._revisions[record.label_path], "issues": list(record.issues)}
 
-    def write_label_text(self, image_id: str, text: str, expected_revision: int | None = None) -> dict:
+    def write_label_text(self, image_id: str, text: str, expected_revision: int | None = None, schema_generation: int | None = None) -> dict:
         """Replace one label file with raw text (malformed lines allowed) through the normal commit path."""
-        with self._lock:
+        with self._lock, identity.action("edit label file"):
+            self.check_schema(schema_generation)
             record = self.require_image(image_id)
             if self.category == "classification":
                 raise DatasetError("Classification images have no label file")
@@ -1287,7 +1457,7 @@ class Dataset:
 
     def trash_orphans(self, issue_ids: list[str]) -> dict:
         """Move orphan label files into the dataset trash as one undoable transaction."""
-        with self._lock:
+        with self._lock, identity.action("trash orphan labels"):
             paths = {issue["id"]: path for issue, path in zip(self._orphan_issues, self.orphan_labels)}
             missing = [issue_id for issue_id in issue_ids if issue_id not in paths]
             if missing:
@@ -1339,11 +1509,13 @@ class Dataset:
                     change.after_exists,
                 ))
                 self._read_record(record)
-            if history and transaction:
-                self._push_history(transaction)
+            pushed = self._push_history(transaction) if history and transaction else None
             changed_ids = [change.record.id for change in changes]
             if changed_ids:
                 self.annotation_generation += 1
+                self._record_change(changed_ids)
+            if pushed is not None:
+                pushed.revision = self.revision
         if changed_ids:
             self._notify_changes(changed_ids)
 
@@ -1379,34 +1551,85 @@ class Dataset:
             path.unlink(missing_ok=True)
 
     def history(self, direction: str) -> dict:
+        """Undo or redo the requesting user's latest change (with sign-in, everyone has their own history;
+        without, there is one). Refused when someone changed the same files or the class list since."""
         with self._lock:
+            user = identity.current_user_name()
             source, target = (self._undo, self._redo) if direction == "undo" else (self._redo, self._undo)
-            if not source:
+            index = next((position for position in range(len(source) - 1, -1, -1) if source[position].user == user), None)
+            if index is None:
                 raise DatasetError(f"Nothing to {direction}")
-            transaction = source[-1]
-            image_ids, schema_changed = self._run_transaction(transaction, direction)
-            source.pop()
+            transaction = source[index]
+            if transaction.schema and transaction.user is not None:
+                self._check_schema_replay(transaction, direction)
+            try:
+                with identity.action(f"{direction} {transaction.action}"):
+                    image_ids, schema_changed = self._run_transaction(transaction, direction)
+            except WriteConflict as exc:
+                raise self._history_conflict(transaction, direction, exc) from exc
+            source.pop(index)
+            self._history_seq += 1
+            transaction.seq = self._history_seq
+            transaction.revision = self.revision
             target.append(transaction)
             return {
                 "image_ids": image_ids,
                 "image_id": image_ids[0] if image_ids else None,
                 "schema_changed": schema_changed,
-                "can_undo": bool(self._undo),
-                "can_redo": bool(self._redo),
+                "action": transaction.action,
+                **self.history_state(),
             }
 
-    def history_state(self) -> dict:
-        with self._lock:
-            return {"can_undo": bool(self._undo), "can_redo": bool(self._redo)}
+    def _check_schema_replay(self, transaction: Transaction, direction: str) -> None:
+        """A class change undone or redone re-reads every label under the other class list, including labels
+        written since for the current one: refused while someone else's later change is still applied (their
+        transactions above it), or after an import or rescan (which cannot be undone)."""
+        others = [other.who for other in self._undo if other is not transaction and other.seq > transaction.seq and other.user != transaction.user]
+        since = transaction.revision
+        if since is not None:
+            if self._change_log and self._change_log[0][0] > since + 1:
+                raise WriteConflict(f"Cannot {direction} your class change ({transaction.action}): too much has changed since")
+            others += [who for revision, _ids, who, _client, _at, _moved, _renamed, kind in self._change_log if revision > since and kind == "rescan"]
+        if others:
+            names = list(dict.fromkeys((who or {}).get("display_name") or "someone" for who in reversed(others)))
+            raise WriteConflict(f"Cannot {direction} your class change ({transaction.action}): {' and '.join(names[:3])}{' and others' if len(names) > 3 else ''} changed labels since, for the current class list")
 
-    def _push_history(self, transaction: list) -> None:
-        """A new undoable transaction: redo is gone, and the oldest transactions drop off past the budget
-        (runtime.undo_max_transactions / undo_max_bytes). Caller holds the lock."""
+    def _history_conflict(self, transaction: Transaction, direction: str, exc: WriteConflict) -> WriteConflict:
+        """Name who changed what an undo/redo needs, when an in-app change by someone else is the cause."""
+        if isinstance(exc, DatasetLocked):
+            return exc
+        paths = transaction.paths()
+        others = [other for other in (*self._undo, *self._redo) if other is not transaction and other.seq > transaction.seq and other.user != transaction.user and (other.schema or other.paths() & paths)]
+        if not others:
+            return exc
+        names = list(dict.fromkeys((other.who or {}).get("display_name") or other.user or "someone" for other in sorted(others, key=lambda item: -item.seq)))
+        what = "the class list" if any(other.schema for other in others) else "the same images"
+        return WriteConflict(f"Cannot {direction} your last change ({transaction.action}): {' and '.join(names[:3])}{' and others' if len(names) > 3 else ''} changed {what} since")
+
+    def history_state(self) -> dict:
+        """Whether the requesting user has something to undo or redo."""
+        with self._lock:
+            user = identity.current_user_name()
+            return {"can_undo": any(item.user == user for item in self._undo), "can_redo": any(item.user == user for item in self._redo)}
+
+    def _push_history(self, transaction: list) -> Transaction:
+        """A new undoable transaction: its author's redo is gone, and the oldest transactions drop off past
+        the budget (runtime.undo_max_transactions / undo_max_bytes). Caller holds the lock."""
         from .runtime import RUNTIME
 
+        if not isinstance(transaction, Transaction):
+            transaction = Transaction(transaction, identity.current_action())
+        kept = []
         for dropped in self._redo:
-            self._history_bytes.pop(id(dropped), None)
-        self._redo.clear()
+            if dropped.user == transaction.user:
+                self._history_bytes.pop(id(dropped), None)
+            else:
+                kept.append(dropped)  # someone else's redo; replaying it later is checked like any other
+        self._redo[:] = kept
+        self._history_seq += 1
+        transaction.seq = self._history_seq
+        if not transaction.schema:
+            transaction.names = dict(self.names)
         self._undo.append(transaction)
         self._history_bytes[id(transaction)] = _transaction_bytes(transaction)
         total = sum(self._history_bytes.get(id(item), 0) for item in self._undo)
@@ -1414,6 +1637,7 @@ class Dataset:
             oldest = self._undo.pop(0)
             total -= self._history_bytes.pop(id(oldest), 0)
             self.history_trimmed += 1
+        return transaction
 
     def referenced_trash_sessions(self) -> set[str]:
         """Sessions whose trash the undo/redo history still points into (their files can be put back)."""
@@ -1443,12 +1667,14 @@ class Dataset:
     def _execute(self, entries: list) -> tuple[list[str], bool]:
         """Apply a new transaction forward and make it undoable as one unit."""
         with self._lock:
-            result = self._run_transaction(entries, "redo")
+            transaction = Transaction(entries, identity.current_action())
+            result = self._run_transaction(transaction, "redo", fresh=True)
             if entries:
-                self._push_history(entries)
+                self._push_history(transaction)
+                transaction.revision = self.revision
             return result
 
-    def _run_transaction(self, entries: list, direction: str) -> tuple[list[str], bool]:
+    def _run_transaction(self, entries: list, direction: str, fresh: bool = False) -> tuple[list[str], bool]:
         """Replay a transaction in either direction: every entry is checked before anything is touched.
 
         Records are re-read once at the end so that a class-folder rename or a names change
@@ -1456,10 +1682,15 @@ class Dataset:
         """
         with self._lock:
             self.check_writable()
+            names = getattr(entries, "names", None)
+            if names is not None and any(self.names.get(class_id) != name for class_id, name in names.items()):
+                raise WriteConflict(f"Cannot {direction}: the class list changed since this change was made")
             ordered = list(reversed(entries)) if direction == "undo" else list(entries)
             records_by_label = {record.label_path: record for record in self.images.values()}
             for entry in ordered:
-                self._check_entry(entry, direction, records_by_label)
+                self._check_entry(entry, direction, records_by_label, exact=not fresh)
+            # images this leaves out of the dataset (deleted, or a restore undone): other browsers must hear of them
+            removed = [entry.image_id for entry in ordered if isinstance(entry, RecordMoveEntry) and (entry.split_after if direction == "redo" else entry.split_before) is None]
             touched: dict[str, ImageRecord] = {}
             schema: SchemaEntry | None = None
             resort = False
@@ -1469,7 +1700,9 @@ class Dataset:
                 else:
                     resort |= self._apply_entry(entry, direction, records_by_label, touched)
             if schema is not None:
-                self._reload_schema()
+                self._reload_schema(classes_changed=not schema.layout_only)
+                if not schema.layout_only:
+                    self._schema_log.append((self.schema_generation, schema.mapping if direction == "redo" else schema.inverse(), identity.who()))
             else:
                 for record in touched.values():
                     if record.id in self.images:
@@ -1483,6 +1716,8 @@ class Dataset:
             image_ids = list(touched)
             if image_ids or schema is not None:
                 self.annotation_generation += 1
+            if image_ids or schema is not None or resort:
+                self._record_change(image_ids + removed, structure=resort or schema is not None, schema=schema is not None and not schema.layout_only)
         if image_ids or schema is not None:
             self._notify_changes(image_ids)
         if schema is not None and not schema.layout_only:
@@ -1496,7 +1731,9 @@ class Dataset:
             return (entry.after, entry.after_exists), (entry.before, entry.before_exists)
         return (entry.before, entry.before_exists), (entry.after, entry.after_exists)
 
-    def _check_entry(self, entry, direction: str, records_by_label: dict) -> None:
+    def _check_entry(self, entry, direction: str, records_by_label: dict, exact: bool = True) -> None:
+        """Can `entry` be applied in `direction`? exact: also compare label files with the content the entry
+        expects (replaying history; a new transaction has just read them)."""
         if isinstance(entry, HistoryEntry):
             record = records_by_label.get(entry.label_path)
             if record is None:
@@ -1505,6 +1742,13 @@ class Dataset:
             if current != self._mtimes.get(entry.label_path):
                 self._read_record(record)
                 raise WriteConflict(f"{entry.label_path.name} changed outside this application; reload before saving")
+            # undo/redo need not be the latest change (each user has their own history): the file must
+            # still hold exactly what this entry left (or expects)
+            if exact:
+                (expected, expected_exists), _ = self._states(entry, direction)
+                exists = entry.label_path.exists()
+                if exists != expected_exists or (exists and entry.label_path.read_text(encoding="utf-8") != expected):
+                    raise WriteConflict(f"{entry.label_path.name} changed since; cannot {direction}")
         elif isinstance(entry, FileEntry):
             (expected, expected_exists), _ = self._states(entry, direction)
             exists = entry.path.exists()
@@ -1524,6 +1768,9 @@ class Dataset:
                 record = self.images.get(entry.image_id)
                 if record is None or record.path != pairs[0][0]:
                     raise WriteConflict(f"{pairs[0][0].name} changed outside this application; cannot {direction}")
+                # a label made after the move (it had none then) would stay behind as an orphan
+                if record.label_path != record.path and record.label_path.exists() and record.label_path not in {src for src, _ in pairs}:
+                    raise WriteConflict(f"{record.label_path.name} was created since; cannot {direction}")
             elif entry.image_id in self.images:
                 raise WriteConflict(f"{pairs[0][1].name} is already part of the dataset; cannot {direction}")
             for src, dst in pairs:
@@ -1615,7 +1862,7 @@ class Dataset:
     def _relocate(self, record: ImageRecord, image_path: Path, label_path: Path) -> None:
         """Point a record at moved files, carrying its revision, mtime, and review bookkeeping along."""
         old_label = record.label_path
-        if record.review and self.reviews and self.reviews.move(record.path, image_path):
+        if self.reviews and self.reviews.move(record.path, image_path):  # review status and who edited it
             self._reviews_dirty = True
         record.path = image_path
         record.label_path = label_path
@@ -1626,10 +1873,12 @@ class Dataset:
         stat = self._safe_stat(label_path)
         self._mtimes[label_path] = stat.st_mtime_ns if stat else None
 
-    def _reload_schema(self) -> None:
-        """Re-read class names and split folders from disk and re-interpret every record against them."""
+    def _reload_schema(self, classes_changed: bool = True) -> None:
+        """Re-read class names and split folders from disk and re-interpret every record against them.
+        classes_changed=False (split folders only): saves made with the current class list stay valid."""
         self._read_layout()
-        self.schema_generation += 1
+        if classes_changed:
+            self.schema_generation += 1
         for record in list(self.images.values()):
             self._read_record(record)
         self._statistics_cache = None
@@ -1648,7 +1897,7 @@ class Dataset:
 
     def delete_images(self, image_ids: list[str]) -> dict:
         """Move images (and their labels) into the dataset trash as one undoable transaction."""
-        with self._lock:
+        with self._lock, identity.action("delete images"):
             entries = []
             for image_id in dict.fromkeys(image_ids):
                 record = self.require_image(image_id)
@@ -1663,7 +1912,7 @@ class Dataset:
 
     def move_images(self, image_ids: list[str], split: str, folder: str | None = None) -> dict:
         """Move images (and their labels) to a split folder as one undoable transaction."""
-        with self._lock:
+        with self._lock, identity.action(f"move images to {split}"):
             target_root = self.resolve_folder(split, folder)
             entries, skipped, targets = [], 0, set()
             for image_id in dict.fromkeys(image_ids):
@@ -1694,7 +1943,7 @@ class Dataset:
             return [issue for _, issue in self._issue_index.values()] + list(self._orphan_issues)
 
     def fix_issue(self, issue_id: str) -> dict:
-        with self._lock:
+        with self._lock, identity.action("fix issue"):
             if any(issue["id"] == issue_id for issue in self._orphan_issues):
                 return {**self.trash_orphans([issue_id]), "image_id": None}
             indexed = self._issue_index.get(issue_id)
@@ -1720,7 +1969,7 @@ class Dataset:
     def fix_issues_bulk(self, kind: str, split: str | None = None, issue_ids: list[str] | None = None) -> dict:
         """Fix every matching fixable issue in one transaction; skips images that fail validation."""
         wanted = set(issue_ids) if issue_ids else None
-        with self._lock:
+        with self._lock, identity.action(f"fix all {kind.replace('_', ' ')} issues"):
             if kind == "orphan_label":
                 ids = [issue["id"] for issue in self._orphan_issues if wanted is None or issue["id"] in wanted]
                 if not ids:
@@ -1766,9 +2015,10 @@ class Dataset:
                 removed.add(annotation.id)
         return [a.as_dict() for a in annotations if a.id not in removed]
 
-    def bulk_edit_objects(self, operations: list[dict]) -> dict:
+    def bulk_edit_objects(self, operations: list[dict], schema_generation: int | None = None) -> dict:
         """Relabel or delete many annotations across images in one transaction."""
-        with self._lock:  # reads records the background probe may be updating
+        with self._lock, identity.action("bulk edit objects"):  # reads records the background probe may be updating
+            self.check_schema(schema_generation)
             if self.category == "classification":
                 return self._bulk_reclassify(operations)
             return self._bulk_edit(operations)

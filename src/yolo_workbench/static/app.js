@@ -1,4 +1,6 @@
 import { watchServerStatus } from "./status.js";
+import { showUser } from "./user.js";
+import { clearEditorNotice, configureCollab, editorShows, loadActivity, personName, presenceBadge, renderAttribution, startChangeFeed } from "./collab.js";
 import { $, api, apiUrl, setApiBase, esc, debounce, classColor } from "./api.js";
 import { state } from "./state.js";
 import { VirtualGallery } from "./grid.js";
@@ -35,6 +37,9 @@ let statisticsRequest = 0;
 
 export function toast(message, kind = "info") {
   const el = $("toast");
+  // an open modal dialog (the editor) is drawn above everything else: show the toast inside it
+  const host = [...document.querySelectorAll("dialog[open]")].pop() || document.body;
+  if (el.parentElement !== host) host.append(el);
   el.textContent = message;
   el.className = `${kind} show`;
   clearTimeout(el.timer);
@@ -51,8 +56,10 @@ async function init() {
   const info = await api("/api/v1/app");
   state.mode = info.mode;
   state.server = !!info.server;
+  state.user = info.auth ? info.user : null;
   state.features = { ...state.features, ...(info.features || {}) };
   watchServerStatus();
+  showUser(info);
   if (info.mode === "projects") {
     const slug = new URLSearchParams(location.search).get("project");
     if (!slug) { location.replace("/projects.html"); return; }
@@ -72,6 +79,8 @@ async function init() {
   }
   state.canUndo = state.meta.can_undo;
   state.canRedo = state.meta.can_redo;
+  state.revision = state.meta.revision ?? 0;
+  state.feed = state.meta.feed ?? null;
   renderMetaControls();
   renderShortcuts();
   setupVirtualGalleries();
@@ -82,6 +91,7 @@ async function init() {
   bindTraining();
   updateHistoryButtons();
   watchIndexing();
+  startChangeFeed();
   if (state.mode === "projects") renderProjectSwitch();
   const params = new URLSearchParams(location.search);
   if (params.get("tab") === "training") showTab("training", params.get("run"));
@@ -126,8 +136,23 @@ function renderMetaControls() {
     `<option value="${esc(`${split}|${folder}`)}" title="${esc(folder)}">${esc(folders[split].length > 1 ? `${split} · ${folder}` : split)}</option>`).join("")).join("");
   $("embed-classes").innerHTML = names.map(([id, name]) =>
     `<button class="class-chip ${state.embed.classes.has(+id) ? "active" : ""}" data-class="${esc(id)}" style="--c:${classColor(+id)}">${esc(name)}</button>`).join("");
+  renderReviewerFilter();
   if (imageGallery) imageGallery.emptyMessage = imageEmptyMessage();
   renderManageMeta();
+}
+
+// "Reviewed by": the people whose review statuses the images have (with sign-in), you first
+const reviewerName = name => name === state.user?.name ? "you" : personName(state.meta.reviewers?.find(item => item.name === name) ?? { name });
+function renderReviewerFilter() {
+  const select = $("image-reviewer");
+  const reviewers = [...(state.meta.reviewers || [])];
+  if (state.user && !reviewers.some(item => item.name === state.user.name)) reviewers.push({ ...state.user, count: 0 });
+  reviewers.sort((a, b) => (b.name === state.user?.name) - (a.name === state.user?.name) || personName(a).localeCompare(personName(b)));
+  const previous = select.value;
+  select.innerHTML = `<option value="">Anyone</option>` + reviewers.map(item =>
+    `<option value="${esc(item.name)}">${esc(item.name === state.user?.name ? `Me (${personName(item)})` : personName(item))}${item.count ? ` · ${item.count.toLocaleString()}` : ""}</option>`).join("");
+  select.value = [...select.options].some(option => option.value === previous) ? previous : "";
+  $("image-reviewer-field").hidden = !state.user;
 }
 
 const imageEmptyMessage = () => state.meta.image_count
@@ -149,19 +174,23 @@ async function renderProjectSwitch() {
 
 async function refreshMeta() {
   state.meta = { ...state.meta, ...(await api("/dataset")) };
+  state.canUndo = state.meta.can_undo;  // the requesting person's own history
+  state.canRedo = state.meta.can_redo;
   renderMetaControls();
 }
 
 // Something changed beyond one image (class schema, import, image delete/move, undo of those):
 // refresh metadata and every view that caches classes, splits, or images.
-export async function datasetChanged({ schema = false } = {}) {
-  if (schema && $("editor").open) $("editor").close();
+// keepEditor: someone else changed the classes; the editor reloads its image instead of closing.
+// keepSelection: someone else's change; this person's selection stays.
+export async function datasetChanged({ schema = false, keepEditor = false, keepSelection = false } = {}) {
+  if (schema && !keepEditor && $("editor").open) $("editor").close();
   if (schema) {
     state.embed.classes.clear();
     state.embed.selection = [];
     clearObjectSelection();
   }
-  clearImageSelection();
+  if (!keepSelection) clearImageSelection();
   try { await refreshMeta(); } catch (error) { toast(error.message, "error"); }
   statisticsChanged();
   updateHistoryButtons();
@@ -193,7 +222,36 @@ function showTab(tab, runId = null) {
   if (tab === "embeddings") refreshEmbeddings();
   if (tab === "statistics") loadStatistics();
   if (tab === "quality") showLabelQA();
-  if (tab === "dataset") { loadClasses(); loadStorage(); }
+  if (tab === "dataset") { loadClasses(); loadStorage(); loadActivity(); }
+}
+
+// Other people's label or review changes (collab.js): refresh what lists the images.
+async function imagesChanged() {
+  statisticsChanged();
+  await Promise.all([loadImages(), loadObjects(), loadIssues()].map(task => task.catch(() => {})));
+  if ($("dataset").classList.contains("active")) loadActivity();
+}
+
+// The editor's image again from the server (someone else changed it); "missing" when it is gone.
+async function reloadEditor(id, { quiet = false } = {}) {
+  const request = editorRequest;
+  let detail;
+  try {
+    detail = await api(`/images/${id}`);
+  } catch (error) {
+    if (error.status === 404) return "missing";
+    if (!quiet) toast(error.message, "error");
+    return "failed";
+  }
+  if (request !== editorRequest || state.detail?.id !== id) return "stale";
+  state.detail = { ...detail, image_version: state.detail.image_version };
+  savedRevisionByImage.set(id, detail.revision);
+  if (!detail.annotations.some(a => a.id === state.selected)) state.selected = null;
+  clearEditorNotice();
+  updateReviewButtons();
+  renderList();
+  render();
+  return "reloaded";
 }
 
 function watchIndexing() {
@@ -248,7 +306,8 @@ function renderShortcuts() {
 
 function bind() {
   document.querySelectorAll(".tab").forEach(button => button.onclick = () => showTab(button.dataset.tab));
-  [$("image-split"), $("image-class"), $("filter-predictions"), $("image-review"), $("image-issues")].forEach(el => el.onchange = () => loadImages({ reset: true }));
+  [$("image-split"), $("image-class"), $("filter-predictions"), $("image-review"), $("image-reviewer"), $("image-issues")].forEach(el => el.onchange = () => loadImages({ reset: true }));
+  $("refresh-activity").onclick = loadActivity;
   $("start-review").onclick = () => openNextUnreviewed(0);
   $("image-review-done").onclick = () => reviewSelection("done");
   $("image-review-work").onclick = () => reviewSelection("needs_work");
@@ -257,7 +316,7 @@ function bind() {
   $("image-search").oninput = debounce(() => loadImages({ reset: true }), 250);
   [$("label-min"), $("label-max")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
   $("image-filters-reset").onclick = () => {
-    for (const [id, value] of [["image-split", "all"], ["image-class", ""], ["image-review", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
+    for (const [id, value] of [["image-split", "all"], ["image-class", ""], ["image-review", ""], ["image-reviewer", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
     $("filter-predictions").checked = false;
     loadImages({ reset: true });
   };
@@ -480,6 +539,8 @@ function bind() {
     }
   });
   $("editor").addEventListener("close", () => {
+    editorShows(null);
+    clearEditorNotice();
     closeEditorSession();
     state.detail = null; state.img = null; state.drawing = null; state.drag = null; state.selected = null;
     state.editorGridIndex = null;
@@ -612,6 +673,7 @@ function imageFilterParams() {
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   if ($("filter-predictions").checked) params.set("has_predictions", "true");
   if ($("image-review").value) params.set("review", $("image-review").value);
+  if ($("image-reviewer").value) params.set("reviewer", $("image-reviewer").value);
   if ($("image-issues").value) params.set("issue", $("image-issues").value);
   if (state.meta.category !== "classification") {
     for (const [id, key] of [["label-min", "min_labels"], ["label-max", "max_labels"]]) {
@@ -686,9 +748,10 @@ function renderImageCard(item, index) {
     `<span class="chip" style="--c:${classColor(id)}">${esc(state.meta.names[id] ?? `class ${id}`)}</span>`).join("");
   const more = item.classes.length > 3 ? `<span class="chip">+${item.classes.length - 3}</span>` : "";
   return `<article class="card ${state.imageSelection.has(item.id) ? "selected" : ""}" data-image="${item.id}" data-index="${index}" tabindex="0">
-      <div class="thumb"><img loading="lazy" src="${apiUrl(`/images/${item.id}/thumbnail?size=320${overlay}`)}" alt="">
+      <div class="thumb"><img loading="lazy" src="${apiUrl(`/images/${item.id}/thumbnail?size=320${overlay}${overlay ? `&v=${item.v ?? 0}` : ""}`)}" alt="">
         <input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for a range, or drag a rectangle from the space between images)" aria-label="Select ${esc(item.name)}" ${state.imageSelection.has(item.id) ? "checked" : ""}>
-        ${item.review ? `<span class="review-flag ${item.review}" title="${item.review === "done" ? "Reviewed: done" : "Review: needs work"}">${item.review === "done" ? "✓" : "⚑"}</span>` : ""}
+        ${item.review ? `<span class="review-flag ${item.review}" title="${item.review === "done" ? "Reviewed: done" : "Review: needs work"}${item.reviewed_by ? ` (${esc(reviewerName(item.reviewed_by))})` : ""}">${item.review === "done" ? "✓" : "⚑"}</span>` : ""}
+        ${presenceBadge(item.id)}
         ${item.issue_count ? `<span class="issue-flag">${item.issue_count} ⚠</span>` : ""}
         ${state.pred.pending[item.id] ? `<span class="pred-flag" title="Pending predictions">${state.pred.pending[item.id]} ✨</span>` : ""}</div>
       <div class="card-body">
@@ -932,7 +995,7 @@ async function runObjectBulk(action, classId = null) {
     ({ image_id: item.image_id, annotation_id: item.id, action, class_id: classId }));
   if (!operations.length) return;
   try {
-    const result = await api("/objects/bulk", { method: "POST", body: JSON.stringify({ operations }) });
+    const result = await api("/objects/bulk", { method: "POST", body: JSON.stringify({ operations, schema_generation: state.meta.schema_generation }) });
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();
@@ -969,7 +1032,7 @@ export async function editObject(imageId, id, change) {
     else detail.annotations = detail.annotations.filter(a => a.id !== id);
     await api(`/images/${imageId}/annotations`, {
       method: "PUT",
-      body: JSON.stringify({ revision: detail.revision, annotations: detail.annotations }),
+      body: JSON.stringify({ revision: detail.revision, schema_generation: state.meta.schema_generation, annotations: detail.annotations }),
     });
     state.canUndo = true;
     state.canRedo = false;
@@ -1150,8 +1213,11 @@ async function fixAllIssues(kind, count) {
 
 configureCanvas({
   acceptPredictions,
+  // a save refused because someone changed the classes: take the new class list (the editor stays open)
+  classesChanged: () => refreshMeta().catch(error => toast(error.message, "error")),
   classOptions,
   datasetChanged,
+  editorOpened: id => { clearEditorNotice(); editorShows(id); },
   drawPredictions,
   drawSam,
   hitPrediction,
@@ -1161,6 +1227,7 @@ configureCanvas({
   loadIssues,
   loadObjects,
   predictImage,
+  renderAttribution,
   renderPredList,
   samHint,
   samImageOpened,
@@ -1189,6 +1256,7 @@ configurePredictor({
 });
 configureSam({ render, save, shapePath, toast, toScreen, updateStatus });
 configureRepair({ datasetChanged, labelsChanged, toast });
+configureCollab({ datasetChanged, imagesChanged, presenceChanged: () => imageGallery?.render(), reloadEditor, toast });
 configureLabelQA({ labelsChanged, openEditor, toast });
 configureEmbeddings({ classOptions, editObject, toast });
 configureManage({ datasetChanged, toast });

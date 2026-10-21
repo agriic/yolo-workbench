@@ -13,6 +13,8 @@ import threading
 import time
 from typing import Callable
 
+from . import identity
+
 log = logging.getLogger(__name__)
 
 MAX_FINISHED = 50
@@ -36,6 +38,8 @@ class Job:
         self.result: dict | None = None
         self.started = time.time()
         self.finished: float | None = None
+        self.started_by = identity.who()  # {name, display_name} with sign-in
+        self.identity = identity.snapshot()  # the work runs as whoever started it
         self._cancel = threading.Event()
         self._lock = threading.Lock()
 
@@ -71,6 +75,7 @@ class Job:
                 "cancel_requested": self._cancel.is_set(),
                 "started": self.started,
                 "finished": self.finished,
+                "started_by": self.started_by,
             }
 
 
@@ -93,7 +98,7 @@ class JobManager:
                 raise DatasetError("The server is shutting down; try again once it is back")
             self._jobs[job.id] = job
             self._prune()
-        log.info("job %s started: %s", job.id, title)
+        log.info("job %s started: %s%s", job.id, title, f" (by {job.started_by['name']})" if job.started_by else "")
         if self.synchronous:
             self._run(job, work)
         else:
@@ -105,7 +110,8 @@ class JobManager:
 
     def _run(self, job: Job, work: Callable[[Job], dict | None]) -> None:
         try:
-            result = work(job)
+            with identity.restored(job.identity), identity.action(job.kind):
+                result = work(job)
             state, error = ("cancelled" if job.cancel_requested else "done"), None
         except JobCancelled:
             result, state, error = None, "cancelled", None

@@ -1,7 +1,7 @@
 // Augmentation group of the new-run form: one card per augmentation with a slider and previews of the two ends of its
 // range, plus training samples with every augmentation at once. The server renders them with Ultralytics' own transforms
 // (GET /training/augment/{original,preview,sample}), so a preview is what training will do, labels included.
-import { $, apiUrl, esc, debounce } from "./api.js";
+import { $, apiUrl, esc, debounce, signIn } from "./api.js";
 
 const DET_SEG = ["detection", "segmentation"];
 const CLS = ["classification"];
@@ -374,6 +374,7 @@ export async function loadImage(img, url, noteEl) {
     const response = await fetch(url, { signal: controller.signal });
     if (!response.ok) {
       const body = await response.json().catch(() => ({ detail: response.statusText }));
+      if (response.status === 401) signIn();
       throw new Error(body.detail || response.statusText);
     }
     const note = decodeURIComponent(response.headers.get("X-Preview-Note") || "");

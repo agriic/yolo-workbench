@@ -39,7 +39,7 @@ from typing import Callable
 
 import yaml
 
-from . import frameworks
+from . import frameworks, identity
 from .dataset import Dataset, DatasetError, DatasetLocked  # noqa: F401  (DatasetLocked is part of this module's API)
 from .frameworks import (  # noqa: F401  (re-exported: the Ultralytics argument helpers used to live here)
     MANAGED_KEYS,
@@ -492,7 +492,7 @@ class TrainingManager:
                     error = state.get("error") or ("Stopped by user" if killed else "The training process exited unexpectedly; see the log")
                 self._write_state(run_dir, status=status, phase=status, finished=time.time(), eta=None, error=error)
             (workdir / "control.json").unlink(missing_ok=True)
-            log.info("training: run '%s' ended (%s)", active["dir"], status)
+            log.info("training: run '%s' of project %s ended (%s)", active["dir"], active.get("project") or "-", status)
         key = self._key(active)
         if active.get("auto_resume") and status in ("paused", "interrupted") and key not in self._queue["auto_resume"]:
             self._queue["auto_resume"].append(key)  # paused for a service stop or a maintenance hold
@@ -556,7 +556,7 @@ class TrainingManager:
             self._save_queue()
             self._handle = self.launcher(workdir / "spec.json", run_dir, self.weights_dir)
             _write_json(workdir / "process.json", {"pid": self._handle.pid, "create_time": _process_create_time(self._handle.pid), "started": time.time()})
-            log.info("training: launched run '%s' (pid %s)", meta.get("name", run_dir.name), self._handle.pid)
+            log.info("training: launched run '%s' of project %s (pid %s)", run_dir.name, entry.get("project") or "-", self._handle.pid)
         except Exception as exc:
             if self._queue["active"] is entry:
                 self._queue["active"] = None
@@ -787,6 +787,7 @@ class TrainingManager:
             "path": run_dir.as_posix(),
             "name": meta.get("name") or run_dir.name,
             "notes": meta.get("notes", ""),
+            "created_by": meta.get("created_by"),  # {name, display_name} with sign-in
             "source": source,
             "framework": framework.id,
             "status": status,
@@ -1177,7 +1178,7 @@ class TrainingManager:
             workdir = run_dir / META_DIR
             workdir.mkdir(parents=True)
             now = time.strftime("%Y-%m-%dT%H:%M:%S")
-            _write_json(workdir / "run.json", {"version": 1, "name": display, "notes": notes or "", "created": now, "source": "workbench", "framework": framework.id, "category": target.category, "task": TASKS[target.category], "base_model": framework.base_model(parsed["args"])})
+            _write_json(workdir / "run.json", {"version": 1, "name": display, "notes": notes or "", "created": now, "source": "workbench", "framework": framework.id, "category": target.category, "task": TASKS[target.category], "base_model": framework.base_model(parsed["args"]), "created_by": identity.who()})
             _write_json(workdir / "spec.json", {"version": 1, "framework": framework.id, "args": parsed["args"], "resume": False})
             self._write_state(run_dir, replace=True, status="queued", phase="queued", queued_at=time.time())
             self._queue["queue"].append({"project": project, "dir": directory})
@@ -1231,14 +1232,16 @@ class TrainingManager:
     def set_hold(self, held: bool, pause_active: bool = False) -> dict:
         """Hold the queue (nothing new launches; persisted across restarts) or release it. With `pause_active`
         the active run also pauses at its next checkpoint and resumes by itself once the queue is released."""
+        who = identity.who()
+        by = f" by {who['display_name']}" if who else ""
         with self._lock:
             self._queue["held"] = bool(held)
-            self._queue["held_reason"] = "Held for maintenance" if held else None
+            self._queue["held_reason"] = f"Held for maintenance{by}" if held else None
             if held and pause_active and self._queue["active"] is not None and self._active_alive(self._queue["active"]):
                 name = self._request_pause(self._queue["active"], "hold")
-                log.info("training: queue held; pausing run '%s'", name)
+                log.info("training: queue held%s; pausing run '%s'", by, name)
             else:
-                log.info("training: queue %s", "held" if held else "released")
+                log.info("training: queue %s%s", "held" if held else "released", by)
             self._save_queue()
         self.tick()
         return self.queue()

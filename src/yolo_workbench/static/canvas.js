@@ -40,6 +40,7 @@ export async function openEditor(id, focus = null, gridIndex = null) {
   state.detail = detail;
   state.editorGridIndex = Number.isInteger(gridIndex) ? gridIndex : null;
   savedRevisionByImage.set(id, detail.revision);
+  deps.editorOpened(id);
   state.pred.items = [];
   deps.loadEditorPredictions(id);
   deps.samImageOpened();
@@ -608,6 +609,7 @@ export async function save(selectIndex = null) {
         method: "PUT",
         body: JSON.stringify({
           revision: savedRevisionByImage.get(image.id) ?? image.revision,
+          schema_generation: state.meta.schema_generation,  // the class list these class ids come from
           annotations,
         }),
       });
@@ -618,6 +620,7 @@ export async function save(selectIndex = null) {
       deps.statisticsChanged();
     } catch (error) {
       deps.toast(error.message, "error");
+      if (error.status === 409 && error.body?.schema_generation != null) await deps.classesChanged();
       if (request === editorRequest && state.detail?.id === image.id && latestSaveByImage.get(image.id) === sequence) {
         try {
           detail = await api(`/images/${image.id}`);
@@ -693,6 +696,7 @@ export function renderList() {
   if (!state.detail) return;
   const annotations = state.detail.annotations;
   renderLabelWarning();
+  deps.renderAttribution();
   if (state.meta.category === "classification") {
     $("annotation-count").textContent = "";
     $("annotation-list").innerHTML = annotations.map(a => `

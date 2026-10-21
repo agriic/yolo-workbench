@@ -106,7 +106,7 @@ def test_server_app_lifespan_health_and_guards(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     root = tmp_path / "projects"
     root.mkdir()
-    config = load_config(None, {"projects_root": root, "allowed_hosts": ["gpu-box"], "idle_unload_minutes": 0}, environ={})
+    config = load_config(None, {"projects_root": root, "allowed_hosts": ["gpu-box"], "idle_unload_minutes": 0, "auth_enabled": False}, environ={})
     app = build_app(config, root)
     lifecycle = app.state.lifecycle
     assert lifecycle.options.pause_training_on_stop and RUNTIME.server_mode and not RUNTIME.allow_path_import

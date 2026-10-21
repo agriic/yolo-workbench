@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass, field
 
+from . import identity
 from .dataset import Dataset
 from .embeddings import EmbeddingsManager
 from .labelqa import LabelQAManager
 from .predictor import UNLOAD_WAIT, PredictorManager
+
+PRESENCE_TTL = 30.0  # seconds a browser counts as still having an image open after its last heartbeat
 
 
 @dataclass
@@ -20,6 +24,9 @@ class DatasetSession:
     project: dict = field(default_factory=dict)
     labelqa: LabelQAManager | None = None
     last_used: float = field(default_factory=time.monotonic)  # last API request (projects mode closes idle sessions)
+    # who has which image open in the editor: browser tab -> {who, image_id, seen}; signed-in users only
+    presence: dict = field(default_factory=dict)
+    _presence_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @classmethod
     def open(cls, dataset: Dataset, predictor: PredictorManager | None = None, slug: str | None = None, project: dict | None = None) -> "DatasetSession":
@@ -37,6 +44,30 @@ class DatasetSession:
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
+
+    def set_presence(self, image_id: str | None) -> None:
+        """The requesting browser tab has `image_id` open in the editor (None: closed it)."""
+        who, client = identity.who(), identity.current_client()
+        if who is None or client is None:
+            return
+        with self._presence_lock:
+            if image_id is None:
+                self.presence.pop(client, None)
+            else:
+                self.presence[client] = {"who": who, "image_id": image_id, "seen": time.monotonic()}
+
+    def others_present(self) -> dict[str, list[dict]]:
+        """image id -> the other people who have it open (not the requester; each person once)."""
+        me, my_name = identity.current_client(), identity.current_user_name()
+        now = time.monotonic()
+        found: dict[str, dict[str, dict]] = {}
+        with self._presence_lock:
+            for client, entry in list(self.presence.items()):
+                if now - entry["seen"] > PRESENCE_TTL:
+                    del self.presence[client]
+                elif client != me and entry["who"]["name"] != my_name:
+                    found.setdefault(entry["image_id"], {})[entry["who"]["name"]] = entry["who"]
+        return {image_id: list(people.values()) for image_id, people in found.items()}
 
     def close(self, timeout: float = 5.0) -> None:
         """Stop this dataset's background work (prediction batch, Label QA, size probing) and drop its model.

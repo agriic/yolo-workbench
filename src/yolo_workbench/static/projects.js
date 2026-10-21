@@ -1,4 +1,5 @@
 import { watchServerStatus } from "./status.js";
+import { showUser } from "./user.js";
 import { $, api, esc } from "./api.js";
 
 let projects = [];
@@ -20,6 +21,7 @@ async function init() {
   const info = await api("/api/v1/app");
   if (info.mode !== "projects") { location.replace("/"); return; }
   watchServerStatus();
+  showUser(info);
   const message = sessionStorage.getItem("projects-message");
   if (message) {
     sessionStorage.removeItem("projects-message");

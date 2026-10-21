@@ -32,6 +32,7 @@ class ImageRecord:
     name_cf: str = ""
     probe_error: str | None = None
     review: str | None = None  # "done", "needs_work", or None (unreviewed); see review.py
+    reviewed_by: str | None = None  # the user name that set `review` (with sign-in)
 
     def summary(self) -> dict:
         return {
@@ -44,4 +45,5 @@ class ImageRecord:
             "classes": sorted(self.class_ids),
             "issue_count": len(self.issues),
             "review": self.review,
+            "reviewed_by": self.reviewed_by,
         }

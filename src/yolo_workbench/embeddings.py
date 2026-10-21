@@ -7,7 +7,7 @@ import hashlib
 import importlib.util
 import threading
 
-from . import libraries
+from . import identity, libraries
 from .dataset import Dataset
 
 
@@ -29,6 +29,7 @@ class EmbeddingsManager:
         self.error: str | None = None
         self.items: list[dict] | None = None
         self.source_generation: int | None = None
+        self.started_by: dict | None = None
         dataset.add_change_listener(self._annotations_changed)
         dataset.add_schema_listener(lambda _mapping: self._annotations_changed([], dataset.annotation_generation))
 
@@ -40,6 +41,7 @@ class EmbeddingsManager:
                 "brain_key": "gt_viz",
                 "dimensions": 3,
                 "source_generation": self.source_generation,
+                "started_by": self.started_by,
                 "items": self.items or [],
             }
 
@@ -58,6 +60,7 @@ class EmbeddingsManager:
             elif self.status != "computing":
                 self.status = "computing"
                 self.error = None
+                self.started_by = identity.who()
                 generation = self.dataset.annotation_generation
                 self._thread = threading.Thread(target=self._run, args=(generation,), daemon=True)
                 self._thread.start()

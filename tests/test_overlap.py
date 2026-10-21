@@ -69,12 +69,12 @@ def test_fix_refuses_different_classes(tmp_path):
 
 def test_bulk_fix_keeps_the_end_of_a_chain(tmp_path):
     # 1~2 and 2~3 overlap, 1 and 3 do not: deleting 2 settles both, 3 stays
-    dataset, label = make(tmp_path, "0 0.5 0.5 0.2 0.2\n0 0.52 0.5 0.2 0.2\n0 0.54 0.5 0.2 0.2\n")
+    dataset, label = make(tmp_path, "0 0.5 0.5 0.2 0.2\n0 0.51 0.5 0.2 0.2\n0 0.52 0.5 0.2 0.2\n")  # IoU 0.90, 0.90; 0.82
     pairs = [(issue["other_annotation_id"][-1], issue["annotation_id"][-1]) for issue in overlaps(dataset)]
     assert pairs == [("1", "2"), ("2", "3")]
     result = dataset.fix_issues_bulk("overlap")
     assert result["files"] == 1
-    assert label.read_text().splitlines() == ["0 0.5 0.5 0.2 0.2", "0 0.54 0.5 0.2 0.2"]
+    assert label.read_text().splitlines() == ["0 0.5 0.5 0.2 0.2", "0 0.52 0.5 0.2 0.2"]
 
 
 def test_segmentation_compares_filled_polygons(tmp_path):

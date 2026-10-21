@@ -1,5 +1,6 @@
 import { $, api, apiUrl, clamp, classColor, esc } from "./api.js";
 import { state } from "./state.js";
+import { startedBy } from "./collab.js";
 let deps;
 
 export function configureEmbeddings(dependencies) {
@@ -34,7 +35,7 @@ export function applyEmbedState(data) {
   $("compute-embeddings").textContent = embed.status === "ready" ? "Recompute gt_viz" : "Compute gt_viz";
   const statusText = {
     idle: "Not computed yet — click “Compute gt_viz”",
-    computing: "Computing embeddings… this can take a while",
+    computing: `Computing embeddings… this can take a while${startedBy(data.started_by)}`,
     ready: `${embed.items.length} objects`,
     error: embed.error || "Failed",
     unavailable: embed.error || "fiftyone is not installed",

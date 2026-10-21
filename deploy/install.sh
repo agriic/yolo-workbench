@@ -56,6 +56,7 @@ mv -T "$PREFIX/current.new" "$PREFIX/current"
 
 echo
 echo "Installed $VERSION.${PREVIOUS:+ Previous release: $PREVIOUS (rollback: sudo ln -sfn $PREVIOUS $PREFIX/current && sudo systemctl restart yolo-workbench)}"
+echo "Account: sudo -u $ACCOUNT $PREFIX/current/.venv/bin/yolo-workbench-server user add <name> --admin --config /etc/yolo-workbench/config.toml"
 echo "Check:   sudo -u $ACCOUNT $PREFIX/current/.venv/bin/yolo-workbench-server check --config /etc/yolo-workbench/config.toml"
 echo "Start:   sudo systemctl enable --now yolo-workbench    (after an upgrade: sudo systemctl restart yolo-workbench)"
 echo "Logs:    journalctl -u yolo-workbench -f"

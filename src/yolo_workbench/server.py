@@ -2,12 +2,14 @@
 
     yolo-workbench-server run --config /etc/yolo-workbench/config.toml
     yolo-workbench-server check --config /etc/yolo-workbench/config.toml
+    yolo-workbench-server user add alice --admin --config /etc/yolo-workbench/config.toml
 
 `run` never prompts and never opens a browser. It validates the configuration, points every library
 cache at the configured cache folder (before torch/Ultralytics/FiftyOne are imported), takes the owner
 lock of the projects folder, and serves until SIGTERM: then the lifespan pauses the active training run
 at its next checkpoint (resumed at the next start) and shuts the rest down in order (lifecycle.py).
-The desktop command (`yolo-workbench`, cli.py) is unchanged.
+With `[auth] enabled` (the default) everyone signs in with an account made by `user add` (auth.py).
+The desktop command (`yolo-workbench`, cli.py) is unchanged and has no sign-in.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ from .config import ConfigError, ServerConfig, load_config
 from .ownership import AlreadyOwned, OwnerLock
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the YOLO Workbench as a server (projects mode).")
+user_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Manage the accounts people sign in with (stored in <projects_root>/.workbench/users.json).")
+app.add_typer(user_app, name="user")
 log = logging.getLogger("yolo_workbench.server")
 
 OWNER_DIR = ".workbench"  # workspace-level server state inside the projects folder
@@ -89,6 +93,7 @@ def lifecycle_options(config: ServerConfig):
 def build_app(config: ServerConfig, root: Path):
     """The projects-mode app with the server profile (also used by tests)."""
     from . import runtime
+    from .auth import Auth
     from .media_cache import MediaCache, default_cache_dir
     from .web import create_workspace_app
     from .workspace import Workspace
@@ -99,7 +104,10 @@ def build_app(config: ServerConfig, root: Path):
     workspace.training.resume_after_service_stop = config.resume_after_service_stop
     workspace.training.hold_queue_after_crash = config.hold_queue_after_crash
     media = MediaCache(default_cache_dir(), max_bytes=config.media_cache_mb * 1024 * 1024)
-    return create_workspace_app(workspace, media_cache=media, allowed_hosts=config.allowed_host_set(), require_header=True, lifecycle_options=lifecycle_options(config))
+    auth = Auth(root / OWNER_DIR, config.session_days) if config.auth_enabled else None
+    if auth is not None and auth.users.count() == 0:
+        log.warning("sign-in is on but there are no user accounts yet: add one with `yolo-workbench-server user add <name> --admin`")
+    return create_workspace_app(workspace, media_cache=media, allowed_hosts=config.allowed_host_set(), require_header=True, lifecycle_options=lifecycle_options(config), auth=auth)
 
 
 @app.command()
@@ -127,7 +135,7 @@ def run(
 
         app_instance = build_app(settings, root)
         app_instance.state.owner_lock = lock
-        log.info("serving %s on http://%s:%s (allowed hosts: %s)", root, settings.host or "*", settings.port, ", ".join(sorted(settings.allowed_host_set() or ["any"])))
+        log.info("serving %s on http://%s:%s (allowed hosts: %s; sign-in %s)", root, settings.host or "*", settings.port, ", ".join(sorted(settings.allowed_host_set() or ["any"])), "on" if settings.auth_enabled else "off")
         uvicorn.run(
             app_instance,
             host=settings.host,
@@ -182,6 +190,18 @@ def check(
         report(os.access(cache, os.W_OK), "cache folder", str(cache))
     except OSError as exc:
         report(False, "cache folder", f"{cache}: {exc}")
+    if settings.auth_enabled:
+        if root.is_dir():
+            from .auth import Auth, AuthError
+
+            try:
+                users = Auth(root / OWNER_DIR, settings.session_days).users.list()
+                admins = sum(1 for user in users if user["admin"])
+                report(None if not users else True, "sign-in", f"{len(users)} account(s), {admins} administrator(s)" if users else "no accounts yet: nobody can sign in. Add one: yolo-workbench-server user add <name> --admin")
+            except AuthError as exc:
+                report(False, "sign-in", str(exc))
+    else:
+        report(None, "sign-in", "turned off: anyone who reaches the port can use every project")
     hosts = settings.allowed_host_set()
     report(True, "listening", f"http://{settings.host or '*'}:{settings.port}, Host header {'not checked' if hosts is None else 'one of ' + ', '.join(sorted(hosts))}")
     try:
@@ -197,7 +217,7 @@ def check(
     for module, label in (("ultralytics", "Ultralytics"), ("rfdetr", "RF-DETR")):
         try:
             imported = __import__(module)
-            report(True, label, getattr(imported, "__version__", "installed"))
+            report(True, label, getattr(imported, "__version__", None) or _distribution_version(module))
         except Exception as exc:
             report(False, label, str(exc))
     if settings.embeddings_enabled:
@@ -215,6 +235,117 @@ def check(
     else:
         report(True, "embeddings", "turned off")
     raise typer.Exit(1 if failures else 0)
+
+
+def _distribution_version(name: str) -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version(name)
+    except PackageNotFoundError:
+        return "installed"
+
+
+# ---------- user accounts ----------
+
+ConfigOption = typer.Option(None, "--config", "-c", envvar="WORKBENCH_CONFIG", dir_okay=False, help="TOML configuration file")
+ProjectsOption = typer.Option(None, "--projects", file_okay=False, help="Projects folder (overrides [server] projects_root)")
+
+
+def _users(config: Optional[Path], projects: Optional[Path]):
+    from .auth import UserStore
+
+    try:
+        settings = load_config(config, {"projects_root": projects}, serving=False)
+    except ConfigError as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    root = settings.projects_root
+    if not root.is_dir():
+        typer.echo(f"Error: the projects folder {root} does not exist", err=True)
+        raise typer.Exit(2)
+    return UserStore(root / OWNER_DIR)
+
+
+def _password(from_stdin: bool) -> str:
+    if from_stdin:
+        return sys.stdin.readline().rstrip("\r\n")
+    return typer.prompt("Password", hide_input=True, confirmation_prompt=True)
+
+
+def _account_command(action):
+    from .auth import AuthError
+
+    try:
+        return action()
+    except AuthError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+
+@user_app.command("add")
+def user_add(
+    name: str = typer.Argument(..., help="Sign-in name: lowercase letters, digits, '.', '_', '-'"),
+    display_name: Optional[str] = typer.Option(None, "--display-name", help="Name shown in the app (default: the sign-in name)"),
+    admin: bool = typer.Option(False, "--admin", help="Mark the account as an administrator"),
+    password_stdin: bool = typer.Option(False, "--password-stdin", help="Read the password from the first line of stdin instead of prompting"),
+    config: Optional[Path] = ConfigOption,
+    projects: Optional[Path] = ProjectsOption,
+) -> None:
+    """Create an account."""
+    from .auth import normalize_name
+
+    store = _users(config, projects)
+    name = _account_command(lambda: normalize_name(name))
+    if store.get(name) is not None:
+        typer.echo(f"Error: user {name} already exists", err=True)
+        raise typer.Exit(1)
+    user = _account_command(lambda: store.add(name, _password(password_stdin), display_name, admin))
+    typer.echo(f"Added {user.name}{' (administrator)' if user.admin else ''}")
+
+
+@user_app.command("passwd")
+def user_passwd(
+    name: str = typer.Argument(...),
+    password_stdin: bool = typer.Option(False, "--password-stdin", help="Read the password from the first line of stdin instead of prompting"),
+    config: Optional[Path] = ConfigOption,
+    projects: Optional[Path] = ProjectsOption,
+) -> None:
+    """Set a new password; the account's sign-ins end."""
+    store = _users(config, projects)
+    if store.get(name.strip().lower()) is None:
+        typer.echo(f"Error: there is no user {name}", err=True)
+        raise typer.Exit(1)
+    _account_command(lambda: store.set_password(name.strip().lower(), _password(password_stdin)))
+    typer.echo(f"Changed the password of {name.strip().lower()}; its sign-ins have ended")
+
+
+@user_app.command("remove")
+def user_remove(name: str = typer.Argument(...), config: Optional[Path] = ConfigOption, projects: Optional[Path] = ProjectsOption) -> None:
+    """Delete an account; its sign-ins end. What the person did stays attributed to the name."""
+    store = _users(config, projects)
+    _account_command(lambda: store.remove(name))
+    typer.echo(f"Removed {name.strip().lower()}")
+
+
+@user_app.command("admin")
+def user_admin(name: str = typer.Argument(...), revoke: bool = typer.Option(False, "--revoke", help="Take the administrator mark away"), config: Optional[Path] = ConfigOption, projects: Optional[Path] = ProjectsOption) -> None:
+    """Mark an account as an administrator (or --revoke it)."""
+    store = _users(config, projects)
+    user = _account_command(lambda: store.update(name, admin=not revoke))
+    typer.echo(f"{user.name} is {'an administrator' if user.admin else 'no longer an administrator'}")
+
+
+@user_app.command("list")
+def user_list(config: Optional[Path] = ConfigOption, projects: Optional[Path] = ProjectsOption) -> None:
+    """List the accounts."""
+    users = _account_command(lambda: _users(config, projects).list())
+    if not users:
+        typer.echo("No accounts yet. Add one: yolo-workbench-server user add <name> --admin")
+        return
+    width = max(len(user["name"]) for user in users)
+    for user in users:
+        typer.echo(f"{user['name']:<{width}}  {user['display_name']:<24}  {'admin' if user['admin'] else '     '}  last sign-in {user['last_login'] or 'never'}")
 
 
 def main() -> None:  # pragma: no cover - console script

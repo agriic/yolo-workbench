@@ -1,6 +1,7 @@
 import { $, api, apiUrl, esc } from "./api.js";
 import { state } from "./state.js";
 import { applyPredictorState } from "./predictor.js";
+import { startedBy } from "./collab.js";
 let deps;
 
 // Label QA tab: run the loaded model over the dataset, list where it disagrees with the labels.
@@ -168,11 +169,11 @@ function renderSetup() {
   $("qa-progress").value = job.done;
   let text;
   if (status.predictor.status === "unavailable") text = "Label QA needs ultralytics (run 'uv sync').";
-  else if (running) text = `Analyzing ${job.done.toLocaleString()} / ${job.total.toLocaleString()} images…`;
+  else if (running) text = `Analyzing ${job.done.toLocaleString()} / ${job.total.toLocaleString()} images…${startedBy(result?.started_by)}`;
   else if (!loadedChosen && choice) text = "Load the model, then analyze. The best weights of a training run on this dataset work well.";
   else if (result) {
     const when = new Date(result.created).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-    text = `Results of ${result.model_name} on ${result.images.toLocaleString()} image${result.images === 1 ? "" : "s"} (${result.split}) · ${when}`;
+    text = `Results of ${result.model_name} on ${result.images.toLocaleString()} image${result.images === 1 ? "" : "s"} (${result.split}) · ${when}${startedBy(result.started_by)}`;
     if (result.unmapped.length) text += ` · model classes not in this dataset are ignored: ${result.unmapped.join(", ")}`;
   } else text = "Analyze runs the model over the images and compares its predictions with the labels.";
   $("qa-status").textContent = text;

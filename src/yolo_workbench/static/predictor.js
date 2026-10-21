@@ -1,5 +1,6 @@
 import { $, api, classColor, esc, pointInPolygon } from "./api.js";
 import { state } from "./state.js";
+import { startedBy } from "./collab.js";
 let deps;
 
 export function configurePredictor(dependencies) {
@@ -81,8 +82,8 @@ export function applyPredictorState(data) {
     loading: "Loading model…",
     error: pred.error || "Failed to load model",
     ready: running
-      ? `Predicting ${pred.job.done}/${pred.job.total} · ${pred.job.completed || 0} completed · ${pred.job.failed || 0} failed${pred.job.cancel_requested ? " · cancelling…" : ""}`
-      : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""}`,
+      ? `Predicting ${pred.job.done}/${pred.job.total} · ${pred.job.completed || 0} completed · ${pred.job.failed || 0} failed${pred.job.cancel_requested ? " · cancelling…" : ""}${startedBy(pred.job.started_by)}`
+      : `${Object.keys(pred.names).length} model classes${unmapped ? ` · ${unmapped} unmapped` : ""}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""}${startedBy(data.loaded_by).replace("started", "loaded")}`,
   }[pred.status] || "";
   if (data.gpu_warning) $("predictor-status").textContent += `${$("predictor-status").textContent ? " · " : ""}${data.gpu_warning}`;
   $("predictor-status").title = $("predictor-status").textContent;

@@ -78,6 +78,13 @@ max_open_projects = 4
 # Closing ends its undo history.
 project_idle_close_min = 60.0
 
+[auth]
+# Everyone signs in with an account made by `yolo-workbench-server user add` (stored in
+# <projects_root>/.workbench/users.json). Off: anyone who reaches the port can use every project.
+enabled = true
+# A sign-in stays valid this many days after it was last used.
+session_days = 30.0
+
 [embeddings]
 # The Embeddings tab (FiftyOne + MongoDB). Everything else works without it.
 enabled = true

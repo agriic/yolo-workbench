@@ -5,13 +5,22 @@ export const $ = id => document.getElementById(id);
 let apiBase = "/api/v1";
 export const setApiBase = base => { apiBase = base; };
 export const apiUrl = path => path.startsWith("/api/") ? path : `${apiBase}${path}`;
+// This browser tab, so the server can tell its changes from other people's (and other tabs').
+export const CLIENT_ID = (crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`).replace(/[^A-Za-z0-9-]/g, "");
+
+// 401: the sign-in ended (server profile). Go to the login page, which comes back here afterwards.
+export const signIn = () => {
+  if (location.pathname !== "/login.html") location.assign(`/login.html?next=${encodeURIComponent(location.pathname + location.search)}`);
+};
 export const api = async (path, options = {}) => {
   // X-Workbench marks the request as coming from this UI; the server refuses mutating requests without it
-  const headers = { "Content-Type": "application/json", "X-Workbench": "1", ...(options.headers || {}) };
+  const headers = { "Content-Type": "application/json", "X-Workbench": "1", "X-Workbench-Client": CLIENT_ID, ...(options.headers || {}) };
   const response = await fetch(apiUrl(path), { ...options, headers });
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail || response.statusText);
+    if (response.status === 401) signIn();
+    // status and body travel with the error: a 409 may say more (e.g. a changed class list)
+    throw Object.assign(new Error(body.detail || response.statusText), { status: response.status, body });
   }
   return response.json();
 };

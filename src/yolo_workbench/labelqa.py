@@ -30,6 +30,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from . import identity
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError
 from .imaging import upright_rgb
 from .models import Annotation, ImageRecord
@@ -109,6 +110,7 @@ class LabelQAManager:
                     "created": result["created"],
                     "finished": result.get("finished"),
                     "split": result["split"],
+                    "started_by": result.get("started_by"),
                     "images": len(result["images"]),
                     "unmapped": sorted(result["names"][model_id] for model_id, target in result["mapping"].items() if target is None and model_id in result["names"]),
                 }
@@ -157,6 +159,7 @@ class LabelQAManager:
                 "names": dict(backend.names),
                 "mapping": mapping,
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "started_by": identity.who(),
                 "finished": None,
                 "split": split or "all",
                 "images": {},

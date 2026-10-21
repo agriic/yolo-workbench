@@ -1,5 +1,6 @@
-import { $, api, apiUrl, esc, classColor, formatBytes } from "./api.js";
+import { $, api, apiUrl, esc, classColor, formatBytes, signIn } from "./api.js";
 import { state } from "./state.js";
+import { startedBy } from "./collab.js";
 let deps;
 
 export function configureManage(dependencies) {
@@ -541,6 +542,7 @@ async function loadCropSample(index) {
   const query = new URLSearchParams({ ...importSource, file: samples[index] });
   try {
     const response = await fetch(apiUrl(`/import/sample?${query}`), { signal: controller.signal });
+    if (response.status === 401) signIn();
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || response.statusText);
     const [width, height] = (response.headers.get("X-Image-Size") || "0x0").split("x").map(Number);
     const url = URL.createObjectURL(await response.blob());
@@ -611,7 +613,7 @@ async function commitImport() {
 
 function trackJob(job, schema) {
   importJob = job;
-  showProgress(job.message || "Importing…", job.done, job.total);
+  showProgress(`${job.message || "Importing…"}${startedBy(job.started_by)}`, job.done, job.total);
   if (job.state === "running") {
     setTimeout(async () => {
       try { trackJob(await api(`/api/v1/jobs/${job.id}`), schema); }

@@ -9,8 +9,9 @@ After=network-online.target
 Wants=network-online.target
 # the projects folder's disk must be mounted first; the server refuses to start on a missing folder
 RequiresMountsFor=/srv/yolo-workbench /var/cache/yolo-workbench
-StartLimitIntervalSec=600
-StartLimitBurst=5
+# a crash loop stops after 10 starts within 5 minutes; manual restarts count too (systemctl reset-failed clears it)
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=exec
@@ -19,14 +20,18 @@ Group=yolo-workbench
 WorkingDirectory=/srv/yolo-workbench
 EnvironmentFile=-/etc/yolo-workbench/yolo-workbench.env
 ExecStart=/opt/yolo-workbench/current/.venv/bin/yolo-workbench-server run --config /etc/yolo-workbench/config.toml
-Restart=on-failure
+# always, not on-failure: the server exits cleanly on SIGTERM (it pauses training first), also when an OOM
+# killer (earlyoom, systemd-oomd) or a stray `kill` sends it; it must come back by itself. `systemctl stop`
+# and `restart` are not affected (systemd does not restart a unit it stopped).
+Restart=always
 RestartSec=10
 
 # Stopping: SIGTERM goes to the server only (KillMode=mixed). It asks the active training run to pause
 # at its next checkpoint, waits up to [training] pause_deadline_s, closes everything else within
 # shutdown_deadline_s, and exits. Whatever is left (a run that did not reach its checkpoint, dataloader
-# workers) gets SIGKILL at TimeoutStopSec; the run then resumes from its previous checkpoint at the next
-# start. Keep TimeoutStopSec above pause_deadline_s + shutdown_deadline_s (600 + 60 by default).
+# workers) gets SIGKILL as soon as the server has exited; the run then resumes from its previous checkpoint
+# at the next start. TimeoutStopSec bounds the server itself: keep it above pause_deadline_s +
+# shutdown_deadline_s (600 + 60 by default), or systemd kills everything before the run could pause.
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=720

@@ -141,11 +141,11 @@ Label and YAML files are written with LF line endings on every platform.
 
 ## Running it on a server
 
-`yolo-workbench-server` runs projects mode as an unattended systemd service for a team on an internal network: configuration file, no prompts or browser, a required Host allow-list, training runs paused at a checkpoint on restart and resumed, idle models unloaded, retention for trash and backups, health endpoints, journald logging. See [docs/server.md](docs/server.md) for installation (`sudo bash deploy/install.sh`), configuration and operation.
+`yolo-workbench-server` runs projects mode as an unattended systemd service for a team on an internal network: configuration file, no prompts or browser, a required Host allow-list, sign-in with accounts made by `yolo-workbench-server user add`, training runs paused at a checkpoint on restart and resumed, idle models unloaded, retention for trash and backups, health endpoints, journald logging. Several people can work in the same project at once: everyone undoes only their own changes, other people's edits show up within seconds, the editor says who else has an image open, and every change is attributed (who last edited or reviewed an image, a per-project activity log). See [docs/server.md](docs/server.md) for installation (`sudo bash deploy/install.sh`), configuration and operation.
 
 ## Security
 
-The desktop app is meant for one user on one machine. It binds to `127.0.0.1`, rejects requests whose `Host` is not local (DNS rebinding), and requires an `X-Workbench` header on every change (cross-site forms). Neither it nor the server has a login yet: binding to another address exposes your datasets to anyone who can reach it, and model files (`.pt`/`.pth`) run code when loaded. Only one workbench (desktop or server) can use a folder at a time.
+The desktop app is meant for one user on one machine. It binds to `127.0.0.1`, rejects requests whose `Host` is not local (DNS rebinding), and requires an `X-Workbench` header on every change (cross-site forms). The desktop app has no login: binding it to another address exposes your datasets to anyone who can reach it. The server asks everyone to sign in (over plain HTTP, meant for a trusted internal network), and model files (`.pt`/`.pth`) run code when loaded. Only one workbench (desktop or server) can use a folder at a time.
 
 ## Tests
 

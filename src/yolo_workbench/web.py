@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import math
 import os
 from contextlib import asynccontextmanager
@@ -19,8 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from . import augment_preview, classes, importer, rfdetr_augment, storage
-from .dataset import Dataset, DatasetError, WriteConflict
+from . import augment_preview, classes, identity, importer, rfdetr_augment, storage
+from .auth import Auth, AuthError, AuthMiddleware, current_user
+from .dataset import Dataset, DatasetError, SchemaChanged, WriteConflict
 from .fsutil import InsufficientSpace, ensure_free_space, replace
 from .imaging import upright_rgb
 from .importer import UploadTooLarge
@@ -34,6 +36,8 @@ from .sam import SamManager
 from .session import DatasetSession
 from .training import TrainingManager, ultralytics_defaults
 from .workspace import Workspace
+
+log = logging.getLogger(__name__)
 
 # Keep in sync with PALETTE in static/api.js so server-rendered overlays match the editor.
 PALETTE = ("#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#f97316", "#06b6d4", "#84cc16", "#a855f7", "#64748b")
@@ -56,6 +60,7 @@ class AnnotationPayload(StrictPayload):
 class AnnotationListPayload(StrictPayload):
     revision: int = Field(ge=1)
     annotations: list[AnnotationPayload]
+    schema_generation: int | None = None  # the class list the class ids were chosen from (409 when it changed)
 
 
 class BulkFixPayload(BaseModel):
@@ -73,6 +78,7 @@ class BulkObjectOperation(BaseModel):
 
 class BulkObjectPayload(BaseModel):
     operations: list[BulkObjectOperation]
+    schema_generation: int | None = None
 
 
 class PredictorLoadPayload(StrictPayload):
@@ -151,6 +157,11 @@ class UnknownClassPayload(BaseModel):
 class LabelTextPayload(BaseModel):
     revision: int = Field(ge=1)
     text: str = Field(max_length=5_000_000)
+    schema_generation: int | None = None
+
+
+class PresencePayload(BaseModel):
+    image_id: str | None = None  # None: the editor closed
 
 
 class ImageIdsPayload(BaseModel):
@@ -251,6 +262,16 @@ class TrainingHoldPayload(BaseModel):
     pause_active: bool = False  # also pause the active run at its next checkpoint; it resumes once released
 
 
+class LoginPayload(BaseModel):
+    name: str = Field(max_length=200)
+    password: str = Field(max_length=1000)
+
+
+class PasswordPayload(BaseModel):
+    current: str = Field(max_length=1000)
+    new: str = Field(max_length=1000)
+
+
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 CSRF_HEADER = "x-workbench"
 HEALTH_PATHS = {"/healthz", "/readyz"}
@@ -282,10 +303,12 @@ async def receive_file(request: Request, target: Path, limit: int, commit) -> di
         await run_in_threadpool(lambda: partial.unlink(missing_ok=True))
 
 
-def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager, sam: SamManager, lifecycle: Callable[[], Lifecycle | None] = lambda: None) -> APIRouter:
-    """Every per-dataset endpoint; mounted at /api/v1 (single mode) or /api/v1/projects/{slug}."""
+def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: TrainingManager, sam: SamManager, lifecycle: Callable[[], Lifecycle | None] = lambda: None, peek_session=None) -> APIRouter:
+    """Every per-dataset endpoint; mounted at /api/v1 (single mode) or /api/v1/projects/{slug}.
+    `peek_session` is the open session or None, without opening or touching it (the change feed's polls)."""
     router = APIRouter()
     current = Depends(get_session)
+    peeked = Depends(peek_session or get_session)
 
     def label_mtime(record: ImageRecord) -> int:
         try:
@@ -323,10 +346,10 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def statistics(session: DatasetSession = current):
         return session.dataset.statistics()
 
-    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, session: DatasetSession = current) -> dict:
+    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, session: DatasetSession = current) -> dict:
         """The gallery filters, shared by the image list and "next unreviewed"."""
         prediction_ids = session.predictor.pending_image_ids() if has_predictions else None
-        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None}
+        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None, "reviewer": reviewer or None}
 
     @router.get("/images")
     def images(filters: dict = Depends(image_filters), offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
@@ -392,7 +415,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     @router.put("/images/{image_id}/label-text")
     def write_label_text(image_id: str, payload: LabelTextPayload, session: DatasetSession = current):
         require_image(session, image_id)
-        return session.dataset.write_label_text(image_id, payload.text, payload.revision)
+        return session.dataset.write_label_text(image_id, payload.text, payload.revision, payload.schema_generation)
 
     @router.put("/images/{image_id}/annotations")
     def update_annotations(image_id: str, payload: AnnotationListPayload, session: DatasetSession = current):
@@ -401,9 +424,32 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
                 image_id,
                 [annotation.model_dump() for annotation in payload.annotations],
                 expected_revision=payload.revision,
+                schema_generation=payload.schema_generation,
             )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    # ---------- several people in one project ----------
+
+    @router.get("/changes")
+    def changes(since: int = Query(0, ge=0), feed: str | None = None, session: DatasetSession | None = peeked):
+        """What others changed since revision `since` of `feed`, and who has which image open (polled every few
+        seconds). Polling neither opens a closed project nor keeps an idle one open: `closed` says it is closed."""
+        if session is None:
+            return {"closed": True, "feed": None, "revision": 0, "reset": False, "structure": False, "schema": False, "images": {}, "presence": {}}
+        return {**session.dataset.changes(since, feed), "presence": session.others_present()}
+
+    @router.post("/presence")
+    def presence(payload: PresencePayload, session: DatasetSession = current):
+        """The editor of this browser tab shows `image_id` (heartbeat), or closed (None)."""
+        if payload.image_id is not None:
+            require_image(session, payload.image_id)
+        session.set_presence(payload.image_id)
+        return {"presence": session.others_present()}
+
+    @router.get("/activity")
+    def activity(limit: int = Query(100, ge=1, le=1000), image_id: str | None = None, user: str | None = None, session: DatasetSession = current):
+        return {"items": session.dataset.recent_activity(limit, image_id, user)}
 
     @router.get("/objects")
     def objects(class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
@@ -436,7 +482,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/objects/bulk")
     def bulk_objects(payload: BulkObjectPayload, session: DatasetSession = current):
-        return session.dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations])
+        return session.dataset.bulk_edit_objects([operation.model_dump() for operation in payload.operations], payload.schema_generation)
 
     # ---------- classes ----------
 
@@ -446,27 +492,33 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/classes")
     def class_add(payload: ClassAddPayload, session: DatasetSession = current):
-        return classes.add_classes(session.dataset, payload.names)
+        with identity.action("add classes"):
+            return classes.add_classes(session.dataset, payload.names)
 
     @router.patch("/classes/{class_id}")
     def class_rename(class_id: int, payload: ClassRenamePayload, session: DatasetSession = current):
-        return classes.rename_class(session.dataset, class_id, payload.name)
+        with identity.action("rename class"):
+            return classes.rename_class(session.dataset, class_id, payload.name)
 
     @router.post("/classes/merge")
     def class_merge(payload: ClassMergePayload, session: DatasetSession = current):
-        return classes.merge_classes(session.dataset, payload.source_ids, payload.target_id)
+        with identity.action("merge classes"):
+            return classes.merge_classes(session.dataset, payload.source_ids, payload.target_id)
 
     @router.post("/classes/reorder")
     def class_reorder(payload: ClassReorderPayload, session: DatasetSession = current):
-        return classes.reorder_classes(session.dataset, payload.order)
+        with identity.action("reorder classes"):
+            return classes.reorder_classes(session.dataset, payload.order)
 
     @router.post("/classes/{class_id}/remove")
     def class_remove(class_id: int, payload: ClassRemovePayload, session: DatasetSession = current):
-        return classes.remove_class(session.dataset, class_id, payload.mode, payload.target_id)
+        with identity.action("remove class"):
+            return classes.remove_class(session.dataset, class_id, payload.mode, payload.target_id)
 
     @router.post("/classes/unknown/{class_id}")
     def class_resolve_unknown(class_id: int, payload: UnknownClassPayload, session: DatasetSession = current):
-        return classes.resolve_unknown(session.dataset, class_id, payload.action, payload.target_id, payload.name)
+        with identity.action("resolve unknown class"):
+            return classes.resolve_unknown(session.dataset, class_id, payload.action, payload.target_id, payload.name)
 
     @router.get("/folders")
     def folder_list(session: DatasetSession = current):
@@ -474,11 +526,13 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/folders")
     def folder_add(payload: FolderAddPayload, session: DatasetSession = current):
-        return session.dataset.add_folder(payload.split, payload.path)
+        with identity.action("add folder"):
+            return session.dataset.add_folder(payload.split, payload.path)
 
     @router.post("/rescan")
     def rescan(session: DatasetSession = current):
-        return session.dataset.rescan()
+        with identity.action("rescan"):
+            return session.dataset.rescan()
 
     # ---------- storage (trash and backups) ----------
 
@@ -488,7 +542,8 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/storage/trash/{session_id}/restore")
     def storage_restore(session_id: str, session: DatasetSession = current):
-        return found(lambda: storage.restore_trash(session.dataset, session_id))
+        with identity.action("restore trash"):
+            return found(lambda: storage.restore_trash(session.dataset, session_id))
 
     @router.delete("/storage/{kind}/{session_id}")
     def storage_purge(kind: str, session_id: str, session: DatasetSession = current):
@@ -625,7 +680,8 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     @router.post("/images/{image_id}/predictions/accept")
     def accept_predictions(image_id: str, payload: PredictionAcceptPayload, session: DatasetSession = current):
         try:
-            return session.predictor.accept(image_id, payload.prediction_ids, payload.min_confidence)
+            with identity.action("accept predictions"):
+                return session.predictor.accept(image_id, payload.prediction_ids, payload.min_confidence)
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -676,7 +732,8 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/qa/images/{image_id}/findings/{key}/apply")
     def qa_apply(image_id: str, key: str, session: DatasetSession = current):
-        return found(lambda: labelqa(session).apply(image_id, key))
+        with identity.action("apply Label QA finding"):
+            return found(lambda: labelqa(session).apply(image_id, key))
 
     @router.post("/qa/images/{image_id}/findings/{key}/dismiss")
     def qa_dismiss(image_id: str, key: str, session: DatasetSession = current):
@@ -833,16 +890,24 @@ async def _lifespan(app: FastAPI):
             await run_in_threadpool(lifecycle.shutdown)
 
 
-def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, require_header: bool) -> FastAPI:
+def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, require_header: bool, auth: Auth | None = None) -> FastAPI:
     app = FastAPI(title="YOLO Dataset Workbench", version="0.1.0", lifespan=_lifespan)
     app.state.jobs = jobs
     app.state.ready = False
     app.state.stopping = False
     app.state.owner_lock = None  # the OwnerLock the CLI/server holds, for /readyz
+    app.state.auth = auth
+    app.add_middleware(identity.RequestContextMiddleware)  # the browser tab (X-Workbench-Client), innermost
+    if auth is not None:
+        app.add_middleware(AuthMiddleware, auth=auth)  # inside the Host/header guard below (added later = outer)
 
     @app.exception_handler(DatasetError)
     async def dataset_error(_, exc: DatasetError):
         return Response(content=f'{{"detail": {json_string(str(exc))}}}', status_code=400, media_type="application/json")
+
+    @app.exception_handler(AuthError)
+    async def auth_error(_, exc: AuthError):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @app.exception_handler(UploadTooLarge)
     async def upload_too_large(_, exc: UploadTooLarge):
@@ -851,6 +916,11 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
     @app.exception_handler(InsufficientSpace)
     async def insufficient_space(_, exc: InsufficientSpace):
         return JSONResponse(status_code=507, content={"detail": str(exc)})
+
+    @app.exception_handler(SchemaChanged)
+    async def schema_changed(_, exc: SchemaChanged):
+        mapping = None if exc.mapping is None else {str(old): new for old, new in exc.mapping.items()}
+        return JSONResponse(status_code=409, content={"detail": str(exc), "schema_generation": exc.generation, "mapping": mapping})
 
     @app.exception_handler(WriteConflict)
     async def conflict_error(_, exc: WriteConflict):
@@ -862,7 +932,52 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
 
     @app.get("/api/v1/app")
     def app_info():
-        return {"mode": mode, "version": app.version, "server": RUNTIME.server_mode, "features": {"path_import": RUNTIME.allow_path_import, "model_upload": True}}
+        user = current_user()
+        return {"mode": mode, "version": app.version, "server": RUNTIME.server_mode, "features": {"path_import": RUNTIME.allow_path_import, "model_upload": True}, "auth": auth is not None, "user": user.public() if user else None}
+
+    # ---------- sign-in (server profile) ----------
+
+    def require_auth() -> Auth:
+        if auth is None:
+            raise HTTPException(404, "Sign-in is not enabled on this server")
+        return auth
+
+    @app.get("/api/v1/auth/me")
+    def auth_me():
+        user = current_user()
+        return {"auth": auth is not None, "user": user.public() if user else None}
+
+    @app.post("/api/v1/auth/login")
+    def auth_login(payload: LoginPayload, request: Request):
+        try:
+            user, token = require_auth().login(payload.name, payload.password)
+        except AuthError:
+            log.info("auth: failed sign-in as %r from %s", payload.name[:64], request.client.host if request.client else "?")
+            raise
+        log.info("auth: %s signed in from %s", user.name, request.client.host if request.client else "?")
+        response = JSONResponse({"user": user.public()})
+        response.headers["set-cookie"] = auth.session_cookie(token)
+        response.headers["cache-control"] = "no-store"
+        return response
+
+    @app.post("/api/v1/auth/logout")
+    def auth_logout(request: Request):
+        response = JSONResponse({"signed_out": True})
+        if auth is not None:
+            auth.logout(auth.cookie_token(request.headers.get("cookie")))
+            response.headers["set-cookie"] = auth.clear_cookie()
+        return response
+
+    @app.post("/api/v1/auth/password")
+    def auth_password(payload: PasswordPayload):
+        user = current_user()
+        if user is None:
+            raise HTTPException(401, "Sign in to continue")
+        token = require_auth().change_password(user, payload.current, payload.new)
+        log.info("auth: %s changed their password (other sessions ended)", user.name)
+        response = JSONResponse({"changed": True})
+        response.headers["set-cookie"] = auth.session_cookie(token)
+        return response
 
     @app.get("/healthz")
     def healthz():
@@ -993,10 +1108,10 @@ def _sam_routes(app: FastAPI, sam: SamManager) -> None:
         return payload(sam.start())
 
 
-def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None, sam: SamManager | None = None, lifecycle_options: LifecycleOptions | None = None) -> FastAPI:
+def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predictor: PredictorManager | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, jobs: JobManager | None = None, training: TrainingManager | None = None, sam: SamManager | None = None, lifecycle_options: LifecycleOptions | None = None, auth: Auth | None = None) -> FastAPI:
     """Single-dataset mode: the dataset API lives directly under /api/v1."""
     jobs = jobs or JobManager()
-    app = _base_app("single", jobs, allowed_hosts, require_header)
+    app = _base_app("single", jobs, allowed_hosts, require_header, auth)
     training = training or TrainingManager.for_dataset(dataset, jobs=jobs)
     training.attach(dataset)
     _training_routes(app, training)
@@ -1016,9 +1131,9 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     return app
 
 
-def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, sam: SamManager | None = None, lifecycle_options: LifecycleOptions | None = None) -> FastAPI:
+def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = None, allowed_hosts: set[str] | None = None, require_header: bool = False, sam: SamManager | None = None, lifecycle_options: LifecycleOptions | None = None, auth: Auth | None = None) -> FastAPI:
     """Projects mode: workspace endpoints plus the dataset API under /api/v1/projects/{slug}."""
-    app = _base_app("projects", workspace.jobs, allowed_hosts, require_header)
+    app = _base_app("projects", workspace.jobs, allowed_hosts, require_header, auth)
     app.state.workspace = workspace
     _training_routes(app, workspace.training)
     sam = sam or SamManager()
@@ -1033,6 +1148,9 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
             return workspace.session(slug)
         except KeyError as exc:
             raise HTTPException(404, "Project not found") from exc
+
+    def peek_session(slug: str) -> DatasetSession | None:
+        return workspace.sessions.get(slug)
 
     def not_found(call):
         try:
@@ -1077,7 +1195,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     def trash_purge(entry: str):
         return not_found(lambda: workspace.purge(entry))
 
-    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training, sam, lambda: app.state.lifecycle), prefix="/api/v1/projects/{slug}")
+    app.include_router(dataset_router(project_session, cache, workspace.jobs, workspace.training, sam, lambda: app.state.lifecycle, peek_session), prefix="/api/v1/projects/{slug}")
     _mount_static(app)
     return app
 

@@ -9,21 +9,84 @@ Checked against the repository on 2026-10-21 (after `7b7c4a9`, which unloads mod
 
 ## Implementation status (2026-10-21)
 
-Stages 1–4 and 6 are implemented (uncommitted at the time of writing); stage 5 needs the real server.
+Stages 1–4 and 6 are implemented (commit `59c003f`); stages 7 and 8 are implemented on top (uncommitted at the
+time of writing). Stage 5 was run as far as possible on a Linux workstation with an RTX 3070 Laptop GPU (8 GB),
+without root: the service ran as a transient **user** systemd unit with the deploy unit's stop/restart settings.
 Operator documentation: `docs/server.md`.
 
 | Stage | State | Where / notes |
 | --- | --- | --- |
 | 1 | done | `config.py`, `server.py` (`run`, `check`), `ownership.py` (desktop CLI takes the lock too), `logs.py`, `runtime.py`; `/healthz`, `/readyz`; cache dirs and `YOLO_AUTOINSTALL=false` set before heavy imports; path import off and no cwd model scan in server mode. Added `[logging] access_log` (off: the UI polls every few seconds). |
 | 2 | done | `lifecycle.py` + FastAPI lifespan in both factories; `TrainingManager.begin_shutdown`/`wait_for_pause`, `set_hold` (persisted), `auto_resume`, active entry saved before `Popen` and `_find_runner` reattach, `hold_queue_after_crash`; `JobManager.close`; `DatasetSession.close`. Interrupted imports are logged with `cancelled`. The desktop keeps its old behavior on exit (runs keep training). |
-| 3 | done | streamed uploads (413/507), staging cleanup in every open project, `fsutil.ensure_free_space`, bounded undo, daily session rotation, retention (trash/backups 30 days, deleted projects 30 days as answered), idle unload of SAM and prediction models, GPU warning or refusal, model upload into `models/`, disk warning banner (`status.js`). |
-| 4 | done | `pyproject.toml` (`dev` group, `psutil`, `tomli`, `yolo-workbench-server` script), `deploy/install.sh`, `deploy/yolo-workbench.service`, `deploy/config.example.toml`, `deploy/yolo-workbench.env`, `docs/server.md`, README/CLAUDE.md. The unit's hardening options are untested on Linux. |
-| 5 | to do on the server | checklist at the end of `docs/server.md`. Not verified here: systemd/`KillMode=mixed` behavior, real Ultralytics/RF-DETR pause and resume under `systemctl restart`, `install.sh`, a 24–72 h soak. A real-process test covers start, readiness, duplicate-owner refusal and signal shutdown (on Windows here). |
+| 3 | done | streamed uploads (413/507), staging cleanup in every open project, `fsutil.ensure_free_space`, bounded undo, daily session rotation, retention (trash/backups 30 days, deleted projects 30 days as answered), idle unload of SAM and prediction models, GPU warning or refusal, model upload into `models/`, disk warning banner (`status.js`). `free_gpu_memory` also trims the heap (`malloc_trim`) after unloads. |
+| 4 | done | `pyproject.toml` (`dev` group, `psutil`, `tomli`, `yolo-workbench-server` script), `deploy/install.sh`, `deploy/yolo-workbench.service`, `deploy/config.example.toml`, `deploy/yolo-workbench.env`, `docs/server.md`, README/CLAUDE.md. Changed after stage 5: `Restart=always` (was `on-failure`), start limit 10 per 5 min (was 5 per 10 min). |
+| 5 | partly done here | See [Stage 5 results](#stage-5-results-on-the-workstation) below. Still to do on the real server, as root: `install.sh`, the unit's hardening options, a host reboot, a 24–72 h soak, an upgrade/rollback drill (a restore drill ran here). |
 | 6 | done (pulled forward) | `Workspace.sessions` pool (`max_open_projects`, LRU close of idle projects, `close_idle`), unload before training and `max_loaded_models` across open projects. |
+| 7 | done | `auth.py` (accounts in `.workbench/users.json` with scrypt hashes, hashed session tokens in `sessions.json` with sliding expiry, `AuthMiddleware`, `require_admin`), `yolo-workbench-server user add\|passwd\|remove\|admin\|list`, `[auth] enabled`/`session_days`, `/api/v1/auth/login\|logout\|me\|password`, `login.html`/`login.js`, `user.js` (header menu, change password). The cookie name carries a hash of the projects folder, so two servers on one host do not sign each other out. |
+| 8 | done | `identity.py` (user, browser tab, action label as context variables; jobs run as who started them), per-user undo/redo in `dataset.py` (`Transaction`, exact-content and class-list checks, "changed since by …"), change feed (`revision`, `/changes`, polled by `collab.js`; polling never opens a closed project, a reopened one resets pages), `schema_generation` on saves (409 with the class mapping), presence (`/presence`, editor heartbeat), attribution (`review.json` reviewed/edited by, `activity.py` → `activity.jsonl`, `/activity`, reviewer filter), "started by" on imports, prediction batches and model loads, Label QA, embeddings, training runs and queue holds. Pending predictions stay shared per project (answered); presence only shows, it does not lock (default of question 7). |
+| 9 | not started | nothing planned in detail yet |
 
 Tests: `tests/test_server.py` (config, lock, lifespan and guards, service stop/resume, holds, launch reconciliation,
 jobs, uploads, GPU policy, undo budget, sessions and retention, maintenance, idle unload, the example config, a real
-server process), plus updated `test_workspace.py`/`test_training.py`.
+server process), `tests/test_auth.py` (accounts, sessions, middleware, password changes, the `user` commands),
+`tests/test_multiuser.py` (per-user undo and its conflicts, the change feed, presence, class-list revisions,
+attribution, polling closed projects), plus updated `test_workspace.py`/`test_training.py`.
+`test_augment_preview.py::test_chance_augmentations_and_pipeline_samples_render` fails now and then (2 of 8
+full runs on 2026-10-21; it asserts two seeded renders are identical); unrelated to the server work.
+
+### Stage 5 results on the workstation
+
+Verified (service as a user unit with `Type=exec`, `KillMode=mixed`, `TimeoutStopSec=720`, the restart policy):
+
+- `check` passes and lists the GPU, libraries and accounts; a second server or a desktop session on the same
+  projects folder is refused; a wrong `Host` gets 403; `/readyz` ready about 2 s after start.
+- Browser-upload import (360 images), gallery and annotated thumbnails, Training tab, best-weights download.
+- Ultralytics (yolo11n): `systemctl restart` mid-epoch → paused at the epoch end (stop took 4 s) → resumed
+  automatically, epoch rows continuous; `kill -9` of the server → systemd killed the runner with it, restarted the
+  service after `RestartSec`; the run showed *interrupted*, **Resume** continued from its checkpoint to 40/40.
+- RF-DETR (nano): the same restart → paused (11.5 s) → resumed with continuous epochs; `kill -9` → interrupted →
+  resumed. A stop with a 1 s pause deadline: the server exited and systemd SIGKILLed the runner and its
+  dataloader workers **as soon as the server exited** (docs corrected: not at `TimeoutStopSec`); the run was
+  requeued and resumed at the next start.
+- ONNX export interrupted by a restart, for both frameworks: no leftover process, no `export-tmp/`, no partial
+  `.onnx`; the repeated export succeeded.
+- Sign-in, change password, sign out, and two users in one project (presence, change notice and reload, class
+  rename while the other's editor is open, per-user undo refused after the other's edit, activity list,
+  "started by"), in the browser; Label QA and model upload through the API.
+
+Found and fixed: the unit's start limit counted manual restarts (5 per 10 min stopped the service; now 10 per
+5 min); a toast raised while the editor is open was invisible (drawn under the modal dialog); and during the soak
+**earlyoom** (the workstation's OOM killer) sent the server SIGTERM at 5% free memory. The server paused the
+active run and exited cleanly, so `Restart=on-failure` left the service down; it is `Restart=always` now. The
+paused run resumed at the next start.
+
+One RF-DETR run diverged (NaN in the matcher at epoch 10) after a kill and two resumes; resuming it from its last
+good checkpoint finished 30/30 at the control run's accuracy, and the checkpoint holds the optimizer, scheduler
+and EMA state, so this looks like RF-DETR's own instability on this tiny synthetic set.
+
+Not verifiable here: `install.sh` and the system account (no root), the hardening options (`ProtectSystem` etc.
+are silently ignored in user units), a host reboot, a long soak, an upgrade/rollback drill.
+
+Soak (55 min, sign-in on, `gpu_models_during_training = "refuse"`): two signed-in users editing, undoing,
+reviewing, polling the change feed and sending presence heartbeats, with 273 browser-upload imports each
+followed by deleting the imported images, 549 predictions with prediction-model loads, 58 SAM uses and 37
+three-epoch training runs (each unloading the models). 115,502 requests, 0 errors. Threads (24), file
+descriptors (50), tasks and `/healthz` (median 14.5 ms, max 24 ms) stayed flat; the server's memory with the
+models unloaded went 2,014 → 2,071 MB and with SAM loaded 3,319 → 3,389 MB, flat within ~60 MB over the run
+(before the `malloc_trim` change it only grew). After the soak, an external SIGTERM to the server: systemd
+restarted it within 5 s (`Restart=always`).
+
+Restore drill (without root): the projects folder copied while the service was stopped and served by a fresh
+server process: the existing accounts sign in, projects, runs, the activity log and "last edited by" are
+there, editing and undo work, best weights download.
+
+An independent code review of stages 7–8 found six defects, all fixed with regression tests: undoing a class
+change over labels others had saved for the new class list, undoing a move leaving a label made since as an
+orphan, a removed and re-added account reviving its old sessions, an open redirect on the login page
+(`next=/%09/host`), a password change on a session-renewing request signing the person out, and
+`user remove` failing on capital letters; plus adding a split folder invalidating saves and a rescan not
+reporting removed images.
+
 
 ## Decisions taken
 
