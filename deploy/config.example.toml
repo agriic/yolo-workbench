@@ -7,8 +7,9 @@
 
 [server]
 # The projects folder: every project (dataset, models, runs) plus the shared training queue lives here.
-# Outside /srv/yolo-workbench the service cannot write it until it is added to the unit's ReadWritePaths
-# (docs/server.md, "Projects folder on another disk"); `yolo-workbench-server check` tells.
+# The service may write only this folder and cache_dir (not under /home). After changing either, run
+# `sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh`: it creates a missing folder and writes the
+# systemd unit for them. Then restart (docs/server.md, "Folders").
 projects_root = "/srv/yolo-workbench/projects"
 # Create the folder when it is missing. Off by default: a disk that is not mounted must stop the service,
 # not turn into an empty workspace on the system disk.
@@ -24,7 +25,7 @@ shutdown_deadline_s = 60
 
 [storage]
 # Rebuildable caches: thumbnails, downloaded weights (YOLO, RF-DETR, SAM), torch/Ultralytics/matplotlib
-# settings. Default: ~/.cache of the service account. Elsewhere, add it to the unit's ReadWritePaths too.
+# settings, compiled GPU kernels. The systemd unit needs it set; without it (not as a service) ~/.cache.
 cache_dir = "/var/cache/yolo-workbench"
 # Thumbnail/crop cache size (MB).
 media_cache_mb = 512
@@ -58,7 +59,7 @@ undo_max_mb = 256
 [training]
 # On stop/restart the active run pauses at the end of its current epoch; this is how long the stop waits
 # for that (seconds). Past it the run is killed and resumes from the previous epoch's checkpoint.
-# systemd's TimeoutStopSec must be longer than this plus shutdown_deadline_s.
+# apply-config.sh sets the unit's TimeoutStopSec to this plus shutdown_deadline_s plus 60 s.
 pause_deadline_s = 600
 # A run paused by a service stop resumes by itself at the next start.
 resume_after_service_stop = true

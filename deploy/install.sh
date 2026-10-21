@@ -8,6 +8,8 @@
 # release.json, which the server reports); /opt/yolo-workbench/current points at the active one and
 # /opt/yolo-workbench/previous at the one before. The running server keeps using its own release's files
 # until `systemctl restart`. Older releases are kept: deploy/rollback.sh switches back to one.
+# The projects folder, the cache and the systemd unit follow /etc/yolo-workbench/config.toml (deploy/apply-config.sh;
+# the first install creates it from deploy/config.example.toml, so write it beforehand for other folders).
 # Needs uv (https://docs.astral.sh/uv/) on the PATH and internet access for the first install.
 set -euo pipefail
 
@@ -16,8 +18,7 @@ VERSION="${1:-$(git -C "$SRC" describe --tags --always --dirty 2>/dev/null || da
 PREFIX=/opt/yolo-workbench
 RELEASE="$PREFIX/releases/$VERSION"
 ACCOUNT=yolo-workbench
-DATA=/data/yolo-workbench
-CACHE=/var/cache/yolo-workbench
+CONFIG=/etc/yolo-workbench/config.toml
 UV="${UV:-$(command -v uv || true)}"
 
 if [ "$(id -u)" -ne 0 ]; then echo "Run as root (sudo $0)" >&2; exit 1; fi
@@ -26,13 +27,12 @@ if [[ ! "$VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then echo "Invalid versi
 if [ -e "$RELEASE" ]; then echo "$RELEASE already exists; pass another version name" >&2; exit 1; fi
 case "$VERSION" in *-dirty) echo "Warning: the checkout has uncommitted changes; they (and untracked files) are installed too" >&2 ;; esac
 
-# the service account owns only the data and the cache; the code stays root-owned and read-only
-id -u "$ACCOUNT" >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --shell /usr/sbin/nologin "$ACCOUNT"
+# the service account owns only the projects folder and the cache (apply-config.sh); the code stays root-owned
+# and read-only. It needs no home folder: the server points the libraries' caches and HOME into the cache.
+id -u "$ACCOUNT" >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$ACCOUNT"
 for group in video render; do
   if getent group "$group" >/dev/null; then usermod -aG "$group" "$ACCOUNT"; fi  # GPU device nodes on some distributions
 done
-install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0777 "$DATA"
-install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0777 "$DATA/projects" "$CACHE"
 install -d -m 0755 "$PREFIX/releases" /etc/yolo-workbench
 
 echo "Installing $VERSION into $RELEASE"
@@ -50,15 +50,16 @@ UV_PYTHON_INSTALL_DIR="$PREFIX/python" UV_CACHE_DIR="$PREFIX/.uv-cache" UV_LINK_
 chmod -R a+rX "$RELEASE" "$PREFIX/python"
 
 # configuration: installed once, never overwritten
-if [ ! -e /etc/yolo-workbench/config.toml ]; then
-  install -m 0644 -g "$ACCOUNT" "$RELEASE/deploy/config.example.toml" /etc/yolo-workbench/config.toml
-  echo "Created /etc/yolo-workbench/config.toml: set allowed_hosts (and check the paths) before starting"
+CREATED=0
+if [ ! -e "$CONFIG" ]; then
+  install -m 0644 -g "$ACCOUNT" "$RELEASE/deploy/config.example.toml" "$CONFIG"
+  CREATED=1
 fi
 if [ ! -e /etc/yolo-workbench/yolo-workbench.env ]; then
   install -m 0644 -g "$ACCOUNT" "$RELEASE/deploy/yolo-workbench.env" /etc/yolo-workbench/yolo-workbench.env
 fi
-install -m 0644 "$RELEASE/deploy/yolo-workbench.service" /etc/systemd/system/yolo-workbench.service
-systemctl daemon-reload
+# the folders and the systemd unit for the configuration, from this release's `yolo-workbench-server unit`
+bash "$RELEASE/deploy/apply-config.sh" "$RELEASE"
 
 PREVIOUS="$(readlink -f "$PREFIX/current" 2>/dev/null || true)"
 if [ -n "$PREVIOUS" ]; then
@@ -71,7 +72,11 @@ trap - ERR
 
 echo
 echo "Installed $VERSION.${PREVIOUS:+ Previous release: $(basename "$PREVIOUS") (rollback: sudo bash $RELEASE/deploy/rollback.sh)}"
-echo "Account: sudo -u $ACCOUNT $PREFIX/current/.venv/bin/yolo-workbench-server user add <name> --admin --config /etc/yolo-workbench/config.toml"
-echo "Check:   sudo -u $ACCOUNT $PREFIX/current/.venv/bin/yolo-workbench-server check --config /etc/yolo-workbench/config.toml"
+if [ "$CREATED" -eq 1 ]; then
+  echo "Created $CONFIG from the example: set allowed_hosts before starting. To use other folders than"
+  echo "         the example's, set projects_root / cache_dir there, then: sudo bash $PREFIX/current/deploy/apply-config.sh"
+fi
+echo "Account: sudo -u $ACCOUNT $PREFIX/current/.venv/bin/yolo-workbench-server user add <name> --admin --config $CONFIG"
+echo "Check:   sudo -u $ACCOUNT $PREFIX/current/.venv/bin/yolo-workbench-server check --config $CONFIG"
 echo "Start:   sudo systemctl enable --now yolo-workbench    (after an upgrade: Check, then sudo systemctl restart yolo-workbench)"
 echo "Logs:    journalctl -u yolo-workbench -f"

@@ -719,7 +719,7 @@ def test_check_names_its_release_and_the_one_holding_the_folder(tmp_path, monkey
     assert "[warn] owner lock:" in result.output and ", release 2026.10.01 (" in result.output
 
 
-SANDBOX = {"LoadState": "loaded", "ProtectSystem": "strict", "ProtectHome": "yes"}  # as deploy/yolo-workbench.service
+SANDBOX = {"LoadState": "loaded", "ProtectSystem": "strict", "ProtectHome": "yes"}  # as systemd_unit.TEMPLATE
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="systemd")
@@ -735,7 +735,7 @@ def test_a_folder_outside_the_units_writable_paths_is_read_only_in_the_service(t
     assert server.sandbox_problem(allowed / "projects", sandbox) is None
     for path in (elsewhere, allowed / "link"):  # a symlink out of a writable folder leads to a read-only one
         problem = server.sandbox_problem(path, sandbox)
-        assert problem and f"write only {allowed}, /var/cache/yolo-workbench" in problem and f"ReadWritePaths={elsewhere.resolve()}" in problem
+        assert problem and f"write only {allowed}, /var/cache/yolo-workbench;" in problem and f"with {elsewhere.resolve()} set there, write it again: sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh" in problem
     assert "hides /home" in server.sandbox_problem(Path("/home/alice/projects"), sandbox)
     assert server.sandbox_problem(Path("/home/alice/projects"), {**sandbox, "ProtectHome": "read-only"})
     full = {**sandbox, "ProtectSystem": "full"}
@@ -771,7 +771,8 @@ def test_check_and_the_service_say_why_a_folder_is_not_writable(tmp_path, monkey
         os.environ.update(environment)
     assert result.exit_code == 1, result.output
     assert f"[FAIL] projects folder: {root} is writable by this user but not by the service: the unit's sandbox (ProtectSystem=strict, ProtectHome=yes) lets the service write only {tmp_path / 'srv'}" in result.output
-    assert f"ReadWritePaths={root.resolve()}" in result.output and f"[ok  ] cache folder: {cache} is writable" in result.output
+    assert f"with {root.resolve()} set there, write it again: sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh, then restart" in result.output
+    assert f"[ok  ] cache folder: {cache} is writable" in result.output
 
     # the service: os.access fails on the read-only mount
     def startup_error(read_only: bool) -> str:
@@ -781,9 +782,128 @@ def test_check_and_the_service_say_why_a_folder_is_not_writable(tmp_path, monkey
         return capsys.readouterr().err
 
     monkeypatch.setattr(os, "access", lambda path, mode: False)
-    assert f"Error: the projects folder {root} is read-only for this process: a read-only mount, or in the systemd service a folder outside the unit's ReadWritePaths; for that, add it with `sudo systemctl edit yolo-workbench`: [Service] ReadWritePaths={root.resolve()}" in startup_error(True)
+    assert f"Error: the projects folder {root} is read-only for this process: a read-only mount, or in the systemd service a folder outside the unit's ReadWritePaths; for that: the unit is written from config.toml, so with {root.resolve()} set there, write it again: sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh" in startup_error(True)
     error = startup_error(False)  # a plain permission problem names the folder's owner and mode
     assert f"Error: the projects folder {root} is not writable by " in error and ", mode 0777)" in error
+
+# ---------- the systemd unit ----------
+
+
+def unit_settings(text: str) -> dict[str, str]:
+    """A unit file's settings (the last of each name), as `systemctl show` would name them."""
+    lines = (line for line in text.splitlines() if line and not line.startswith(("#", "[")))
+    return dict(line.split("=", 1) for line in lines)
+
+
+def test_the_unit_is_written_from_the_configuration(tmp_path):
+    """Folders, mounts and stop timeout come from config.toml plus the unit's environment file; nothing names
+    the example's /srv/yolo-workbench."""
+    from typer.testing import CliRunner
+
+    from yolo_workbench import server, systemd_unit
+
+    root, cache = tmp_path / "data" / "projects", tmp_path / "fast" / "cache"
+    config = tmp_path / "etc" / "config.toml"
+    config.parent.mkdir()
+    config.write_text(f'[server]\nprojects_root = "{root.as_posix()}"\nshutdown_deadline_s = 30\n[storage]\ncache_dir = "{(tmp_path / "other").as_posix()}"\n[training]\npause_deadline_s = 1200\n')
+    (config.parent / "yolo-workbench.env").write_text(f'# what the service reads too\nWORKBENCH_CACHE_DIR="{cache.as_posix()}"\nHTTPS_PROXY=http://proxy:3128\n')
+    text = systemd_unit.render(systemd_unit.load(config), config)
+    unit = unit_settings(text)
+    assert unit["ReadWritePaths"] == unit["RequiresMountsFor"] == f"{root} {cache}"
+    assert unit["WorkingDirectory"] == str(cache) and unit["TimeoutStopSec"] == "1290"  # 1200 + 30 + 60
+    assert unit["ExecStart"] == f"/opt/yolo-workbench/current/.venv/bin/yolo-workbench-server run --config {config}"
+    assert unit["EnvironmentFile"] == f"-{config.parent / 'yolo-workbench.env'}" and unit["User"] == unit["Group"] == "yolo-workbench"
+    assert "/srv/" not in text and "listen" not in text
+    sandbox = {"LoadState": "loaded", **{key: unit[key] for key in ("ProtectSystem", "ProtectHome", "ReadWritePaths")}}
+    assert sandbox == {**SANDBOX, "ReadWritePaths": f"{root} {cache}"}  # what the sandbox tests assume
+    assert server.sandbox_problem(root, sandbox) is None and server.sandbox_problem(cache / "yolo-workbench" / "weights", sandbox) is None
+
+    result = CliRunner().invoke(server.app, ["unit", "--config", str(config), "--account", "wb", "--prefix", "/srv/wb"])
+    assert result.exit_code == 0, result.output
+    assert unit_settings(result.output)["ExecStart"].startswith("/srv/wb/current/.venv/bin/yolo-workbench-server run") and "User=wb\n" in result.output
+    folders = CliRunner().invoke(server.app, ["unit", "--config", str(config), "--folders"])
+    assert folders.exit_code == 0 and folders.output == f"{root.as_posix()}\n{cache.as_posix()}\n"
+
+
+def test_a_configuration_the_unit_cannot_serve_is_refused(tmp_path):
+    from typer.testing import CliRunner
+
+    from yolo_workbench import server, systemd_unit
+    from yolo_workbench.config import ServerConfig
+
+    config = tmp_path / "config.toml"
+    config.write_text(f'[server]\nprojects_root = "{(tmp_path / "projects").as_posix()}"\n')
+    result = CliRunner().invoke(server.app, ["unit", "--config", str(config)])
+    assert result.exit_code == 2 and "set [storage] cache_dir" in result.output  # ~/.cache of whom?
+    for root, message in ((Path("/home/alice/projects"), "hides from the service"), (tmp_path / "my projects", "spaces")):
+        with pytest.raises(systemd_unit.UnitError, match=message):
+            systemd_unit.render(ServerConfig(projects_root=root, cache_dir=tmp_path / "cache"), config)
+    unit = unit_settings(systemd_unit.render(ServerConfig(projects_root=tmp_path / "100%", cache_dir=tmp_path / "cache"), tmp_path / "$etc" / "config.toml"))
+    assert unit["ReadWritePaths"].startswith(f"{tmp_path}/100%% ")  # % starts a specifier, $ a variable in a command
+    assert unit["ExecStart"].endswith(f"--config {tmp_path}/$$etc/config.toml")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd")
+def test_check_warns_when_the_installed_unit_is_not_the_one_for_the_configuration(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from yolo_workbench import server, systemd_unit
+
+    torch = SimpleNamespace(__version__="2.9.0", cuda=SimpleNamespace(is_available=lambda: False))
+    for name, module in (("torch", torch), ("ultralytics", SimpleNamespace(__version__="8.3.0")), ("rfdetr", SimpleNamespace(__version__="1.11.0"))):
+        monkeypatch.setitem(sys.modules, name, module)
+    root, cache = tmp_path / "data" / "projects", tmp_path / "cache"
+    root.mkdir(parents=True)
+    config = tmp_path / "config.toml"
+    config.write_text(f'[server]\nprojects_root = "{root.as_posix()}"\nallowed_hosts = ["gpu-box"]\n[storage]\ncache_dir = "{cache.as_posix()}"\n[auth]\nenabled = false\n[embeddings]\nenabled = false\n')
+    installed = tmp_path / "yolo-workbench.service"
+    installed.write_text(systemd_unit.render(systemd_unit.load(config), config))
+    monkeypatch.setattr(server, "unit_sandbox", lambda: {**SANDBOX, "FragmentPath": str(installed), "ReadWritePaths": f"{root} {cache}"})
+
+    def check() -> str:
+        environment = os.environ.copy()
+        try:
+            return CliRunner().invoke(server.app, ["check", "--config", str(config)]).output
+        finally:
+            os.environ.clear()
+            os.environ.update(environment)
+
+    assert f"[ok  ] systemd unit: {installed} is written for this configuration" in check()
+    config.write_text(config.read_text().replace("[auth]", "[training]\npause_deadline_s = 1800\n[auth]"))
+    assert f"[warn] systemd unit: {installed} is not the unit for this configuration (TimeoutStopSec=1920 expected): sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh, then restart" in check()
+
+
+def test_library_caches_and_home_go_into_the_cache(tmp_path):
+    """The service account needs no home: its home may not exist, and the unit's sandbox mounts it read-only
+    (RF-DETR training failed on `~/.triton`). The training subprocesses inherit the environment."""
+    from yolo_workbench import server
+    from yolo_workbench.config import ServerConfig
+
+    cache = tmp_path / "cache"
+    environment = os.environ.copy()
+    try:
+        for name in ("TRITON_HOME", "TORCHINDUCTOR_CACHE_DIR", "TORCH_HOME", "HF_HOME"):
+            os.environ.pop(name, None)
+        os.environ["HOME"] = str(tmp_path / "srv" / "yolo-workbench")  # not there
+        server.prepare_environment(ServerConfig(projects_root=tmp_path / "projects", cache_dir=cache))
+        assert os.environ["TRITON_HOME"] == str(cache / "triton") and (cache / "triton").is_dir()
+        assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == str(cache / "torchinductor") and os.environ["TORCH_HOME"] == str(cache / "torch")
+        assert os.environ["HOME"] == str(cache / "home") and Path.home() == cache / "home" and Path.home().is_dir()
+        child = {**os.environ}
+        home = tmp_path / "home"
+        home.mkdir()
+        os.environ["HOME"] = str(home)
+        server.prepare_environment(ServerConfig(projects_root=tmp_path / "projects", cache_dir=cache))
+        assert os.environ["HOME"] == str(home)  # a writable home stays
+    finally:
+        os.environ.clear()
+        os.environ.update(environment)
+    pytest.importorskip("triton")  # Linux only
+    where = subprocess.run([sys.executable, "-c", "from triton import knobs; print(knobs.cache.dir)"], env=child, capture_output=True, text=True, timeout=60)
+    assert where.stdout.strip() == str(cache / "triton" / ".triton" / "cache"), where.stderr
+
 
 def test_example_config_lists_every_setting_and_loads(tmp_path):
     from yolo_workbench.config import ServerConfig

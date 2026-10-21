@@ -43,14 +43,26 @@ From a checkout of this repository on the server:
 sudo bash deploy/install.sh
 ```
 
-It creates the `yolo-workbench` system account, `/srv/yolo-workbench/projects` (data), `/var/cache/yolo-workbench`
-(caches), installs the code and its virtual environment into `/opt/yolo-workbench/releases/<version>/` with
-`/opt/yolo-workbench/current` pointing at it, and installs `/etc/yolo-workbench/config.toml` (first time only)
-and the systemd unit. The version name comes from `git describe` (`sudo bash deploy/install.sh 2026.10.21`
-names it yourself). Then:
+It creates the `yolo-workbench` system account, installs the code and its virtual environment into
+`/opt/yolo-workbench/releases/<version>/` with `/opt/yolo-workbench/current` pointing at it, installs
+`/etc/yolo-workbench/config.toml` (first time only, from `deploy/config.example.toml`), creates the projects
+folder and the cache it names (`projects_root`, `cache_dir`; the example's are `/srv/yolo-workbench/projects`
+and `/var/cache/yolo-workbench`), and writes the systemd unit for them (see [Folders](#folders)). The version
+name comes from `git describe` (`sudo bash deploy/install.sh 2026.10.21` names it yourself).
+
+For other folders from the start, write the configuration before the first install:
+
+```bash
+sudo install -d /etc/yolo-workbench
+sudo cp deploy/config.example.toml /etc/yolo-workbench/config.toml
+sudoedit /etc/yolo-workbench/config.toml      # projects_root, cache_dir, allowed_hosts
+```
+
+Then:
 
 1. Edit `/etc/yolo-workbench/config.toml`: at least `allowed_hosts` — the names and addresses people type in
-   the browser (e.g. `["gpu-server", "gpu-server.example.local", "10.0.0.20"]`).
+   the browser (e.g. `["gpu-server", "gpu-server.example.local", "10.0.0.20"]`). If you change
+   `projects_root` or `cache_dir` now, apply them: `sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh`.
 2. Create your account (and one for each colleague; see [Users and sign-in](#users-and-sign-in)):
    ```bash
    sudo -u yolo-workbench /opt/yolo-workbench/current/.venv/bin/yolo-workbench-server user add alice --admin --display-name "Alice Smith" --config /etc/yolo-workbench/config.toml
@@ -62,15 +74,16 @@ names it yourself). Then:
    It reports the configuration, the projects folder (writable, free space, not in use), the accounts, the
    cache folder, what it listens on, the GPU torch sees, Ultralytics/RF-DETR, and MongoDB when embeddings
    are enabled. It exits non-zero on a failure. It runs outside the service's sandbox, so it also checks
-   that the unit lets the service write both folders (see [Projects folder on another disk](#projects-folder-on-another-disk)).
+   that the unit lets the service write both folders and that it is the unit for this configuration
+   (see [Folders](#folders)).
 4. Start it now and at every boot:
    ```bash
    sudo systemctl enable --now yolo-workbench
    ```
 5. Open the port for the people who use it (and nothing else), e.g. `sudo ufw allow from 10.0.0.0/24 to any port 8765 proto tcp`.
 
-To bring existing datasets in, copy their folders into `/srv/yolo-workbench/projects/` (owned by
-`yolo-workbench`) and use **Adopt** on the projects page, or create a project and upload the images.
+To bring existing datasets in, copy their folders into the projects folder (owned by `yolo-workbench`)
+and use **Adopt** on the projects page, or create a project and upload the images.
 
 ### Layout
 
@@ -82,33 +95,39 @@ To bring existing datasets in, copy their folders into `/srv/yolo-workbench/proj
 | `/opt/yolo-workbench/python/` | the Python uv installed for the releases |
 | `/etc/yolo-workbench/config.toml` | configuration |
 | `/etc/yolo-workbench/yolo-workbench.env` | environment for the unit (optional overrides, proxy, `CUDA_VISIBLE_DEVICES`) |
-| `/srv/yolo-workbench/projects/` | every project, `.training/` (the queue), `.trash/` (deleted projects), `.workbench/` (owner lock, `users.json` accounts, `sessions.json` sign-ins) |
-| `/var/cache/yolo-workbench/` | thumbnails, downloaded weights, torch/Ultralytics/matplotlib caches — rebuildable |
+| `/etc/systemd/system/yolo-workbench.service` | the unit, written from the configuration by `deploy/apply-config.sh` — not edited by hand |
+| `projects_root` (example: `/srv/yolo-workbench/projects/`) | every project, `.training/` (the queue), `.trash/` (deleted projects), `.workbench/` (owner lock, `users.json` accounts, `sessions.json` sign-ins) |
+| `cache_dir` (example: `/var/cache/yolo-workbench/`) | thumbnails, downloaded weights, torch/Ultralytics/matplotlib caches, compiled GPU kernels, the service's `HOME` — rebuildable |
 
-### Projects folder on another disk
+### Folders
 
 The unit runs the server in a sandbox (`ProtectSystem=strict`): the whole filesystem is read-only for it
-except `/srv/yolo-workbench` and `/var/cache/yolo-workbench` (`ReadWritePaths=`), whatever the folders'
-owner and mode — `chmod 0777` does not help. `/home`, `/root` and `/run/user` are hidden from it
-(`ProtectHome=yes`). A `projects_root` or `cache_dir` elsewhere, or a symlink from `/srv/yolo-workbench` to
-another disk, has to be added to the unit:
+except the configured `projects_root` and `cache_dir` (`ReadWritePaths=`), whatever other folders' owner and
+mode — `chmod 0777` does not help. `/home`, `/root` and `/run/user` are hidden from it (`ProtectHome=yes`).
+The service account needs no home folder: the server points the libraries' caches (and `HOME`, when the
+account's home is not writable) into `cache_dir`.
+
+The unit is written from the configuration, so moving the projects (or the cache) to another disk is a
+change of `config.toml`, applied with `deploy/apply-config.sh`:
 
 ```bash
-sudo systemctl edit yolo-workbench
+sudoedit /etc/yolo-workbench/config.toml      # [server] projects_root = "/data/yolo-workbench/projects"
+sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh
+sudo systemctl restart yolo-workbench
 ```
 
-```ini
-[Unit]
-RequiresMountsFor=/data/yolo-workbench
-
-[Service]
-ReadWritePaths=/data/yolo-workbench
-```
-
-(`RequiresMountsFor` waits for that disk to be mounted.) Both settings add to the unit's own, and the
-drop-in (`/etc/systemd/system/yolo-workbench.service.d/override.conf`) survives upgrades. Then
-`sudo systemctl restart yolo-workbench`. Keep the folder out of `/home`. Name the real folder, not a
-symlink to it.
+`apply-config.sh` creates a missing folder (owned by `yolo-workbench`, mode 0750) and writes
+`/etc/systemd/system/yolo-workbench.service` with the folders the service may write, waits for
+(`RequiresMountsFor=`, so the disk is mounted first) and works in, and the stop timeout (`TimeoutStopSec`,
+from `pause_deadline_s` and `shutdown_deadline_s`); it reads `yolo-workbench.env` too, like the service.
+`install.sh` and `rollback.sh` run it as well, so do not edit the unit: they would replace your edit, and
+`check` warns about a unit that is not the one for the configuration. It refuses to create a missing projects
+folder that the installed unit already names (an unmounted disk would otherwise become an empty workspace on
+the system disk): mount the disk first. Move existing projects while the service is stopped. Symlinks in
+the configured paths are resolved, so the unit names the real folders. Settings the configuration does not
+cover go into a drop-in (`sudo systemctl edit yolo-workbench`), which stays; `apply-config.sh` lists the
+drop-ins it finds. One that adds `ReadWritePaths=`, `RequiresMountsFor=` or `TimeoutStopSec=` by hand (as
+an earlier version of this guide said to) is not needed anymore: remove those lines.
 
 ## Configuration
 
@@ -124,7 +143,7 @@ variable is `WORKBENCH_` plus the name in the first column (`WORKBENCH_PORT=9000
 | `host`, `port` | `[server]` | `0.0.0.0`, `8765` | where to listen |
 | `allowed_hosts` | `[server]` | — (required with `0.0.0.0`) | accepted `Host` names; `["*"]` = any |
 | `shutdown_deadline_s` | `[server]` | `60` | wait for jobs and projects on stop |
-| `cache_dir` | `[storage]` | `~/.cache` | caches (media, weights, libraries) |
+| `cache_dir` | `[storage]` | `~/.cache` | caches (media, weights, libraries); the systemd unit needs it set |
 | `media_cache_mb` | `[storage]` | `512` | thumbnail cache size |
 | `min_free_disk_gb` | `[storage]` | `5` | refuse writes below this; warn on every page |
 | `trash_retention_days`, `backup_retention_days` | `[storage]` | `30`, `30` | dataset trash / label backups of earlier sessions (0 = keep) |
@@ -150,7 +169,9 @@ variable is `WORKBENCH_` plus the name in the first column (`WORKBENCH_PORT=9000
 | `log_level`, `log_format` | `[logging] level`, `format` | `info`, `text` | `json` for one object per line |
 | `access_log` | `[logging]` | `false` | one line per HTTP request |
 
-Configuration changes take effect at the next `systemctl restart yolo-workbench`.
+Configuration changes take effect at the next `systemctl restart yolo-workbench`. Changes of `projects_root`,
+`cache_dir`, `pause_deadline_s` or `shutdown_deadline_s` (also in `yolo-workbench.env`) change the unit too:
+run `sudo bash /opt/yolo-workbench/current/deploy/apply-config.sh` before the restart ([Folders](#folders)).
 
 ## Operating it
 
@@ -178,14 +199,15 @@ One run trains at a time; the queue is shared by all projects. On `systemctl sto
 
 If the epoch takes longer, the server exits anyway and systemd kills what is left of the run right away
 (`KillMode=mixed`); the run is **interrupted**: it resumes from the previous epoch's checkpoint, losing the
-epoch in progress. `TimeoutStopSec` (720 s in the unit) only bounds the server itself. Either way,
+epoch in progress. `TimeoutStopSec` (`pause_deadline_s` + `shutdown_deadline_s` + 60 s: 720 s by default)
+only bounds the server itself. Either way,
 with `resume_after_service_stop` the run goes back to the front of the queue at the next start. A run
 interrupted by a crash, a power loss or the OOM killer is shown as interrupted and waits for **Resume** in the
 Training tab (or holds the whole queue, with `hold_queue_after_crash`). A run without any checkpoint yet
 cannot resume and must start again.
 
-For long epochs, raise `pause_deadline_s` and `TimeoutStopSec` together
-(`sudo systemctl edit yolo-workbench` → `[Service]` `TimeoutStopSec=1800`).
+For long epochs, raise `pause_deadline_s` and run `apply-config.sh` (the unit's `TimeoutStopSec` follows),
+then restart.
 
 ### Maintenance: holding the queue
 
@@ -327,8 +349,9 @@ another format has to be run again).
    sudo bash deploy/install.sh
    ```
    It downloads the locked packages (internet access; each release is a few GB, torch and CUDA included),
-   points `current` at the new release and `previous` at the old one, and replaces the systemd unit with the
-   new release's. `config.toml` and `yolo-workbench.env` are never overwritten.
+   points `current` at the new release and `previous` at the old one, and writes the systemd unit for your
+   configuration with the new release's `apply-config.sh`. `config.toml` and `yolo-workbench.env` are never
+   overwritten.
 4. **Check the new release before restarting.** The old server keeps running meanwhile; its owner lock
    shows as a warning naming the release that holds it.
    ```bash
@@ -354,9 +377,10 @@ bash deploy/rollback.sh --list              # the installed releases, newest fir
 ```
 
 `rollback.sh` runs `check` with the release it switches to and changes nothing when that fails (`--force`
-switches anyway). Then it points `current` at that release and `previous` at the one it leaves (running it
-again returns), puts back that release's systemd unit (`install.sh` replaced it with the newer one's),
-restarts the service (clearing the start limit a crashing release may have hit) and waits for `/readyz`.
+switches anyway). Then it writes the systemd unit for the configuration with that release's
+`apply-config.sh` (a release from before that script keeps the installed unit, which runs it the same way),
+points `current` at that release and `previous` at the one it leaves (running it again returns), restarts the
+service (clearing the start limit a crashing release may have hit) and waits for `/readyz`.
 The restart is like an upgrade's: training pauses first, the undo history is dropped, and open tabs need
 a reload. Releases installed before `rollback.sh` existed have no `release.json` and do not report their
 name; switching to one works the same.
@@ -378,8 +402,10 @@ sudo rm -rf /opt/yolo-workbench/releases/<version>
 | Symptom | Cause |
 | --- | --- |
 | `Configuration error: …` in the journal, service fails | a setting is wrong or unknown; `yolo-workbench-server check` names it |
-| `the projects folder … does not exist (is its disk mounted?)` | mount missing; the unit also waits for `/srv/yolo-workbench`. A folder under `/home` is hidden from the service |
-| `the projects folder … is read-only for this process` (even with mode 0777) | the folder is outside the unit's `ReadWritePaths`: [add it](#projects-folder-on-another-disk) |
+| `the projects folder … does not exist (is its disk mounted?)` | mount missing; the unit also waits for the disks of `projects_root` and `cache_dir` (`RequiresMountsFor`). A folder under `/home` is hidden from the service |
+| `the projects folder … is read-only for this process` (even with mode 0777) | the unit was written for other folders: [run `apply-config.sh`](#folders) and restart |
+| `Read-only file system: '…/.triton'` (or another `~/.…` folder) in a training log | a library writing into the service account's home, which the sandbox mounts read-only; the server points those into `cache_dir`: upgrade a release from before it, and make sure `cache_dir` is set |
+| `check`: `systemd unit: … is not the unit for this configuration` | the configuration changed since the unit was written, or the unit was edited by hand: `apply-config.sh`, then restart |
 | `… is already in use by process …` | another server or a desktop session uses the folder |
 | the service stopped by itself and came back 10 s later, `low memory! … sending SIGTERM` in `journalctl` | an OOM killer (earlyoom, systemd-oomd) asked the server to stop: the active run paused at its checkpoint and resumes after the restart (`Restart=always`). Give the host more memory, or load fewer models during training (`gpu_models_during_training = "refuse"`, a lower `max_loaded_models`) |
 | `start request repeated too quickly` / `start of the service was attempted too often` | more than 10 starts within 5 minutes (a crash loop, or many restarts); fix the cause, then `sudo systemctl reset-failed yolo-workbench` and start it |
@@ -390,7 +416,7 @@ sudo rm -rf /opt/yolo-workbench/releases/<version>
 | uploads fail with "Not enough free disk space" | free space below `min_free_disk_gb` |
 | a run shows *interrupted* after a restart | its epoch did not finish within `pause_deadline_s`; it resumes from the previous checkpoint |
 | GPU not found by `check` | driver/CUDA mismatch, or `CUDA_VISIBLE_DEVICES` hides it; `nvidia-smi` as the service account |
-| first SAM / training start is slow | weights download on first use into `/var/cache/yolo-workbench/weights/` (set `HTTPS_PROXY` in the env file behind a proxy) |
+| first SAM / training start is slow | weights download on first use into `<cache_dir>/yolo-workbench/weights/` (set `HTTPS_PROXY` in the env file behind a proxy) |
 
 ## Acceptance checklist
 

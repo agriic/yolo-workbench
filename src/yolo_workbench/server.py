@@ -3,6 +3,7 @@
     yolo-workbench-server run --config /etc/yolo-workbench/config.toml
     yolo-workbench-server check --config /etc/yolo-workbench/config.toml
     yolo-workbench-server user add alice --admin --config /etc/yolo-workbench/config.toml
+    yolo-workbench-server unit --config /etc/yolo-workbench/config.toml   # the systemd unit (deploy/apply-config.sh)
 
 `run` never prompts and never opens a browser. It validates the configuration, points every library
 cache at the configured cache folder (before torch/Ultralytics/FiftyOne are imported), takes the owner
@@ -25,9 +26,11 @@ from typing import Optional
 
 import typer
 
+from . import systemd_unit
 from .config import ConfigError, ServerConfig, load_config
 from .ownership import AlreadyOwned, OwnerLock
 from .release import describe as describe_release
+from .systemd_unit import HOME_FOLDERS, PREFIX, UNIT, UnitError, under
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the YOLO Workbench as a server (projects mode).")
 user_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Manage the accounts people sign in with (stored in <projects_root>/.workbench/users.json).")
@@ -35,8 +38,7 @@ app.add_typer(user_app, name="user")
 log = logging.getLogger("yolo_workbench.server")
 
 OWNER_DIR = ".workbench"  # workspace-level server state inside the projects folder
-UNIT = "yolo-workbench"  # the systemd unit install.sh installs
-HOME_FOLDERS = ("/home", "/root", "/run/user")  # what the unit's ProtectHome= hides or makes read-only
+APPLY_CONFIG = f"{PREFIX.as_posix()}/current/deploy/apply-config.sh"  # writes the unit for config.toml
 
 
 def _load(config: Optional[Path], projects: Optional[Path] = None, host: Optional[str] = None, port: Optional[int] = None) -> ServerConfig:
@@ -49,19 +51,46 @@ def _load(config: Optional[Path], projects: Optional[Path] = None, host: Optiona
 
 def prepare_environment(config: ServerConfig) -> None:
     """Library caches and settings under the configured cache folder (so the service account needs no home
-    folder), no runtime pip installs, and FiftyOne's MongoDB. Must run before torch/Ultralytics/FiftyOne load."""
+    folder), no runtime pip installs, and FiftyOne's MongoDB. Must run before torch/Ultralytics/FiftyOne load.
+    The training and export subprocesses inherit all of it."""
     if config.cache_dir is not None:
         cache = config.cache_dir
         os.environ["XDG_CACHE_HOME"] = str(cache)  # workbench media + weights (media_cache.cache_root)
-        for name, sub in (("YOLO_CONFIG_DIR", "ultralytics"), ("TORCH_HOME", "torch"), ("MPLCONFIGDIR", "matplotlib"), ("HF_HOME", "huggingface"), ("FIFTYONE_MODEL_ZOO_DIR", "fiftyone/models"), ("FIFTYONE_DATASET_ZOO_DIR", "fiftyone/datasets")):
+        for name, sub in (
+            ("YOLO_CONFIG_DIR", "ultralytics"),
+            ("TORCH_HOME", "torch"),
+            ("TORCHINDUCTOR_CACHE_DIR", "torchinductor"),
+            ("TRITON_HOME", "triton"),  # compiled GPU kernels (RF-DETR training): $TRITON_HOME/.triton
+            ("MPLCONFIGDIR", "matplotlib"),
+            ("HF_HOME", "huggingface"),
+            ("FIFTYONE_MODEL_ZOO_DIR", "fiftyone/models"),
+            ("FIFTYONE_DATASET_ZOO_DIR", "fiftyone/datasets"),
+        ):
             os.environ.setdefault(name, str(cache / sub))
-            try:
-                Path(os.environ[name]).mkdir(parents=True, exist_ok=True)  # Ultralytics falls back to /tmp for a missing one
-            except OSError:
-                pass  # `check` reports an unwritable cache folder
+            _make_folder(Path(os.environ[name]))  # Ultralytics falls back to /tmp for a missing one
+        # whatever else writes into ~: the account's home may not exist, and the unit's sandbox mounts it
+        # read-only unless it is the projects folder or the cache
+        if not _home_writable():
+            home = cache / "home"
+            _make_folder(home)
+            os.environ["HOME"] = str(home)
     os.environ.setdefault("YOLO_AUTOINSTALL", "false")  # Ultralytics would pip-install missing packages into the venv
     if config.mongodb_uri:
         os.environ["FIFTYONE_DATABASE_URI"] = config.mongodb_uri
+
+
+def _make_folder(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass  # `check` reports an unwritable cache folder
+
+
+def _home_writable() -> bool:
+    try:
+        return os.access(Path.home(), os.W_OK)
+    except (RuntimeError, KeyError):  # no HOME and no home folder for the uid
+        return False
 
 
 def _projects_root(config: ServerConfig) -> Path:
@@ -69,7 +98,7 @@ def _projects_root(config: ServerConfig) -> Path:
     if not root.is_dir():
         if not config.create_projects_root:
             # INVOCATION_ID: started by systemd, whose unit hides the home folders (ProtectHome=yes)
-            hidden = " The service cannot see folders under /home, /root or /run/user (ProtectHome=yes in the unit)." if os.environ.get("INVOCATION_ID") and _under(root, HOME_FOLDERS) else ""
+            hidden = " The service cannot see folders under /home, /root or /run/user (ProtectHome=yes in the unit)." if os.environ.get("INVOCATION_ID") and under(root, HOME_FOLDERS) else ""
             typer.echo(f"Error: the projects folder {root} does not exist (is its disk mounted?). Create it, or set [server] create_projects_root = true.{hidden}", err=True)
             raise typer.Exit(2)
         root.mkdir(parents=True, exist_ok=True)
@@ -79,20 +108,15 @@ def _projects_root(config: ServerConfig) -> Path:
     return root
 
 
-def _under(path: Path, folders) -> bool:
-    path = path.resolve()
-    return any(path.is_relative_to(Path(folder).resolve()) for folder in folders)
-
-
 def _sandbox_fix(path: Path) -> str:
-    return f"add it with `sudo systemctl edit {UNIT}`: [Service] ReadWritePaths={path.resolve()} (docs/server.md: Projects folder on another disk)"
+    return f"the unit is written from config.toml, so with {path.resolve()} set there, write it again: sudo bash {APPLY_CONFIG}, then restart (docs/server.md: Folders)"
 
 
 def _not_writable(path: Path) -> str:
     """Why this process cannot write the folder `path` (os.access said it cannot)."""
     if hasattr(os, "statvfs") and os.statvfs(path).f_flag & os.ST_RDONLY:
         # the unit's sandbox (ProtectSystem=strict) mounts everything but its ReadWritePaths read-only: no mode helps
-        return f"{path} is read-only for this process: a read-only mount, or in the systemd service a folder outside the unit's ReadWritePaths; for that, {_sandbox_fix(path)}"
+        return f"{path} is read-only for this process: a read-only mount, or in the systemd service a folder outside the unit's ReadWritePaths; for that: {_sandbox_fix(path)}"
     stat = path.stat()
     try:
         user, owner = getpass.getuser(), path.owner()
@@ -104,7 +128,7 @@ def _not_writable(path: Path) -> str:
 def unit_sandbox(unit: str = UNIT) -> dict[str, str] | None:
     """The installed systemd unit's filesystem sandbox (`systemctl show`), or None without systemd or the unit."""
     try:
-        result = subprocess.run(["systemctl", "show", unit, "--property=LoadState,ProtectSystem,ProtectHome,ReadWritePaths"], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(["systemctl", "show", unit, "--property=LoadState,FragmentPath,ProtectSystem,ProtectHome,ReadWritePaths"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return None
     values = dict(line.partition("=")[::2] for line in result.stdout.splitlines())
@@ -115,16 +139,32 @@ def sandbox_problem(path: Path, sandbox: dict[str, str]) -> str | None:
     """Why the service cannot write `path` under the unit's sandbox, with the fix (None: the sandbox allows it).
     `check` runs outside the sandbox (sudo -u), so its own write test cannot tell."""
     home = sandbox.get("ProtectHome", "no")
-    if home in ("yes", "tmpfs") and _under(path, HOME_FOLDERS):
+    if home in ("yes", "tmpfs") and under(path, HOME_FOLDERS):
         return f"the unit hides /home, /root and /run/user from the service (ProtectHome={home}): move the folder elsewhere"
     writable = [folder.lstrip("-+") for folder in sandbox.get("ReadWritePaths", "").split()]  # "-": may be missing
-    if _under(path, writable):
+    if under(path, writable):
         return None
     system = sandbox.get("ProtectSystem", "no")
     read_only = {"yes": ["/usr", "/boot", "/efi"], "full": ["/usr", "/boot", "/efi", "/etc"], "strict": ["/"]}.get(system, [])
-    if _under(path, read_only + (list(HOME_FOLDERS) if home == "read-only" else [])):
-        return f"the unit's sandbox (ProtectSystem={system}, ProtectHome={home}) lets the service write only {', '.join(writable) or 'nothing'}: {_sandbox_fix(path)}"
+    if under(path, read_only + (list(HOME_FOLDERS) if home == "read-only" else [])):
+        return f"the unit's sandbox (ProtectSystem={system}, ProtectHome={home}) lets the service write only {', '.join(writable) or 'nothing'}; {_sandbox_fix(path)}"
     return None
+
+
+def unit_drift(config: Path, sandbox: dict[str, str]) -> str | None:
+    """How the installed unit differs from the one apply-config.sh would write for `config` (None: it does not)."""
+    fragment = sandbox.get("FragmentPath")
+    if not fragment:
+        return None
+    try:
+        installed = Path(fragment).read_text(encoding="utf-8")
+        wanted = systemd_unit.render(systemd_unit.load(config), config)
+    except (OSError, ConfigError, UnitError) as exc:
+        return str(exc)
+    if installed == wanted:
+        return None
+    changed = [line for line in wanted.splitlines() if line and not line.startswith("#") and line not in installed.splitlines()]
+    return f"{fragment} is not the unit for this configuration ({'; '.join(changed[:3]) or 'edited by hand'} expected): sudo bash {APPLY_CONFIG}, then restart"
 
 
 def lifecycle_options(config: ServerConfig):
@@ -260,6 +300,9 @@ def check(
         folder("cache folder", cache)
     except OSError as exc:
         report(False, "cache folder", f"{cache}: {exc}")
+    if sandbox is not None and config is not None and sandbox.get("FragmentPath"):
+        drift = unit_drift(config, sandbox)
+        report(None if drift else True, "systemd unit", drift or f"{sandbox['FragmentPath']} is written for this configuration")
     if settings.auth_enabled:
         if root.is_dir():
             from .auth import Auth, AuthError
@@ -305,6 +348,27 @@ def check(
     else:
         report(True, "embeddings", "turned off")
     raise typer.Exit(1 if failures else 0)
+
+
+@app.command()
+def unit(
+    config: Path = typer.Option(..., "--config", "-c", envvar="WORKBENCH_CONFIG", dir_okay=False, help="TOML configuration file"),
+    env_file: Optional[Path] = typer.Option(None, "--env-file", dir_okay=False, help="The unit's environment file, whose WORKBENCH_ settings count too (default: yolo-workbench.env beside the configuration)"),
+    account: str = typer.Option(UNIT, "--account", help="Service account"),
+    prefix: Path = typer.Option(PREFIX, "--prefix", file_okay=False, help="Installation folder; the unit runs <prefix>/current"),
+    folders: bool = typer.Option(False, "--folders", help="Print the folders the unit lets the service write, one per line, instead"),
+) -> None:
+    """Print the systemd unit for this configuration (deploy/apply-config.sh installs it)."""
+    try:
+        settings = systemd_unit.load(config, env_file)
+        if folders:
+            for folder in systemd_unit.service_folders(settings):
+                typer.echo(folder.as_posix())
+        else:
+            typer.echo(systemd_unit.render(settings, config, env_file, account, prefix), nl=False)
+    except (ConfigError, UnitError) as exc:
+        typer.echo(f"Configuration error: {exc}", err=True)
+        raise typer.Exit(2) from exc
 
 
 def _distribution_version(name: str) -> str:

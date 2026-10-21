@@ -6,10 +6,12 @@
 #   sudo bash deploy/rollback.sh 2026.10.21    # or name one
 #   bash deploy/rollback.sh --list             # the installed releases
 #
-# It runs `check` with that release's code first (nothing changes when it fails, unless --force), points
-# /opt/yolo-workbench/current at it and `previous` at the release it leaves (so running it again returns),
-# puts back that release's systemd unit, and restarts the service: the active training run pauses at its
-# next checkpoint first, which can take up to [training] pause_deadline_s. Then it waits for /readyz.
+# It runs `check` with that release's code first (nothing changes when it fails, unless --force),
+# writes the systemd unit for config.toml with that release's apply-config.sh (a release from before that
+# script keeps the installed unit, which runs it the same way), points /opt/yolo-workbench/current at it and
+# `previous` at the release it leaves (so running it again returns), and restarts the service: the active
+# training run pauses at its next checkpoint first, which can take up to [training] pause_deadline_s. Then it
+# waits for /readyz.
 # The projects folder and /etc/yolo-workbench/ are not touched.
 set -euo pipefail
 
@@ -63,7 +65,7 @@ else
   exit 1
 fi
 SERVER="$TARGET/.venv/bin/yolo-workbench-server"
-if [ -z "$TARGET" ] || [ ! -x "$SERVER" ] || [ ! -f "$TARGET/deploy/$SERVICE.service" ]; then
+if [ -z "$TARGET" ] || [ ! -x "$SERVER" ]; then
   echo "$WANTED is not an installed release" >&2
   list >&2
   exit 1
@@ -82,15 +84,19 @@ if [ "$STATUS" -ne 0 ]; then
   echo "The check failed; switching anyway (--force)." >&2
 fi
 
+# the unit for the configuration, written by the release we switch to; never an older release's fixed unit
+# file, which named the folders of the example configuration
+if [ -f "$TARGET/deploy/apply-config.sh" ]; then
+  bash "$TARGET/deploy/apply-config.sh" "$TARGET"
+else
+  echo "$NAME predates deploy/apply-config.sh: the installed unit stays (it runs $PREFIX/current, whichever release that is)"
+fi
 if [ -n "$CURRENT" ]; then
   ln -sfn "$CURRENT" "$PREFIX/previous.new"
   mv -T "$PREFIX/previous.new" "$PREFIX/previous"
 fi
 ln -sfn "$TARGET" "$PREFIX/current.new"
 mv -T "$PREFIX/current.new" "$PREFIX/current"
-# the unit of the release we switch to: install.sh replaced it with the newer release's
-install -m 0644 "$TARGET/deploy/$SERVICE.service" "/etc/systemd/system/$SERVICE.service"
-systemctl daemon-reload
 echo "Active release: $NAME${CURRENT:+ (previous: $(basename "$CURRENT"))}"
 
 echo "Restarting $SERVICE (the active training run pauses at its next checkpoint first)"
