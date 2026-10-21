@@ -613,6 +613,110 @@ def test_server_process_refuses_a_second_owner_and_stops_cleanly_on_a_signal(tmp
     OwnerLock(root / ".workbench").acquire().release()  # released with the process
 
 
+
+# ---------- the installed release ----------
+
+RELEASE = {"name": "2026.10.21", "commit": "279d5d130af5ec1bbae64f9dcf005ad5da193d93", "installed": "2026-10-21T10:00:00Z"}
+
+
+@pytest.fixture
+def installed_release(tmp_path, monkeypatch):
+    """The process runs from releases/<name>/.venv with install.sh's release.json beside it."""
+    from yolo_workbench import release
+
+    folder = tmp_path / "releases" / RELEASE["name"]
+    (folder / ".venv").mkdir(parents=True)
+    (folder / "release.json").write_text(json.dumps(RELEASE))
+    monkeypatch.setattr(sys, "prefix", str(folder / ".venv"))
+    release.release_info.cache_clear()
+    yield folder
+    release.release_info.cache_clear()
+
+
+def test_the_release_is_reported_by_readyz_app_info_and_the_owner_lock(tmp_path, monkeypatch, installed_release):
+    from yolo_workbench import release
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    assert release.describe() == "2026.10.21 (commit 279d5d130af5, installed 2026-10-21T10:00:00Z)"
+    (installed_release / "release.json").write_text(json.dumps({**RELEASE, "name": "later"}))
+    assert release.release_name() == "2026.10.21"  # read once: `current` may point elsewhere by now
+    root = tmp_path / "projects"
+    root.mkdir()
+    config = load_config(None, {"projects_root": root, "allowed_hosts": ["gpu-box"], "idle_unload_minutes": 0, "auth_enabled": False}, environ={})
+    app = build_app(config, root)
+
+    async def run():
+        async with client_for(app, "gpu-box") as client:
+            assert (await client.get("/api/v1/app")).json()["release"] == RELEASE
+        async with client_for(app, "10.0.0.20") as client:
+            assert (await client.get("/readyz")).json() == {"status": "unavailable", "problems": ["starting"], "release": "2026.10.21"}
+
+    asyncio.run(run())
+    lock = OwnerLock(root / ".workbench").acquire()
+    try:
+        assert json.loads((root / ".workbench" / "owner.json").read_text())["release"] == "2026.10.21"
+        with pytest.raises(AlreadyOwned, match=r"since [^(]*, release 2026\.10\.21 \("):
+            OwnerLock(root / ".workbench").acquire()
+    finally:
+        lock.release()
+
+
+def test_without_an_installed_release_only_the_version_is_known(tmp_path, monkeypatch):
+    from yolo_workbench import __version__, release
+
+    venv = tmp_path / "checkout" / ".venv"
+    venv.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    try:
+        for content in (None, "not json", json.dumps({"name": ""}), json.dumps(["2026.10.21"])):
+            if content is not None:
+                (venv.parent / "release.json").write_text(content)
+            release.release_info.cache_clear()
+            assert release.release_info() is None and release.release_name() is None, content
+            assert release.describe().startswith(f"version {__version__}, not an installed release")
+        (venv.parent / "release.json").write_text(json.dumps({"name": "hand-made"}))
+        release.release_info.cache_clear()
+        assert release.release_info() == {"name": "hand-made", "commit": None, "installed": None} and release.describe() == "hand-made"
+    finally:
+        release.release_info.cache_clear()
+
+
+def test_check_names_its_release_and_the_one_holding_the_folder(tmp_path, monkeypatch, installed_release):
+    """What an admin runs after install.sh and before the restart: the new code, the old server's lock."""
+    from types import SimpleNamespace
+
+    from typer.testing import CliRunner
+
+    from yolo_workbench import server
+
+    torch = SimpleNamespace(__version__="2.9.0", cuda=SimpleNamespace(is_available=lambda: False))
+    for name, module in (("torch", torch), ("ultralytics", SimpleNamespace(__version__="8.3.0")), ("rfdetr", SimpleNamespace(__version__="1.11.0"))):
+        monkeypatch.setitem(sys.modules, name, module)  # importing the real ones takes seconds
+    root = tmp_path / "projects"
+    root.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(f'[server]\nprojects_root = "{root.as_posix()}"\nallowed_hosts = ["gpu-box"]\n[storage]\ncache_dir = "{(tmp_path / "cache").as_posix()}"\n[auth]\nenabled = false\n[embeddings]\nenabled = false\n')
+    running = tmp_path / "releases" / "2026.10.01" / ".venv"
+    running.mkdir(parents=True)
+    (running.parent / "release.json").write_text(json.dumps({**RELEASE, "name": "2026.10.01"}))
+    from yolo_workbench import release
+
+    monkeypatch.setattr(sys, "prefix", str(running))  # the old server took the lock
+    release.release_info.cache_clear()
+    lock = OwnerLock(root / ".workbench").acquire()
+    monkeypatch.setattr(sys, "prefix", str(installed_release / ".venv"))
+    release.release_info.cache_clear()
+    environment = os.environ.copy()  # check points the library caches at cache_dir
+    try:
+        result = CliRunner().invoke(server.app, ["check", "--config", str(config)])
+    finally:
+        os.environ.clear()
+        os.environ.update(environment)
+        lock.release()
+    assert result.exit_code == 0, result.output
+    assert "[ok  ] release: 2026.10.21 (commit 279d5d130af5, installed 2026-10-21T10:00:00Z)" in result.output
+    assert "[warn] owner lock:" in result.output and ", release 2026.10.01 (" in result.output
+
 def test_example_config_lists_every_setting_and_loads(tmp_path):
     from yolo_workbench.config import ServerConfig
 

@@ -46,7 +46,8 @@ sudo bash deploy/install.sh
 It creates the `yolo-workbench` system account, `/srv/yolo-workbench/projects` (data), `/var/cache/yolo-workbench`
 (caches), installs the code and its virtual environment into `/opt/yolo-workbench/releases/<version>/` with
 `/opt/yolo-workbench/current` pointing at it, and installs `/etc/yolo-workbench/config.toml` (first time only)
-and the systemd unit. Then:
+and the systemd unit. The version name comes from `git describe` (`sudo bash deploy/install.sh 2026.10.21`
+names it yourself). Then:
 
 1. Edit `/etc/yolo-workbench/config.toml`: at least `allowed_hosts` — the names and addresses people type in
    the browser (e.g. `["gpu-server", "gpu-server.example.local", "10.0.0.20"]`).
@@ -74,8 +75,9 @@ To bring existing datasets in, copy their folders into `/srv/yolo-workbench/proj
 
 | Path | Contents |
 | --- | --- |
-| `/opt/yolo-workbench/releases/<version>/` | code and virtual environment of one version (read-only) |
+| `/opt/yolo-workbench/releases/<version>/` | code and virtual environment of one version (read-only); `release.json` names it (version, commit, install time) |
 | `/opt/yolo-workbench/current` | the active version |
+| `/opt/yolo-workbench/previous` | the version active before the last switch, where `deploy/rollback.sh` goes back to |
 | `/opt/yolo-workbench/python/` | the Python uv installed for the releases |
 | `/etc/yolo-workbench/config.toml` | configuration |
 | `/etc/yolo-workbench/yolo-workbench.env` | environment for the unit (optional overrides, proxy, `CUDA_VISIBLE_DEVICES`) |
@@ -135,7 +137,9 @@ curl -s localhost:8765/readyz            # 200 when ready; /healthz answers as l
 
 `/healthz` (liveness) and `/readyz` (startup finished, projects folder writable, owner lock held) need no
 Host name from `allowed_hosts`, so a monitoring system can poll them by IP. Readiness does not wait for image
-indexing, the GPU, or MongoDB.
+indexing, the GPU, or MongoDB. `/readyz` also says which release answers (`"release"`, the version
+`install.sh` named; `null` when not run from an installed release); so do `check`, the journal (`release …`
+at every start) and, for a signed-in browser, `/api/v1/app`.
 
 ### Training and restarts
 
@@ -275,17 +279,73 @@ that were active in the backup show as interrupted; resume them from the Trainin
 
 ## Upgrade and rollback
 
+An upgrade installs the new release next to the old ones and points `current` at it; the running server
+keeps using its own release's files until it restarts. The projects folder, `/etc/yolo-workbench/` and the
+accounts are not touched, and nothing migrates them: every release reads the same files. A cache whose
+format changed is rebuilt (the image size index is probed again; a Label QA analysis made by a release with
+another format has to be run again).
+
+1. **Tell people a restart is coming.** It keeps sign-ins, reviews, the activity log, Label QA results and
+   the training queue. It drops what lives only in memory: every project's undo history, predictions not yet
+   accepted, loaded models (they load again on use), and who has which image open. Saves during the stop
+   are refused ("the server is shutting down"), then the server is unreachable for a few seconds.
+2. **Training tab: Hold & pause**, and wait for the run to pause (or accept that the restart pauses it at
+   its next checkpoint, waiting up to `pause_deadline_s`). The hold is saved: nothing starts after the
+   restart until you release it. The paused run resumes on the new release; when the upgrade changes the
+   Ultralytics, RF-DETR or torch version (`uv.lock`), its checkpoint may not resume, so upgrade between runs
+   when you can.
+3. **Install the new release** from a clean checkout: `install.sh` copies the whole folder (uncommitted
+   and untracked files too; the version name then ends in `-dirty` and it warns).
+   ```bash
+   cd /path/to/checkout && git pull                    # or check out a tag
+   sudo bash deploy/install.sh
+   ```
+   It downloads the locked packages (internet access; each release is a few GB, torch and CUDA included),
+   points `current` at the new release and `previous` at the old one, and replaces the systemd unit with the
+   new release's. `config.toml` and `yolo-workbench.env` are never overwritten.
+4. **Check the new release before restarting.** The old server keeps running meanwhile; its owner lock
+   shows as a warning naming the release that holds it.
+   ```bash
+   sudo -u yolo-workbench /opt/yolo-workbench/current/.venv/bin/yolo-workbench-server check --config /etc/yolo-workbench/config.toml
+   ```
+   This loads your configuration with the new code, so a setting it renamed or removed shows up here rather
+   than as a failed start (it reads `config.toml`, not the unit's `yolo-workbench.env`). If it fails, fix
+   the configuration, or roll back (below): nothing has restarted yet.
+5. **Restart and confirm** that the new release answers:
+   ```bash
+   sudo systemctl restart yolo-workbench
+   curl -s localhost:8765/readyz                       # {"status": "ready", "problems": [], "release": "<version>"}
+   ```
+6. **Release the queue** in the Training tab, and ask people to **reload** their open tabs. The pages are
+   served with `no-cache`, so a reload gets the new UI; a tab left open keeps running the old one.
+
+### Rollback
+
 ```bash
-# 1. Training tab: Hold & pause, and wait for the run to pause (or accept that the restart pauses it)
-cd /path/to/checkout && git pull
-sudo bash deploy/install.sh                  # installs the new release next to the old one, switches `current`
-sudo systemctl restart yolo-workbench
-curl -s localhost:8765/readyz                # then release the queue in the Training tab
+sudo bash deploy/rollback.sh                # back to `previous` (from the checkout, or /opt/yolo-workbench/current/deploy/)
+sudo bash deploy/rollback.sh <version>      # to any installed release
+bash deploy/rollback.sh --list              # the installed releases, newest first
 ```
 
-Rollback: `sudo ln -sfn /opt/yolo-workbench/releases/<previous> /opt/yolo-workbench/current && sudo systemctl restart yolo-workbench`.
-Keep old releases until no run they started is still training (a run's process uses the files of the
-release that launched it); delete them by hand afterwards.
+`rollback.sh` runs `check` with the release it switches to and changes nothing when that fails (`--force`
+switches anyway). Then it points `current` at that release and `previous` at the one it leaves (running it
+again returns), puts back that release's systemd unit (`install.sh` replaced it with the newer one's),
+restarts the service (clearing the start limit a crashing release may have hit) and waits for `/readyz`.
+The restart is like an upgrade's: training pauses first, the undo history is dropped, and open tabs need
+a reload. Releases installed before `rollback.sh` existed have no `release.json` and do not report their
+name; switching to one works the same.
+
+### Old releases
+
+Nothing runs from a release after the restart that leaves it: stopping the service ends every process it
+started, training runs and exports included (`KillMode=mixed`). Until that restart, the old release is still
+in use, and a run the old server starts in the meantime runs from its files. Keep `previous` for rollback
+and delete older ones by hand (never `current` or `previous`):
+
+```bash
+bash deploy/rollback.sh --list
+sudo rm -rf /opt/yolo-workbench/releases/<version>
+```
 
 ## Troubleshooting
 
@@ -322,4 +382,5 @@ Before people rely on a new installation (and after major upgrades):
       an ONNX export interrupted by a restart (fails cleanly, can be repeated).
 - [ ] A 24–72 hour run with regular work: memory and disk use stay flat; `/healthz` stays fast; no leftover
       processes after `systemctl stop`.
-- [ ] Restore a backup onto a second machine; upgrade and roll back once.
+- [ ] Restore a backup onto a second machine; upgrade and roll back once (`deploy/rollback.sh`), and
+      `/readyz` names the release each time.

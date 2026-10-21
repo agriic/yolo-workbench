@@ -31,6 +31,7 @@ from .lifecycle import Lifecycle, LifecycleOptions
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
 from .predictor import PredictorManager, free_gpu_memory, model_upload_target
+from .release import release_info, release_name
 from .runtime import RUNTIME
 from .sam import SamManager
 from .session import DatasetSession
@@ -947,7 +948,7 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
     @app.get("/api/v1/app")
     def app_info():
         user = current_user()
-        return {"mode": mode, "version": app.version, "server": RUNTIME.server_mode, "features": {"path_import": RUNTIME.allow_path_import, "model_upload": True}, "auth": auth is not None, "user": user.public() if user else None}
+        return {"mode": mode, "version": app.version, "release": release_info(), "server": RUNTIME.server_mode, "features": {"path_import": RUNTIME.allow_path_import, "model_upload": True}, "auth": auth is not None, "user": user.public() if user else None}
 
     # ---------- sign-in (server profile) ----------
 
@@ -1001,7 +1002,8 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
     @app.get("/readyz")
     def readyz():
         """Readiness: startup finished, not stopping, the data folder writable, the owner lock held. Image
-        indexing, the GPU and MongoDB do not count: the app is usable without them."""
+        indexing, the GPU and MongoDB do not count: the app is usable without them. `release` tells an admin
+        after an upgrade which release answers (/api/v1/app needs a sign-in and an allowed Host)."""
         problems = []
         if app.state.stopping:
             problems.append("stopping")
@@ -1013,7 +1015,7 @@ def _base_app(mode: str, jobs: JobManager, allowed_hosts: set[str] | None, requi
         lock = app.state.owner_lock
         if lock is not None and not lock.held:
             problems.append("the owner lock is not held")
-        return JSONResponse(status_code=503 if problems else 200, content={"status": "unavailable" if problems else "ready", "problems": problems})
+        return JSONResponse(status_code=503 if problems else 200, content={"status": "unavailable" if problems else "ready", "problems": problems, "release": release_name()})
 
     @app.get("/api/v1/status")
     def server_status():

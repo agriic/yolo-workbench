@@ -25,6 +25,7 @@ import typer
 
 from .config import ConfigError, ServerConfig, load_config
 from .ownership import AlreadyOwned, OwnerLock
+from .release import describe as describe_release
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, help="Run the YOLO Workbench as a server (projects mode).")
 user_app = typer.Typer(add_completion=False, no_args_is_help=True, help="Manage the accounts people sign in with (stored in <projects_root>/.workbench/users.json).")
@@ -138,6 +139,7 @@ def run(
 
         app_instance = build_app(settings, root)
         app_instance.state.owner_lock = lock
+        log.info("release %s", describe_release())
         log.info("serving %s on http://%s:%s (allowed hosts: %s; sign-in %s)", root, settings.host or "*", settings.port, ", ".join(sorted(settings.allowed_host_set() or ["any"])), "on" if settings.auth_enabled else "off")
         uvicorn.run(
             app_instance,
@@ -168,6 +170,7 @@ def check(
         failures += ok is False
         typer.echo(f"[{mark}] {label}{f': {detail}' if detail else ''}")
 
+    report(True, "release", describe_release())
     report(True, "configuration", str(config) if config else "defaults and environment")
     root = settings.projects_root
     if not root.is_dir():

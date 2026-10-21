@@ -14,6 +14,8 @@ import sys
 import time
 from pathlib import Path
 
+from .release import release_name
+
 LOCK_NAME = "owner.lock"
 INFO_NAME = "owner.json"
 
@@ -41,7 +43,7 @@ class OwnerLock:
             stream.close()
             raise AlreadyOwned(self._describe_owner()) from None
         self._stream = stream
-        info = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "command": " ".join(sys.argv)}
+        info = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "command": " ".join(sys.argv), "release": release_name()}
         try:
             (self.directory / INFO_NAME).write_text(json.dumps(info), encoding="utf-8")
         except OSError:
@@ -70,7 +72,8 @@ class OwnerLock:
     def _describe_owner(self) -> str:
         try:
             info = json.loads((self.directory / INFO_NAME).read_text(encoding="utf-8"))
-            owner = f"process {info.get('pid')} on {info.get('host')} since {info.get('started')} ({info.get('command')})"
+            release = f", release {info['release']}" if info.get("release") else ""
+            owner = f"process {info.get('pid')} on {info.get('host')} since {info.get('started')}{release} ({info.get('command')})"
         except (OSError, ValueError, AttributeError):
             owner = "another process"
         return f"{self.directory.parent} is already in use by {owner}"
