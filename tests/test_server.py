@@ -706,6 +706,7 @@ def test_check_names_its_release_and_the_one_holding_the_folder(tmp_path, monkey
     lock = OwnerLock(root / ".workbench").acquire()
     monkeypatch.setattr(sys, "prefix", str(installed_release / ".venv"))
     release.release_info.cache_clear()
+    monkeypatch.setattr(server, "unit_sandbox", lambda: None)  # not the unit of a server this may run on
     environment = os.environ.copy()  # check points the library caches at cache_dir
     try:
         result = CliRunner().invoke(server.app, ["check", "--config", str(config)])
@@ -716,6 +717,73 @@ def test_check_names_its_release_and_the_one_holding_the_folder(tmp_path, monkey
     assert result.exit_code == 0, result.output
     assert "[ok  ] release: 2026.10.21 (commit 279d5d130af5, installed 2026-10-21T10:00:00Z)" in result.output
     assert "[warn] owner lock:" in result.output and ", release 2026.10.01 (" in result.output
+
+
+SANDBOX = {"LoadState": "loaded", "ProtectSystem": "strict", "ProtectHome": "yes"}  # as deploy/yolo-workbench.service
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd")
+def test_a_folder_outside_the_units_writable_paths_is_read_only_in_the_service(tmp_path):
+    """ProtectSystem=strict mounts everything but ReadWritePaths read-only, whatever a folder's mode."""
+    from yolo_workbench import server
+
+    allowed, elsewhere = tmp_path / "srv", tmp_path / "data"
+    (allowed / "projects").mkdir(parents=True)
+    elsewhere.mkdir(mode=0o777)
+    (allowed / "link").symlink_to(elsewhere)
+    sandbox = {**SANDBOX, "ReadWritePaths": f"{allowed} -/var/cache/yolo-workbench"}
+    assert server.sandbox_problem(allowed / "projects", sandbox) is None
+    for path in (elsewhere, allowed / "link"):  # a symlink out of a writable folder leads to a read-only one
+        problem = server.sandbox_problem(path, sandbox)
+        assert problem and f"write only {allowed}, /var/cache/yolo-workbench" in problem and f"ReadWritePaths={elsewhere.resolve()}" in problem
+    assert "hides /home" in server.sandbox_problem(Path("/home/alice/projects"), sandbox)
+    assert server.sandbox_problem(Path("/home/alice/projects"), {**sandbox, "ProtectHome": "read-only"})
+    full = {**sandbox, "ProtectSystem": "full"}
+    assert server.sandbox_problem(elsewhere, full) is None and server.sandbox_problem(Path("/etc/yolo-workbench/projects"), full)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="systemd")
+def test_check_and_the_service_say_why_a_folder_is_not_writable(tmp_path, monkeypatch, capsys):
+    """`check` runs as the account but outside the sandbox (sudo -u): the folder is writable there, not in the
+    service, which sees it on a read-only mount."""
+    from types import SimpleNamespace
+
+    import typer
+    from typer.testing import CliRunner
+
+    from yolo_workbench import server
+    from yolo_workbench.config import ServerConfig
+
+    torch = SimpleNamespace(__version__="2.9.0", cuda=SimpleNamespace(is_available=lambda: False))
+    for name, module in (("torch", torch), ("ultralytics", SimpleNamespace(__version__="8.3.0")), ("rfdetr", SimpleNamespace(__version__="1.11.0"))):
+        monkeypatch.setitem(sys.modules, name, module)
+    root, cache = tmp_path / "data" / "projects", tmp_path / "srv" / "cache"
+    root.mkdir(parents=True)
+    root.chmod(0o777)
+    config = tmp_path / "config.toml"
+    config.write_text(f'[server]\nprojects_root = "{root.as_posix()}"\nallowed_hosts = ["gpu-box"]\n[storage]\ncache_dir = "{cache.as_posix()}"\n[auth]\nenabled = false\n[embeddings]\nenabled = false\n')
+    monkeypatch.setattr(server, "unit_sandbox", lambda: {**SANDBOX, "ReadWritePaths": str(tmp_path / "srv")})
+    environment = os.environ.copy()
+    try:
+        result = CliRunner().invoke(server.app, ["check", "--config", str(config)])
+    finally:
+        os.environ.clear()
+        os.environ.update(environment)
+    assert result.exit_code == 1, result.output
+    assert f"[FAIL] projects folder: {root} is writable by this user but not by the service: the unit's sandbox (ProtectSystem=strict, ProtectHome=yes) lets the service write only {tmp_path / 'srv'}" in result.output
+    assert f"ReadWritePaths={root.resolve()}" in result.output and f"[ok  ] cache folder: {cache} is writable" in result.output
+
+    # the service: os.access fails on the read-only mount
+    def startup_error(read_only: bool) -> str:
+        monkeypatch.setattr(os, "statvfs", lambda path: SimpleNamespace(f_flag=os.ST_RDONLY if read_only else 0))
+        with pytest.raises(typer.Exit):
+            server._projects_root(ServerConfig(projects_root=root))
+        return capsys.readouterr().err
+
+    monkeypatch.setattr(os, "access", lambda path, mode: False)
+    assert f"Error: the projects folder {root} is read-only for this process: a read-only mount, or in the systemd service a folder outside the unit's ReadWritePaths; for that, add it with `sudo systemctl edit yolo-workbench`: [Service] ReadWritePaths={root.resolve()}" in startup_error(True)
+    error = startup_error(False)  # a plain permission problem names the folder's owner and mode
+    assert f"Error: the projects folder {root} is not writable by " in error and ", mode 0777)" in error
 
 def test_example_config_lists_every_setting_and_loads(tmp_path):
     from yolo_workbench.config import ServerConfig

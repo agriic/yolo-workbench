@@ -7,6 +7,8 @@
 
 [server]
 # The projects folder: every project (dataset, models, runs) plus the shared training queue lives here.
+# Outside /srv/yolo-workbench the service cannot write it until it is added to the unit's ReadWritePaths
+# (docs/server.md, "Projects folder on another disk"); `yolo-workbench-server check` tells.
 projects_root = "/srv/yolo-workbench/projects"
 # Create the folder when it is missing. Off by default: a disk that is not mounted must stop the service,
 # not turn into an empty workspace on the system disk.
@@ -22,7 +24,7 @@ shutdown_deadline_s = 60
 
 [storage]
 # Rebuildable caches: thumbnails, downloaded weights (YOLO, RF-DETR, SAM), torch/Ultralytics/matplotlib
-# settings. Default: ~/.cache of the service account.
+# settings. Default: ~/.cache of the service account. Elsewhere, add it to the unit's ReadWritePaths too.
 cache_dir = "/var/cache/yolo-workbench"
 # Thumbnail/crop cache size (MB).
 media_cache_mb = 512

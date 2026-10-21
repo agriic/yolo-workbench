@@ -14,9 +14,11 @@ The desktop command (`yolo-workbench`, cli.py) is unchanged and has no sign-in.
 
 from __future__ import annotations
 
+import getpass
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -33,6 +35,8 @@ app.add_typer(user_app, name="user")
 log = logging.getLogger("yolo_workbench.server")
 
 OWNER_DIR = ".workbench"  # workspace-level server state inside the projects folder
+UNIT = "yolo-workbench"  # the systemd unit install.sh installs
+HOME_FOLDERS = ("/home", "/root", "/run/user")  # what the unit's ProtectHome= hides or makes read-only
 
 
 def _load(config: Optional[Path], projects: Optional[Path] = None, host: Optional[str] = None, port: Optional[int] = None) -> ServerConfig:
@@ -64,13 +68,63 @@ def _projects_root(config: ServerConfig) -> Path:
     root = config.projects_root
     if not root.is_dir():
         if not config.create_projects_root:
-            typer.echo(f"Error: the projects folder {root} does not exist (is its disk mounted?). Create it, or set [server] create_projects_root = true", err=True)
+            # INVOCATION_ID: started by systemd, whose unit hides the home folders (ProtectHome=yes)
+            hidden = " The service cannot see folders under /home, /root or /run/user (ProtectHome=yes in the unit)." if os.environ.get("INVOCATION_ID") and _under(root, HOME_FOLDERS) else ""
+            typer.echo(f"Error: the projects folder {root} does not exist (is its disk mounted?). Create it, or set [server] create_projects_root = true.{hidden}", err=True)
             raise typer.Exit(2)
         root.mkdir(parents=True, exist_ok=True)
     if not os.access(root, os.W_OK):
-        typer.echo(f"Error: the projects folder {root} is not writable by this user", err=True)
+        typer.echo(f"Error: the projects folder {_not_writable(root)}", err=True)
         raise typer.Exit(2)
     return root
+
+
+def _under(path: Path, folders) -> bool:
+    path = path.resolve()
+    return any(path.is_relative_to(Path(folder).resolve()) for folder in folders)
+
+
+def _sandbox_fix(path: Path) -> str:
+    return f"add it with `sudo systemctl edit {UNIT}`: [Service] ReadWritePaths={path.resolve()} (docs/server.md: Projects folder on another disk)"
+
+
+def _not_writable(path: Path) -> str:
+    """Why this process cannot write the folder `path` (os.access said it cannot)."""
+    if hasattr(os, "statvfs") and os.statvfs(path).f_flag & os.ST_RDONLY:
+        # the unit's sandbox (ProtectSystem=strict) mounts everything but its ReadWritePaths read-only: no mode helps
+        return f"{path} is read-only for this process: a read-only mount, or in the systemd service a folder outside the unit's ReadWritePaths; for that, {_sandbox_fix(path)}"
+    stat = path.stat()
+    try:
+        user, owner = getpass.getuser(), path.owner()
+    except Exception:  # no name for the uid
+        user, owner = "this user", str(stat.st_uid)
+    return f"{path} is not writable by {user} (owner {owner}, mode {stat.st_mode & 0o7777:04o})"
+
+
+def unit_sandbox(unit: str = UNIT) -> dict[str, str] | None:
+    """The installed systemd unit's filesystem sandbox (`systemctl show`), or None without systemd or the unit."""
+    try:
+        result = subprocess.run(["systemctl", "show", unit, "--property=LoadState,ProtectSystem,ProtectHome,ReadWritePaths"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    values = dict(line.partition("=")[::2] for line in result.stdout.splitlines())
+    return values if result.returncode == 0 and values.get("LoadState") == "loaded" else None
+
+
+def sandbox_problem(path: Path, sandbox: dict[str, str]) -> str | None:
+    """Why the service cannot write `path` under the unit's sandbox, with the fix (None: the sandbox allows it).
+    `check` runs outside the sandbox (sudo -u), so its own write test cannot tell."""
+    home = sandbox.get("ProtectHome", "no")
+    if home in ("yes", "tmpfs") and _under(path, HOME_FOLDERS):
+        return f"the unit hides /home, /root and /run/user from the service (ProtectHome={home}): move the folder elsewhere"
+    writable = [folder.lstrip("-+") for folder in sandbox.get("ReadWritePaths", "").split()]  # "-": may be missing
+    if _under(path, writable):
+        return None
+    system = sandbox.get("ProtectSystem", "no")
+    read_only = {"yes": ["/usr", "/boot", "/efi"], "full": ["/usr", "/boot", "/efi", "/etc"], "strict": ["/"]}.get(system, [])
+    if _under(path, read_only + (list(HOME_FOLDERS) if home == "read-only" else [])):
+        return f"the unit's sandbox (ProtectSystem={system}, ProtectHome={home}) lets the service write only {', '.join(writable) or 'nothing'}: {_sandbox_fix(path)}"
+    return None
 
 
 def lifecycle_options(config: ServerConfig):
@@ -170,13 +224,23 @@ def check(
         failures += ok is False
         typer.echo(f"[{mark}] {label}{f': {detail}' if detail else ''}")
 
+    sandbox = unit_sandbox()
+
+    def folder(label: str, path: Path) -> None:
+        if not os.access(path, os.W_OK):
+            report(False, label, _not_writable(path))
+        elif sandbox is not None and (problem := sandbox_problem(path, sandbox)):
+            report(False, label, f"{path} is writable by this user but not by the service: {problem}")
+        else:
+            report(True, label, f"{path} is writable")
+
     report(True, "release", describe_release())
     report(True, "configuration", str(config) if config else "defaults and environment")
     root = settings.projects_root
     if not root.is_dir():
         report(None if settings.create_projects_root else False, "projects folder", f"{root} does not exist{' (it will be created)' if settings.create_projects_root else ''}")
     else:
-        report(os.access(root, os.W_OK), "projects folder", f"{root} {'is writable' if os.access(root, os.W_OK) else 'is not writable by this user'}")
+        folder("projects folder", root)
         try:
             usage = shutil.disk_usage(root)
             low = usage.free < settings.min_free_disk_gb * 2**30
@@ -193,7 +257,7 @@ def check(
     cache = settings.cache_dir or Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
     try:
         cache.mkdir(parents=True, exist_ok=True)
-        report(os.access(cache, os.W_OK), "cache folder", str(cache))
+        folder("cache folder", cache)
     except OSError as exc:
         report(False, "cache folder", f"{cache}: {exc}")
     if settings.auth_enabled:

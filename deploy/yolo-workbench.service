@@ -40,7 +40,9 @@ TimeoutStopSec=720
 StandardOutput=journal
 StandardError=journal
 
-# Hardening. The account may write only the projects folder and the cache; the code is read-only.
+# Hardening. The account may write only the projects folder and the cache; the code is read-only. A
+# projects_root or cache_dir elsewhere needs `systemctl edit yolo-workbench`: [Service] ReadWritePaths=<folder>
+# (docs/server.md, "Projects folder on another disk"); its mode does not matter, everything else is read-only.
 # Check GPU training after changing any of these (PrivateDevices would hide /dev/nvidia*).
 NoNewPrivileges=yes
 ProtectSystem=strict

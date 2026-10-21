@@ -61,7 +61,8 @@ names it yourself). Then:
    ```
    It reports the configuration, the projects folder (writable, free space, not in use), the accounts, the
    cache folder, what it listens on, the GPU torch sees, Ultralytics/RF-DETR, and MongoDB when embeddings
-   are enabled. It exits non-zero on a failure.
+   are enabled. It exits non-zero on a failure. It runs outside the service's sandbox, so it also checks
+   that the unit lets the service write both folders (see [Projects folder on another disk](#projects-folder-on-another-disk)).
 4. Start it now and at every boot:
    ```bash
    sudo systemctl enable --now yolo-workbench
@@ -83,6 +84,31 @@ To bring existing datasets in, copy their folders into `/srv/yolo-workbench/proj
 | `/etc/yolo-workbench/yolo-workbench.env` | environment for the unit (optional overrides, proxy, `CUDA_VISIBLE_DEVICES`) |
 | `/srv/yolo-workbench/projects/` | every project, `.training/` (the queue), `.trash/` (deleted projects), `.workbench/` (owner lock, `users.json` accounts, `sessions.json` sign-ins) |
 | `/var/cache/yolo-workbench/` | thumbnails, downloaded weights, torch/Ultralytics/matplotlib caches — rebuildable |
+
+### Projects folder on another disk
+
+The unit runs the server in a sandbox (`ProtectSystem=strict`): the whole filesystem is read-only for it
+except `/srv/yolo-workbench` and `/var/cache/yolo-workbench` (`ReadWritePaths=`), whatever the folders'
+owner and mode — `chmod 0777` does not help. `/home`, `/root` and `/run/user` are hidden from it
+(`ProtectHome=yes`). A `projects_root` or `cache_dir` elsewhere, or a symlink from `/srv/yolo-workbench` to
+another disk, has to be added to the unit:
+
+```bash
+sudo systemctl edit yolo-workbench
+```
+
+```ini
+[Unit]
+RequiresMountsFor=/data/yolo-workbench
+
+[Service]
+ReadWritePaths=/data/yolo-workbench
+```
+
+(`RequiresMountsFor` waits for that disk to be mounted.) Both settings add to the unit's own, and the
+drop-in (`/etc/systemd/system/yolo-workbench.service.d/override.conf`) survives upgrades. Then
+`sudo systemctl restart yolo-workbench`. Keep the folder out of `/home`. Name the real folder, not a
+symlink to it.
 
 ## Configuration
 
@@ -352,7 +378,8 @@ sudo rm -rf /opt/yolo-workbench/releases/<version>
 | Symptom | Cause |
 | --- | --- |
 | `Configuration error: …` in the journal, service fails | a setting is wrong or unknown; `yolo-workbench-server check` names it |
-| `the projects folder … does not exist (is its disk mounted?)` | mount missing; the unit also waits for `/srv/yolo-workbench` |
+| `the projects folder … does not exist (is its disk mounted?)` | mount missing; the unit also waits for `/srv/yolo-workbench`. A folder under `/home` is hidden from the service |
+| `the projects folder … is read-only for this process` (even with mode 0777) | the folder is outside the unit's `ReadWritePaths`: [add it](#projects-folder-on-another-disk) |
 | `… is already in use by process …` | another server or a desktop session uses the folder |
 | the service stopped by itself and came back 10 s later, `low memory! … sending SIGTERM` in `journalctl` | an OOM killer (earlyoom, systemd-oomd) asked the server to stop: the active run paused at its checkpoint and resumes after the restart (`Restart=always`). Give the host more memory, or load fewer models during training (`gpu_models_during_training = "refuse"`, a lower `max_loaded_models`) |
 | `start request repeated too quickly` / `start of the service was attempted too often` | more than 10 starts within 5 minutes (a crash loop, or many restarts); fix the cause, then `sudo systemctl reset-failed yolo-workbench` and start it |
