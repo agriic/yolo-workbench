@@ -84,6 +84,21 @@ def test_chance_augmentations_and_pipeline_samples_render(tmp_path):
     assert first.jpeg == again.jpeg  # seeded
 
 
+def test_seeded_samples_ignore_draws_from_the_global_generators(tmp_path, monkeypatch):
+    """Other threads draw from `random` and `np.random` at any time (pymongo does for every write FiftyOne makes)."""
+    dataset = make_dataset(tmp_path, "segmentation")
+    values = {"degrees": 10, "mixup": 0.5, "copy_paste": 0.5, "cutmix": 0.5}
+    expected = augment_preview.render_pipeline(dataset, values, DEFAULTS, 0, 3, 64, 64, True, class_color).jpeg
+    read = augment_preview._read_bgr
+
+    def read_while_others_draw(*args):
+        random.random(), np.random.random()
+        return read(*args)
+
+    monkeypatch.setattr(augment_preview, "_read_bgr", read_while_others_draw)  # called mid-render, for every image mixed in
+    assert augment_preview.render_pipeline(dataset, values, DEFAULTS, 0, 3, 64, 64, True, class_color).jpeg == expected
+
+
 def test_renders_leave_ultralytics_and_global_random_state_alone(tmp_path):
     from ultralytics.data import augment
 

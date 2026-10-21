@@ -3,8 +3,9 @@
 Detection and segmentation run Ultralytics' own transforms (`ultralytics.data.augment`) on dataset images, so a preview
 is what training does, labels included (clipping, the box filter, copy-paste selection). For the range ends, every random
 draw inside that module is pinned to the low or the high end of its range for the duration of one render; pipeline samples
-seed the real random generators instead. Classification runs the torchvision operations Ultralytics composes
-(`classify_augmentations`). Imports of ultralytics/torch happen on first use, through `libraries.load`.
+give it seeded generators of their own instead (other threads draw from the global ones). Classification runs the
+torchvision operations Ultralytics composes (`classify_augmentations`). Imports of ultralytics/torch happen on first use,
+through `libraries.load`.
 
 Images are rendered at `min(imgsz, WORK_SIZE)`. Every augmentation is scale-free except `perspective`, whose coefficient is
 in pixels; it is rescaled so a preview looks like the same value at the real `imgsz`.
@@ -38,7 +39,7 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 LIBRARIES = ("cv2", "torch", "torchvision.transforms", "ultralytics.data.augment", "ultralytics.utils.instance", "ultralytics.utils.ops")
 
-_render_lock = threading.Lock()  # renders patch module globals and reseed global generators
+_render_lock = threading.Lock()  # renders patch module globals and reseed torch's global generator
 _image_cache: OrderedDict = OrderedDict()
 _IMAGE_CACHE_SIZE = 24
 
@@ -176,51 +177,62 @@ class _Pinned:
         return getattr(self.fallback, name)
 
 
-class _NumpyWithPinnedRandom:
-    def __init__(self, at: float):
-        self.random = _Pinned(at, np.random)
+class _NumpyWith:
+    """`np` with another `np.random`."""
+
+    def __init__(self, generator):
+        self.random = generator
 
     def __getattr__(self, name):
         return getattr(np, name)
 
 
-class _pinned_draws:
-    def __init__(self, at: float):
-        self.at = at
+class _augment_draws:
+    """Point the `random` and `np.random` Ultralytics' augment module draws from at generators of this render's own. The
+    global ones are shared with other threads, which draw from them at any time (pymongo does for every write FiftyOne
+    makes), so seeding those does not make a render repeatable."""
+
+    def __init__(self, python_random, numpy_random):
+        self.random = python_random
+        self.numpy_random = numpy_random
 
     def __enter__(self):
         from ultralytics.data import augment
 
         self.module = augment
         self.saved = (augment.random, augment.np)
-        augment.random = _Pinned(self.at, random)
-        augment.np = _NumpyWithPinnedRandom(self.at)
+        augment.random, augment.np = self.random, _NumpyWith(self.numpy_random)
+        return self
 
     def __exit__(self, *exc):
         self.module.random, self.module.np = self.saved
 
 
-class _seeded:
-    """Seed the global generators Ultralytics and torchvision draw from, and put their state back afterwards."""
+class _pinned_draws(_augment_draws):
+    def __init__(self, at: float):
+        super().__init__(_Pinned(at, random.Random(0)), _Pinned(at, np.random.RandomState(0)))
+
+
+class _seeded(_augment_draws):
+    """Seeded generators for Ultralytics' augment module. torchvision has no stand-in for torch's global generator, so that
+    one is seeded and put back afterwards (Albumentations, inside Ultralytics' transforms, is seeded from its seed)."""
 
     def __init__(self, seed: int):
+        super().__init__(random.Random(seed), np.random.RandomState(seed))
         self.seed = seed
 
     def __enter__(self):
         import torch
 
-        self.saved = (random.getstate(), np.random.get_state(), torch.random.get_rng_state())
-        random.seed(self.seed)
-        np.random.seed(self.seed)
+        self.torch_state = torch.random.get_rng_state()
         torch.manual_seed(self.seed)
+        return super().__enter__()
 
     def __exit__(self, *exc):
         import torch
 
-        python_state, numpy_state, torch_state = self.saved
-        random.setstate(python_state)
-        np.random.set_state(numpy_state)
-        torch.random.set_rng_state(torch_state)
+        super().__exit__(*exc)
+        torch.random.set_rng_state(self.torch_state)
 
 
 # ---------- detection / segmentation ----------
@@ -330,11 +342,11 @@ def _detect_pipeline(values: dict, defaults: dict, samples: list[Sample], catego
 
     hyp = _hyp(values, defaults, imgsz, work)
     partners = _PreviewDataset(samples, category, work)
-    with _seeded(seed):
+    with _seeded(seed) as draws:
         transforms = v8_transforms(partners, work, hyp)
         labels = transforms(_labels(samples[0], category, work))
         labels.pop("mix_labels", None)
-        if hyp.bgr and random.uniform(0, 1) < float(hyp.bgr):  # Format() swaps channels after the transforms
+        if hyp.bgr and draws.random.uniform(0, 1) < float(hyp.bgr):  # Format() swaps channels after the transforms
             labels["img"] = np.ascontiguousarray(labels["img"][..., ::-1])
     return labels
 
