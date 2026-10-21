@@ -31,18 +31,22 @@ id -u "$ACCOUNT" >/dev/null 2>&1 || useradd --system --home-dir "$DATA" --shell 
 for group in video render; do
   if getent group "$group" >/dev/null; then usermod -aG "$group" "$ACCOUNT"; fi  # GPU device nodes on some distributions
 done
-install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$DATA" "$DATA/projects" "$CACHE"
+install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0777 "$DATA"
+install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$DATA/projects" "$CACHE"
 install -d -m 0755 "$PREFIX/releases" /etc/yolo-workbench
 
 echo "Installing $VERSION into $RELEASE"
 mkdir -p "$RELEASE"
+# a failed install leaves no half-built release behind (its name could not be used again)
+trap 'echo "Install failed; removing the incomplete $RELEASE" >&2; rm -rf "$RELEASE"' ERR
 tar -C "$SRC" --exclude=./.git --exclude=./.venv --exclude='__pycache__' --exclude=./.pytest_cache -cf - . | tar -C "$RELEASE" -xf -
 # what the server reports as its release (/readyz, /api/v1/app, `check`, the log); the name is validated above
 COMMIT="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || true)"
 printf '{"name": "%s", "commit": "%s", "installed": "%s"}\n' "$VERSION" "$COMMIT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RELEASE/release.json"
-# Python and the environment live under /opt, not in root's home (the service cannot read /root)
+# Python and the environment live under /opt, not in root's home (the service cannot read /root); always
+# uv's own Python, even when the system has a 3.12 (uv would pick that one and leave $PREFIX/python empty)
 UV_PYTHON_INSTALL_DIR="$PREFIX/python" UV_CACHE_DIR="$PREFIX/.uv-cache" UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$RELEASE/.venv" \
-  "$UV" sync --project "$RELEASE" --frozen --no-dev --python 3.12
+  "$UV" sync --project "$RELEASE" --frozen --no-dev --python 3.12 --managed-python
 chmod -R a+rX "$RELEASE" "$PREFIX/python"
 
 # configuration: installed once, never overwritten
@@ -63,6 +67,7 @@ if [ -n "$PREVIOUS" ]; then
 fi
 ln -sfn "$RELEASE" "$PREFIX/current.new"
 mv -T "$PREFIX/current.new" "$PREFIX/current"
+trap - ERR
 
 echo
 echo "Installed $VERSION.${PREVIOUS:+ Previous release: $(basename "$PREVIOUS") (rollback: sudo bash $RELEASE/deploy/rollback.sh)}"
