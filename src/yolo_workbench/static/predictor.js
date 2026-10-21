@@ -57,10 +57,11 @@ export function applyPredictorState(data) {
   pred.job = data.job;
   pred.maxPoints = data.max_points ?? null;
   pred.modelPath = data.model.path;
-  pred.unloaded = data.unloaded ?? null;  // a training run took the GPU
+  pred.unloaded = data.unloaded ?? null;  // a training run took the GPU: load it again by hand
+  pred.parked = data.parked ?? null;  // unloaded because nobody used it: the next prediction loads it again
   $("pred-points-wrap").hidden = state.meta.category !== "segmentation";
   if (document.activeElement !== $("pred-max-points")) $("pred-max-points").value = pred.maxPoints ?? "";
-  const ready = pred.status === "ready";
+  const ready = pred.status === "ready" || pred.status === "parked";
   const running = pred.job.state === "running";
   const canCancel = running && pred.job.done < pred.job.total && !pred.job.cancel_requested;
   const canRetry = !running && Number(pred.job.failed) > 0;
@@ -79,6 +80,7 @@ export function applyPredictorState(data) {
   $("predictor-status").textContent = {
     unavailable: "Assisted labeling needs the [predict] extra (ultralytics)",
     idle: pred.unloaded || "",
+    parked: pred.parked || "Unloaded while unused; it loads again when used",
     loading: "Loading model…",
     error: pred.error || "Failed to load model",
     ready: running
@@ -110,11 +112,12 @@ function renderModelChip(status = state.pred.status) {
     loading: "Loading model…",
     error: "Model failed to load",
     ready: `${modelLabel(pred.modelPath)}${running ? ` · predicting ${pred.job.done}/${pred.job.total}` : ""}`,
+    parked: `${modelLabel(pred.modelPath)} · unloaded`,
   }[status] || "";
   chip.hidden = !text;
   chip.className = `model-chip ${status === "loading" || status === "error" ? status : ""}`;
   chip.innerHTML = `<span>${esc(text)}</span>`;
-  chip.title = status === "ready" ? `Prediction model: ${pred.modelPath}\n${$("predictor-status").textContent}` : $("predictor-status").textContent;
+  chip.title = status === "ready" || status === "parked" ? `Prediction model: ${pred.modelPath}\n${$("predictor-status").textContent}` : $("predictor-status").textContent;
 }
 
 // trained weights are all best.pt: name them after their run folder
@@ -216,12 +219,15 @@ export function maxPointsChanged() {
 
 export async function predictImage() {
   if (!state.detail) return;
-  if (state.pred.status !== "ready") return deps.toast("Load a model first", "error");
+  if (state.pred.status !== "ready" && state.pred.status !== "parked") return deps.toast("Load a model first", "error");
   const id = state.detail.id;
   const button = $("predict-image");
+  const parked = state.pred.status === "parked";  // the server loads it again first
   button.disabled = true;
+  if (parked) $("predictor-status").textContent = "Loading the model again…";
   try {
     const data = await api(`/images/${id}/predictions/compute`, { method: "POST" });
+    if (parked) refreshPredictor();
     if (state.detail?.id === id) {
       state.pred.items = data.items;
       renderPredList();

@@ -131,6 +131,7 @@ class LabelQAManager:
         if self.dataset.category == "classification":
             raise DatasetError("Label QA needs boxes or polygons; classification datasets are not supported")
         predictor = self.predictor
+        predictor.reload()  # a model unloaded while idle comes back
         with predictor._lock:
             if predictor.status != "ready" or predictor.backend is None:
                 raise DatasetError(predictor.unloaded or "Load a model first: pick a trained run or a .pt file above")

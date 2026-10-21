@@ -263,7 +263,12 @@ class PredictorManager:
         self.error: str | None = None
         self.backend = None
         self.model_path: str | None = None
-        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU, or it sat idle)
+        self.unloaded: str | None = None  # why the model was dropped when it must be loaded again by hand (a training run)
+        # status "parked": dropped because nobody used it; the next prediction loads it again (reload())
+        self.parked: str | None = None
+        self.model_names: dict[int, str] = {}  # the loaded (or parked) model's classes
+        self.model_framework: str | None = None
+        self._reload_lock = threading.Lock()  # one reload at a time; others wait for it
         self.loaded_by: dict | None = None  # who loaded the model ({name, display_name}, with sign-in)
         self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
         self.last_used = time.monotonic()  # for the idle unload (and least-recently-used unload across projects)
@@ -286,10 +291,10 @@ class PredictorManager:
                 self.mapping = {model_id: target if target in names else None for model_id, target in self.mapping.items()}
             else:
                 self.mapping = {model_id: None if target is None else mapping.get(target) for model_id, target in self.mapping.items()}
-            if self.backend:
+            if self.model_names:
                 # a class added or renamed to match a model class gets mapped automatically
                 taken = {target for target in self.mapping.values() if target is not None}
-                for model_id, target in self._auto_map(self.backend.names).items():
+                for model_id, target in self._auto_map(self.model_names).items():
                     if self.mapping.get(model_id) is None and target is not None and target not in taken:
                         self.mapping[model_id] = target
                         taken.add(target)
@@ -325,12 +330,13 @@ class PredictorManager:
             return {
                 "status": self.status,
                 "error": self.error,
-                "model": {"path": self.model_path, "names": self.backend.names if self.backend else {}, "framework": getattr(self.backend, "framework", None)},
+                "model": {"path": self.model_path, "names": self.model_names if self.status in ("ready", "parked") else {}, "framework": self.model_framework if self.status in ("ready", "parked") else None},
                 "conf": self.conf,
                 "iou": self.iou,
                 "max_points": self.max_points,
                 "unloaded": self.unloaded,
-                "loaded_by": self.loaded_by if self.backend else None,
+                "parked": self.parked if self.status == "parked" else None,
+                "loaded_by": self.loaded_by if self.status in ("ready", "parked") else None,
                 "mapping": {str(key): value for key, value in self.mapping.items()},
                 "job": job,
                 "pending": {image_id: len(items) for image_id, items in self.predictions.items() if items},
@@ -373,6 +379,9 @@ class PredictorManager:
                 raise DatasetError(self.unloaded or "The model was unloaded while loading")
             self.backend = backend
             self.unloaded = None
+            self.parked = None
+            self.model_names = dict(backend.names)
+            self.model_framework = getattr(backend, "framework", None)
             self.loaded_by = identity.who()
             self.model_path = model_path.as_posix()
             if conf is not None:
@@ -390,11 +399,17 @@ class PredictorManager:
         log.info("predictor: loaded %s for %s", model_path.name, self.dataset.root.name)
         return self.payload()
 
-    def unload(self, run: str, reason: str | None = None) -> bool:
-        """Drop the model so a training run gets the GPU (or because it sat idle: `reason`); cancels a batch run
-        and waits for its current image. Pending predictions, the class mapping and the model path stay.
+    def unload(self, run: str, reason: str | None = None, park: bool = False) -> bool:
+        """Drop the model so a training run gets the GPU (or another project's model: `reason`; it must be loaded
+        again by hand), or because nobody used it (`park`: the next prediction loads it again). Cancels a batch
+        run and waits for its current image. Pending predictions, the class mapping and the model path stay.
         False when nothing was loaded."""
         with self._lock:
+            if self.status == "parked" and not park:
+                # parked models must not come back by themselves now (a run that needs the GPU starts)
+                self.status = "idle"
+                self.unloaded = reason or f"The model was unloaded to free memory for training run '{run}'; load it again"
+                return False
             if self.backend is None and self.status != "loading":
                 return False
             self._generation += 1
@@ -403,8 +418,9 @@ class PredictorManager:
                 self.job["cancel_requested"] = True
             thread = self._thread
             self.backend = None
-            self.status = "idle"
-            self.unloaded = reason or f"The model was unloaded to free memory for training run '{run}'; load it again"
+            self.status = "parked" if park else "idle"
+            self.parked = reason if park else None
+            self.unloaded = None if park else reason or f"The model was unloaded to free memory for training run '{run}'; load it again"
         if thread is not None:
             thread.join(UNLOAD_WAIT)
         log.info("predictor: unloaded the model of %s (%s)", self.dataset.root.name, reason or f"training run '{run}'")
@@ -424,8 +440,40 @@ class PredictorManager:
         with self._lock:
             if self.backend is None or self.status != "ready" or time.monotonic() - self.last_used < idle_seconds:
                 return False
-        minutes = round(idle_seconds / 60)
-        return self.unload("", reason=f"The model was unloaded after {minutes} minute{'s' if minutes != 1 else ''} without use to free memory; load it again")
+        minutes = idle_seconds / 60
+        return self.unload("", reason=f"Unloaded after {minutes:g} minute{'s' if minutes != 1 else ''} without use; it loads again when used", park=True)
+
+    def reload(self) -> bool:
+        """Load a parked model again (same file, options, class mapping and pending predictions); a no-op for any
+        other state. True when it loaded."""
+        with self._reload_lock:  # a second caller waits, then finds it ready
+            with self._lock:
+                if self.status != "parked":
+                    return False
+                path, conf, iou = self.model_path, self.conf, self.iou
+                self.status = "loading"
+                generation = self._generation
+            try:
+                backend = self._backend_factory(Path(path), self.dataset.category, conf, iou)
+            except Exception as exc:
+                with self._lock:
+                    if generation == self._generation:
+                        self.status = "error"
+                        self.error = str(exc)
+                raise DatasetError(f"Failed to load the model again: {exc}") from exc
+            with self._lock:
+                if generation != self._generation:
+                    raise DatasetError(self.unloaded or "The model was unloaded while loading")
+                self.backend = backend
+                self.status = "ready"
+                self.parked = None
+                self.last_used = time.monotonic()
+                if dict(backend.names) != self.model_names:  # the file changed meanwhile
+                    self.model_names = dict(backend.names)
+                    self.mapping = self._auto_map(backend.names)
+                    self.predictions.clear()
+            log.info("predictor: loaded %s again for %s", Path(path).name, self.dataset.root.name)
+            return True
 
     def close(self, timeout: float) -> None:
         """Shutdown: cancel a batch run, wait for it, and drop the model."""
@@ -576,12 +624,12 @@ class PredictorManager:
 
     def set_mapping(self, raw: dict) -> dict:
         with self._lock:
-            if not self.backend:
+            if self.status not in ("ready", "parked"):
                 raise DatasetError("Load a model first")
             mapping: dict[int, int | None] = {}
             for key, value in raw.items():
                 model_id = int(key)
-                if model_id not in self.backend.names:
+                if model_id not in self.model_names:
                     raise DatasetError(f"Unknown model class {model_id}")
                 if value is not None and int(value) not in self.dataset.names:
                     raise DatasetError(f"Unknown dataset class {value}")
@@ -593,6 +641,7 @@ class PredictorManager:
         return self.payload()
 
     def run(self, image_ids: list[str] | None = None, split: str | None = None, only_unlabeled: bool = False) -> dict:
+        self.reload()
         with self._lock:
             if self.status != "ready" or not self.backend:
                 raise DatasetError(self.unloaded or "Load a model first")
@@ -687,6 +736,7 @@ class PredictorManager:
     def predict_image(self, image_id: str) -> dict:
         """Run the model on one image synchronously — the editor's per-image predict action."""
         record = self.dataset.require_image(image_id)
+        self.reload()
         with self._lock:
             if self.status != "ready" or not self.backend:
                 raise DatasetError(self.unloaded or "Load a model first")

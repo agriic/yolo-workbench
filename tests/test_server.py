@@ -12,6 +12,7 @@ from dataclasses import fields, replace as dc_replace
 from pathlib import Path
 
 import pytest
+from PIL import Image
 from httpx import ASGITransport, AsyncClient
 
 from test_dataset import make_dataset as make_small_dataset
@@ -478,7 +479,12 @@ def test_idle_models_unload(tmp_path):
     sam._thread.join(5)
     assert not sam.unload_if_idle(60)
     sam.last_used -= 120
-    assert sam.unload_if_idle(60) and "without use" in sam.payload()["unloaded"]
+    assert sam.unload_if_idle(60)
+    state = sam.payload()
+    assert state["status"] == "idle" and state["idle_unloaded"] and state["unloaded"] is None  # the editor loads it again
+    sam.start()
+    sam._thread.join(5)
+    assert sam.payload()["status"] == "ready" and not sam.payload()["idle_unloaded"]
 
     dataset, _ = make_small_dataset(tmp_path)
     predictor = PredictorManager(dataset, backend_factory=lambda *args: type("Backend", (), {"names": {0: "zero"}})())
@@ -491,7 +497,69 @@ def test_idle_models_unload(tmp_path):
     predictor.external_busy = None
     assert not predictor.unload_if_idle(60)
     predictor.last_used -= 120
-    assert predictor.unload_if_idle(60) and predictor.backend is None and "without use" in predictor.payload()["unloaded"]
+    assert predictor.unload_if_idle(60) and predictor.backend is None
+    state = predictor.payload()
+    assert state["status"] == "parked" and "without use" in state["parked"] and state["unloaded"] is None
+    assert state["model"]["names"] == {0: "zero"}  # the mapping stays editable while parked
+
+
+def test_a_parked_model_loads_again_on_use_with_its_mapping_and_predictions(tmp_path):
+    from test_predictor import make_predictor
+
+    dataset, _, manager, model = make_predictor(tmp_path)
+    manager.load(str(model))
+    first = second = next(iter(dataset.images))
+    pending = manager.predict_image(first)["items"]
+    manager.set_mapping({"0": None})
+    manager.last_used -= 600
+    assert manager.unload_if_idle(60) and manager.status == "parked"
+    loads = []
+    factory = manager._backend_factory
+    manager._backend_factory = lambda *args: loads.append(args) or factory(*args)
+    assert manager.pending_image_ids() == {first}
+    manager.set_mapping({"0": None})  # works while parked
+    manager.predict_image(second)  # loads it again first
+    assert len(loads) == 1 and manager.status == "ready" and manager.mapping[0] is None  # the mapping chosen by hand stayed
+    # a run that needs the GPU makes a parked model one that is loaded again only by hand
+    manager.last_used -= 600
+    manager.unload_if_idle(60)
+    assert manager.unload("big run") is False and manager.status == "idle" and "big run" in manager.payload()["unloaded"]
+    with pytest.raises(DatasetError, match="big run"):
+        manager.predict_image(second)
+
+
+def test_server_training_unloads_only_the_trained_projects_model(tmp_path):
+    from test_training import ARGS, FakeLauncher, FakePredictorBackend, FakeSamBackend
+
+    launcher = FakeLauncher()
+    workspace = Workspace(tmp_path / "projects", jobs=JobManager(synchronous=True), background_probe=False, training_options={"launcher": launcher, "weights_dir": tmp_path / "w"})
+    slugs = [workspace.create(name, "detection", ["cat"])["slug"] for name in ("Alpha", "Beta")]
+    for slug in slugs:
+        for split in ("train", "val"):
+            Image.new("RGB", (16, 16)).save(workspace.root / slug / "images" / split / "a.jpg")
+            (workspace.root / slug / "labels" / split / "a.txt").write_text("0 0.5 0.5 0.2 0.2\n")
+    sam = SamManager(backend_factory=FakeSamBackend, gpu=True)
+    app = create_workspace_app(workspace, media_cache=MediaCache(tmp_path / "media"), sam=sam, lifecycle_options=LifecycleOptions(unload_for_training="project"))
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"x")
+    predictors = []
+    for slug in slugs:
+        predictor = workspace.session(slug).predictor
+        predictor._backend_factory = FakePredictorBackend
+        predictor._available = True
+        predictor.load(str(model))
+        predictors.append(predictor)
+    sam.start()
+    sam._thread.join(5)
+
+    async def run():
+        async with client_for(app) as client:
+            response = await client.post(f"/api/v1/projects/{slugs[0]}/training/runs", json={"name": "p", "yaml": ARGS})
+            assert response.json()["run"]["active"]
+        assert predictors[0].status == "idle" and "training run" in predictors[0].unloaded
+        assert predictors[1].status == "ready" and sam.status == "ready"
+
+    asyncio.run(run())
 
 
 # ---------- the real server process ----------

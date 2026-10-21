@@ -285,7 +285,7 @@ class TrainingManager:
         self._exports: dict[Path, str] = {}  # run dir -> its latest ONNX export job
         self.weights_dir = weights_dir or default_weights_dir()
         # called with a run's name right before it launches: the app unloads SAM and prediction models (one GPU)
-        self.before_launch: Callable[[str], None] | None = None
+        self.before_launch: Callable[[str, str | None], None] | None = None  # (run name, project) frees the GPU
         self._lock = threading.RLock()
         self._handle = None  # process handle of a run this server launched (None after a restart)
         self._locked: dict[Path, dict] = {}  # dataset yaml -> lock info; replaced whole, read without the lock
@@ -550,7 +550,7 @@ class TrainingManager:
                 self._queue["active"] = entry
                 self._refresh_lock()
             ensure_free_space(run_dir, what=f"training run '{meta.get('name', run_dir.name)}'")
-            self._free_models(meta.get("name", run_dir.name))
+            self._free_models(meta.get("name", run_dir.name), entry.get("project"))
             # recorded as active before the process exists: a server stopping right after the launch finds the
             # runner again by its spec path (see _active_alive) instead of launching the run a second time
             self._save_queue()
@@ -568,11 +568,11 @@ class TrainingManager:
             self._refresh_lock()
             log.warning("training: could not start run '%s': %s", run_dir.name, exc)
 
-    def _free_models(self, run: str) -> None:
+    def _free_models(self, run: str, project: str | None) -> None:
         if self.before_launch is None:
             return
         try:
-            self.before_launch(run)
+            self.before_launch(run, project)
         except Exception:  # the run starts anyway; it may just have less GPU memory
             log.exception("training: could not unload models before '%s'", run)
 

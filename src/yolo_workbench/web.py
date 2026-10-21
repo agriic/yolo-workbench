@@ -613,6 +613,20 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         payload["gpu_warning"] = app_lifecycle.gpu_warning(payload.get("status") == "ready") if app_lifecycle else None
         return payload
 
+    def with_model(session: DatasetSession, call):
+        """A prediction that may load a parked model again (it sat idle): that load follows the GPU policy and
+        counts toward max_loaded_models like a load by hand."""
+        parked = getattr(session.predictor, "status", None) == "parked"
+        app_lifecycle = lifecycle()
+        if parked and app_lifecycle is not None:
+            refused = app_lifecycle.refuse_gpu_load()
+            if refused:
+                raise DatasetError(refused)
+        result = call()
+        if parked and app_lifecycle is not None and getattr(session.predictor, "backend", None) is not None:
+            app_lifecycle.enforce_model_limit(session)
+        return result
+
     @router.get("/predictor")
     def predictor_state(session: DatasetSession = current):
         return predictor_payload(session, session.predictor.payload())
@@ -653,7 +667,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/predictor/run")
     def predictor_run(payload: PredictorRunPayload, session: DatasetSession = current):
-        return session.predictor.run(payload.image_ids, payload.split, payload.only_unlabeled)
+        return predictor_payload(session, with_model(session, lambda: session.predictor.run(payload.image_ids, payload.split, payload.only_unlabeled)))
 
     @router.post("/predictor/cancel")
     def predictor_cancel(session: DatasetSession = current):
@@ -661,12 +675,12 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/predictor/retry")
     def predictor_retry(session: DatasetSession = current):
-        return session.predictor.retry_failed()
+        return predictor_payload(session, with_model(session, session.predictor.retry_failed))
 
     @router.post("/images/{image_id}/predictions/compute")
     def compute_predictions(image_id: str, session: DatasetSession = current):
         try:
-            return session.predictor.predict_image(image_id)
+            return with_model(session, lambda: session.predictor.predict_image(image_id))
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
 
@@ -705,7 +719,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/qa/run")
     def qa_run(payload: QARunPayload, session: DatasetSession = current):
-        return labelqa(session).start(payload.split)
+        return with_model(session, lambda: labelqa(session).start(payload.split))
 
     @router.post("/qa/cancel")
     def qa_cancel(session: DatasetSession = current):
@@ -1068,13 +1082,16 @@ def _training_routes(app: FastAPI, training: TrainingManager) -> None:
         return training.set_hold(payload.held, payload.pause_active)
 
 
-def _unload_before_training(training: TrainingManager, sam: SamManager, open_sessions: Callable[[], list[DatasetSession]]) -> None:
-    """A run about to start gets the GPU: SAM and every open dataset's prediction model are unloaded first."""
+def _unload_before_training(training: TrainingManager, sam: SamManager, open_sessions: Callable[[], list[DatasetSession]], scope: str = "all") -> None:
+    """A run about to start gets the GPU. scope "all": SAM and every open dataset's prediction model are
+    unloaded first; "project" (the server): only the trained project's prediction model (its dataset is
+    read-only while it trains); SAM and other projects' models stay until they sit idle."""
 
-    def unload(run: str) -> None:
-        freed = sam.unload(run)
+    def unload(run: str, project: str | None = None) -> None:
+        freed = sam.unload(run) if scope == "all" else False
         for session in open_sessions():
-            freed = session.unload_models(run) or freed
+            if scope == "all" or session.slug == project:
+                freed = session.unload_models(run) or freed
         if freed:
             free_gpu_memory()
 
@@ -1118,7 +1135,7 @@ def create_app(dataset: Dataset, media_cache: MediaCache | None = None, predicto
     sam = sam or SamManager()
     _sam_routes(app, sam)
     session = DatasetSession.open(dataset, predictor)
-    _unload_before_training(training, sam, lambda: [session])
+    _unload_before_training(training, sam, lambda: [session], (lifecycle_options or LifecycleOptions()).unload_for_training)
     app.state.lifecycle = Lifecycle(training, jobs, sam, lambda: [session], dataset.root, lifecycle_options)
     app.state.dataset = dataset
     app.state.session = session
@@ -1138,7 +1155,7 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     _training_routes(app, workspace.training)
     sam = sam or SamManager()
     _sam_routes(app, sam)
-    _unload_before_training(workspace.training, sam, workspace.open_sessions)
+    _unload_before_training(workspace.training, sam, workspace.open_sessions, (lifecycle_options or LifecycleOptions()).unload_for_training)
     app.state.lifecycle = Lifecycle(workspace.training, workspace.jobs, sam, workspace.open_sessions, workspace.root, lifecycle_options, workspace=workspace)
     cache = media_cache or MediaCache()
     app.state.media_cache = cache

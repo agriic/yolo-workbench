@@ -52,7 +52,7 @@ function applySamState(data) {
   s.model = data.model;
   s.message = data.message;
   s.error = data.error;
-  s.unloaded = data.unloaded ?? null;  // a training run took the GPU: not loaded again by itself
+  s.unloaded = data.unloaded ?? null;  // a training run took the GPU: not loaded again by itself (an idle unload is)
   const button = $("smart-annotate");
   button.disabled = s.status === "unavailable";
   button.title = {
@@ -127,12 +127,17 @@ async function encodeCurrent() {
   }
 }
 
-/** After a failed request: true when the server no longer has the model (a training run unloaded it).
- * Smart annotation then turns off, so turning it on loads the model again. */
+/** After a failed request: true when the server no longer has the model. Unloaded because nobody used it: it
+ * loads again and the prompt is answered once it is ready. Unloaded for a training run: smart annotation
+ * turns off, so turning it on loads the model again. */
 async function modelLost(error) {
   await refreshSam();
   const s = sam();
   if (s.status === "ready" || s.status === "loading") return false;
+  if (s.status === "idle" && !s.unloaded) {
+    await startModel();
+    return true;
+  }
   if (s.active) {
     await toggleSam(false);
     deps.toast(s.unloaded || error.message, "error");

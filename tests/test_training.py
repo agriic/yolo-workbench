@@ -1049,7 +1049,7 @@ def test_a_failing_unload_does_not_stop_the_run(tmp_path):
     manager = make_manager(dataset, tmp_path, launcher)
     calls = []
 
-    def before_launch(run):
+    def before_launch(run, project):
         calls.append(run)
         raise RuntimeError("boom")
 

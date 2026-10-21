@@ -1,8 +1,10 @@
 """Smart annotation: Segment Anything (SAM 2.1) turns clicked points or a rough box into an annotation.
 
-One SamManager serves the whole app (both modes), so the model is loaded once. Loading is
+One SamManager serves the whole app (both modes): one model for every user and project. Loading is
 started explicitly (the editor's Smart annotation button) and runs in a background thread,
-since the first use downloads the weights. Each image is encoded once (the slow step) and its
+since the first use downloads the weights. It is unloaded when nobody used it for the idle time
+(the server's maintenance), after which the editor loads it again by itself on the next use, or for
+a training run (the desktop; then it stays off until turned on again). Each image is encoded once (the slow step) and its
 features kept in a small LRU, so every further click only runs the prompt decoder.
 Results are never written here: the editor adds them as annotations through the normal save path.
 """
@@ -27,7 +29,7 @@ from .predictor import ultralytics_available
 log = logging.getLogger(__name__)
 
 LARGE, BASE = "sam2.1_l.pt", "sam2.1_b.pt"
-FEATURE_CACHE = 4  # encoded images kept; SAM 2.1 features are ~16 MB each
+FEATURE_CACHE = 8  # encoded images kept (shared by everyone using SAM); SAM 2.1 features are ~16 MB each
 MIN_AREA = 4  # px; a smaller mask counts as "nothing found"
 
 
@@ -123,14 +125,15 @@ class SamManager:
         self.model: str | None = None
         self.device: str | None = None
         self.backend = None
-        self.unloaded: str | None = None  # why the model was dropped (a training run took the GPU, or it sat idle)
+        self.unloaded: str | None = None  # why the model was dropped when it must be turned on again (a training run took the GPU)
+        self.idle_unloaded = False  # dropped because nobody used it: the editor loads it again by itself
         self._generation = 0  # bumped by unload, so a load finishing afterwards is discarded
         self.last_used = time.monotonic()
         self._features: OrderedDict[tuple, tuple] = OrderedDict()  # (path, mtime_ns, size) -> (features, (h, w))
 
     def payload(self) -> dict:
         with self._lock:
-            return {"status": self.status, "message": self.message, "error": self.error, "model": self.model, "device": self.device, "unloaded": self.unloaded}
+            return {"status": self.status, "message": self.message, "error": self.error, "model": self.model, "device": self.device, "unloaded": self.unloaded, "idle_unloaded": self.idle_unloaded}
 
     def candidates(self) -> list[str]:
         """Large when a GPU can run it at interactive speed, base as the fallback."""
@@ -146,6 +149,7 @@ class SamManager:
                 self.status = "loading"
                 self.error = None
                 self.unloaded = None
+                self.idle_unloaded = False
                 self._thread = threading.Thread(target=self._load, args=(self._generation,), name="sam-load", daemon=True)
                 self._thread.start()
         return self.payload()
@@ -180,9 +184,10 @@ class SamManager:
             self.message = None
             self.error = "Failed to load SAM — " + "; ".join(errors)
 
-    def unload(self, run: str, reason: str | None = None) -> bool:
-        """Drop the model (and the encoded images) so a training run gets the GPU, or because it sat idle
-        (`reason`). False when nothing was loaded."""
+    def unload(self, run: str, reason: str | None = None, idle: bool = False) -> bool:
+        """Drop the model (and the encoded images) so a training run gets the GPU (it stays off until turned on
+        again), or because nobody used it (`idle`: the editor loads it again on the next use). False when
+        nothing was loaded."""
         with self._lock:
             if self.status not in ("ready", "loading"):
                 return False
@@ -192,19 +197,21 @@ class SamManager:
             self.device = None
             self.status = "idle"
             self.message = None
-            self.unloaded = reason or f"Smart annotation was unloaded to free memory for training run '{run}'; turn it on again to load it"
+            self.idle_unloaded = idle
+            self.unloaded = None if idle else reason or f"Smart annotation was unloaded to free memory for training run '{run}'; turn it on again to load it"
         with self._run_lock:  # an in-flight encode or decode finishes first
             self._features.clear()
         log.info("sam: unloaded (%s)", reason or f"training run '{run}'")
         return True
 
     def unload_if_idle(self, idle_seconds: float) -> bool:
-        """Unload a model nobody prompted for `idle_seconds` (the maintenance thread calls this)."""
+        """Unload a model nobody prompted for `idle_seconds` (the maintenance thread calls this); it loads
+        again with the next use."""
         with self._lock:
             if self.status != "ready" or self._run_lock.locked() or time.monotonic() - self.last_used < idle_seconds:
                 return False
-        minutes = round(idle_seconds / 60)
-        return self.unload("", reason=f"Smart annotation was unloaded after {minutes} minute{'s' if minutes != 1 else ''} without use to free memory; turn it on again to load it")
+        minutes = idle_seconds / 60
+        return self.unload("", reason=f"{minutes:g} minute{'s' if minutes != 1 else ''} without use; loads again when used", idle=True)
 
     def close(self, timeout: float) -> None:
         """Shutdown: drop the model; a load in progress is discarded when it finishes."""

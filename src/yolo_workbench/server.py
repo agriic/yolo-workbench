@@ -80,6 +80,7 @@ def lifecycle_options(config: ServerConfig):
         training_pause_deadline=config.training_pause_deadline_s,
         shutdown_deadline=config.shutdown_deadline_s,
         maintenance=True,
+        tick=30.0,  # idle models unload within half a minute of their idle time
         interval=config.maintenance_interval_min * 60,
         idle_unload=config.idle_unload_minutes * 60,
         project_idle_close=config.project_idle_close_min * 60,
@@ -87,6 +88,8 @@ def lifecycle_options(config: ServerConfig):
         staging_max_age=config.staging_max_age_hours * 3600,
         project_trash_retention_days=config.project_trash_retention_days,
         max_loaded_models=config.max_loaded_models,
+        # SAM and other projects' models stay loaded while a run trains, unless models must not share the GPU
+        unload_for_training="all" if config.gpu_models_during_training == "refuse" else "project",
     )
 
 

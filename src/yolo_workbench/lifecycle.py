@@ -41,6 +41,9 @@ class LifecycleOptions:
     staging_max_age: float = 24 * 3600.0
     project_trash_retention_days: float = 0.0
     max_loaded_models: int = 0  # prediction models loaded across open projects; 0 = no limit
+    # what a training run about to start unloads: "all" = SAM and every open project's prediction model
+    # (desktop; the server with gpu_models_during_training = refuse), "project" = only the trained project's model
+    unload_for_training: str = "all"
 
 
 class Lifecycle:

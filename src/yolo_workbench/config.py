@@ -69,7 +69,7 @@ class ServerConfig:
     resume_after_service_stop: bool = _setting(True, "training", "bool")
     hold_queue_after_crash: bool = _setting(False, "training", "bool")
     # [models]
-    idle_unload_minutes: float = _setting(30.0, "models", "float")  # 0 keeps models loaded
+    idle_unload_minutes: float = _setting(2.0, "models", "float")  # SAM / prediction models nobody used; 0 keeps them loaded
     gpu_models_during_training: str = _setting("allow", "models", "choice", choices=GPU_POLICIES)
     max_loaded_models: int = _setting(2, "models", "int", minimum=1)  # prediction models across open projects
     # [projects]

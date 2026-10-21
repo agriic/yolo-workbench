@@ -64,9 +64,12 @@ resume_after_service_stop = true
 hold_queue_after_crash = false
 
 [models]
-# Unload SAM and prediction models after this many minutes without use (frees GPU memory; 0 = never).
-idle_unload_minutes = 30.0
-# Loading SAM or a prediction model while a run trains on the GPU: "allow" (with a warning) or "refuse".
+# Unload SAM (one for everyone) and a project's prediction model after this many minutes nobody used them
+# (frees GPU memory; 0 = never). They load again by themselves on the next use. A training run that starts
+# unloads only its own project's prediction model.
+idle_unload_minutes = 2.0
+# Loading SAM or a prediction model while a run trains on the GPU: "allow" (with a warning) or "refuse"
+# (then a starting run also unloads SAM and every project's prediction model).
 gpu_models_during_training = "allow"
 # Prediction models kept loaded across open projects; loading one more unloads the least recently used.
 max_loaded_models = 2

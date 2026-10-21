@@ -155,7 +155,7 @@ function renderSetup() {
   if (!status) return;
   const job = status.job, result = status.result;
   const running = job.state === "running";
-  const predictorReady = status.predictor.status === "ready";
+  const predictorReady = status.predictor.status === "ready" || status.predictor.status === "parked";  // parked: loads on use
   const choice = $("qa-model").value;
   const loadedChosen = predictorReady && choice && choice === status.predictor.model;
   $("qa-load").hidden = !choice || loadedChosen;

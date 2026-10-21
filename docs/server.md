@@ -110,7 +110,7 @@ variable is `WORKBENCH_` plus the name in the first column (`WORKBENCH_PORT=9000
 | `training_pause_deadline_s` | `[training] pause_deadline_s` | `600` | wait for the active run's checkpoint on stop |
 | `resume_after_service_stop` | `[training]` | `true` | resume it at the next start |
 | `hold_queue_after_crash` | `[training]` | `false` | hold the queue when a run dies |
-| `idle_unload_minutes` | `[models]` | `30` | unload SAM / prediction models (0 = never) |
+| `idle_unload_minutes` | `[models]` | `2` | unload SAM / prediction models (0 = never) |
 | `gpu_models_during_training` | `[models]` | `allow` | `allow` (with a warning) or `refuse` |
 | `max_loaded_models` | `[models]` | `2` | prediction models across open projects |
 | `max_open_projects` | `[projects]` | `4` | projects open at once |
@@ -173,10 +173,14 @@ curl -b /tmp/wb -X POST -H 'X-Workbench: 1' -H 'Content-Type: application/json' 
 
 ### GPU
 
-Starting a run unloads SAM and every open project's prediction model first. SAM and prediction models also
-unload after `idle_unload_minutes` without use, and at most `max_loaded_models` prediction models stay loaded.
-Loading one while a run trains shows a warning (it shares the GPU's memory); `gpu_models_during_training =
-"refuse"` refuses it instead. To keep the server off a GPU, set `CUDA_VISIBLE_DEVICES` in
+SAM (smart annotation) is one model for everyone; each project has its own prediction model, shared by everyone
+in it. Both unload after `idle_unload_minutes` (2) during which nobody used them, and load again by themselves
+on the next use (the first click or prediction then takes a few seconds; a prediction model keeps its class
+mapping and pending predictions). A training run that starts unloads only its own project's prediction model
+(that project is read-only while it trains; load it again by hand if needed); SAM and other projects' models
+stay. At most `max_loaded_models` prediction models stay loaded across projects. Loading one while a run trains
+shows a warning (it shares the GPU's memory); `gpu_models_during_training = "refuse"` refuses it instead, and a
+starting run then also unloads SAM and every project's prediction model. To keep the server off a GPU, set `CUDA_VISIBLE_DEVICES` in
 `/etc/yolo-workbench/yolo-workbench.env` (it applies to the training runs too).
 
 ### Data, uploads and models
