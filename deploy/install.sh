@@ -16,7 +16,7 @@ VERSION="${1:-$(git -C "$SRC" describe --tags --always --dirty 2>/dev/null || da
 PREFIX=/opt/yolo-workbench
 RELEASE="$PREFIX/releases/$VERSION"
 ACCOUNT=yolo-workbench
-DATA=/srv/yolo-workbench
+DATA=/data/yolo-workbench
 CACHE=/var/cache/yolo-workbench
 UV="${UV:-$(command -v uv || true)}"
 
@@ -32,7 +32,7 @@ for group in video render; do
   if getent group "$group" >/dev/null; then usermod -aG "$group" "$ACCOUNT"; fi  # GPU device nodes on some distributions
 done
 install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0777 "$DATA"
-install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$DATA/projects" "$CACHE"
+install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0777 "$DATA/projects" "$CACHE"
 install -d -m 0755 "$PREFIX/releases" /etc/yolo-workbench
 
 echo "Installing $VERSION into $RELEASE"
@@ -51,11 +51,11 @@ chmod -R a+rX "$RELEASE" "$PREFIX/python"
 
 # configuration: installed once, never overwritten
 if [ ! -e /etc/yolo-workbench/config.toml ]; then
-  install -m 0640 -g "$ACCOUNT" "$RELEASE/deploy/config.example.toml" /etc/yolo-workbench/config.toml
+  install -m 0644 -g "$ACCOUNT" "$RELEASE/deploy/config.example.toml" /etc/yolo-workbench/config.toml
   echo "Created /etc/yolo-workbench/config.toml: set allowed_hosts (and check the paths) before starting"
 fi
 if [ ! -e /etc/yolo-workbench/yolo-workbench.env ]; then
-  install -m 0640 -g "$ACCOUNT" "$RELEASE/deploy/yolo-workbench.env" /etc/yolo-workbench/yolo-workbench.env
+  install -m 0644 -g "$ACCOUNT" "$RELEASE/deploy/yolo-workbench.env" /etc/yolo-workbench/yolo-workbench.env
 fi
 install -m 0644 "$RELEASE/deploy/yolo-workbench.service" /etc/systemd/system/yolo-workbench.service
 systemctl daemon-reload
