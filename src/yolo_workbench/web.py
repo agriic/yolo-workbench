@@ -13,14 +13,14 @@ from typing import Callable, Literal
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from . import augment_preview, classes, identity, importer, rfdetr_augment, storage
+from . import augment_preview, classes, download, identity, importer, rfdetr_augment, storage
 from .auth import Auth, AuthError, AuthMiddleware, current_user
 from .dataset import Dataset, DatasetError, SchemaChanged, WriteConflict
 from .fsutil import InsufficientSpace, ensure_free_space, replace
@@ -545,6 +545,16 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
             return session.dataset.rescan()
 
     # ---------- storage (trash and backups) ----------
+
+    @router.get("/download")
+    def download_dataset(kind: download.Kind = "full", session: DatasetSession = current):
+        entries = download.plan(session.dataset, kind)
+        filename = download.archive_name(session.slug or session.dataset.root.name or "dataset", kind)
+        log.info("download %s of %s: %d files", kind, session.slug or session.dataset.root, len(entries))
+        return StreamingResponse(download.stream(entries), media_type="application/zip", headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "Cache-Control": "no-store",
+        })
 
     @router.get("/storage")
     def storage_summary(session: DatasetSession = current):

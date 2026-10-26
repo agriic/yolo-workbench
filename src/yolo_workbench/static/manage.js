@@ -53,6 +53,8 @@ export function bindManage() {
     const purge = e.target.closest("[data-purge]");
     if (purge) purgeStorage(purge.dataset.kind, purge.dataset.purge);
   });
+  $("download-labels").onclick = () => downloadDataset("labels");
+  $("download-full").onclick = () => downloadDataset("full");
   $("refresh-models").onclick = loadModels;
   $("upload-models").onclick = () => $("models-file").click();
   $("models-file").onchange = e => { uploadModels([...e.target.files]); e.target.value = ""; };
@@ -134,8 +136,27 @@ export function renderManageMeta() {
   $("class-note").textContent = meta.category === "classification"
     ? "Classes are the folders inside each split; ids follow the folder names alphabetically."
     : "Removing or reordering renumbers class ids in every label file. Ctrl+Z undoes any class change.";
+  renderDownload();
   loadFolders();
   if (!importJob) resumeImportJob();
+}
+
+function renderDownload() {
+  const meta = state.meta;
+  const classification = meta.category === "classification";
+  $("download-labels").hidden = classification;  // its labels are the class folders
+  $("download-full").textContent = classification ? "Download" : "Images & labels";
+  $("download-note").textContent = classification
+    ? `A .zip of the ${plural(meta.image_count, "image")} in their split and class folders.`
+    : `A .zip in the dataset's own layout with its data.yaml: the label files only (to lay over a copy of the images), or all ${plural(meta.image_count, "image")} with their labels, ready to train on.`;
+}
+
+function downloadDataset(kind) {
+  // the server names the file and builds the zip while sending it; a link keeps the browser's own download progress
+  const link = document.createElement("a");
+  link.href = apiUrl(`/download?kind=${kind}`);
+  link.download = "";
+  link.click();
 }
 
 async function loadFolders() {
