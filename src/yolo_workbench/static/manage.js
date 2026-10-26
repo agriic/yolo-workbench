@@ -53,6 +53,27 @@ export function bindManage() {
     const purge = e.target.closest("[data-purge]");
     if (purge) purgeStorage(purge.dataset.kind, purge.dataset.purge);
   });
+  $("refresh-models").onclick = loadModels;
+  $("upload-models").onclick = () => $("models-file").click();
+  $("models-file").onchange = e => { uploadModels([...e.target.files]); e.target.value = ""; };
+  $("models-list").addEventListener("click", e => {
+    const load = e.target.closest("[data-load-model]");
+    if (load) return loadFolderModel(load.dataset.loadModel);
+    const remove = e.target.closest("[data-delete-model]");
+    if (remove) deleteModel(remove.dataset.deleteModel);
+  });
+  const modelsPanel = $("models-panel");
+  modelsPanel.addEventListener("dragover", e => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    modelsPanel.classList.add("dragging");
+  });
+  modelsPanel.addEventListener("dragleave", e => { if (!modelsPanel.contains(e.relatedTarget)) modelsPanel.classList.remove("dragging"); });
+  modelsPanel.addEventListener("drop", e => {
+    e.preventDefault();
+    modelsPanel.classList.remove("dragging");
+    uploadModels([...e.dataTransfer.files]);
+  });
   $("split-overview").addEventListener("click", e => {
     const add = e.target.closest("[data-add-folder]");
     if (add) addFolder(add.dataset.addFolder);
@@ -108,6 +129,7 @@ export function renderManageMeta() {
   $("dataset-path").textContent = meta.yaml;
   $("dataset-path").title = meta.root;
   $("import-panel").hidden = !caps.image_ops;
+  $("models-panel").hidden = meta.category === "classification";  // no model-assisted labeling there
   $("class-add-form").hidden = !caps.classes;
   $("class-note").textContent = meta.category === "classification"
     ? "Classes are the folders inside each split; ids follow the folder names alphabetically."
@@ -329,6 +351,81 @@ async function purgeStorage(kind, session) {
   try {
     renderStorage(await api(`/storage/${kind}/${encodeURIComponent(session)}`, { method: "DELETE" }));
     deps.toast(`Deleted the ${what}`);
+  } catch (error) { deps.toast(error.message, "error"); }
+}
+
+/* ---------- models ---------- */
+
+const MODEL_EXTENSIONS = /\.(pt|pth|onnx)$/i;
+let modelItems = [];
+let modelUploads = 0;
+
+export async function loadModels() {
+  if ($("models-panel").hidden) return;
+  try {
+    renderModels(await api("/models"));
+  } catch (error) { deps.toast(error.message, "error"); }
+}
+
+function renderModels(data) {
+  modelItems = data.items;
+  $("models-total").textContent = data.items.length ? `${data.items.length} · ${formatBytes(data.total_bytes)}` : "";
+  const when = item => new Date(item.mtime * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  $("models-list").innerHTML = data.items.length ? data.items.map(item => `
+    <div class="storage-row">
+      <div class="model-file"><strong title="${esc(item.path)}">${esc(item.name)}</strong>${item.loaded ? ' <span class="pill">loaded</span>' : ""}
+        <div class="muted">${formatBytes(item.size)} · ${esc(when(item))}</div></div>
+      <span class="row-actions">
+        ${item.loaded ? "" : `<button class="secondary mini" data-load-model="${esc(item.path)}" title="Load it for prediction (the Annotation tab's model)">Load</button>`}
+        <button class="danger-btn mini" data-delete-model="${esc(item.name)}" title="Delete this file for good">Delete</button>
+      </span>
+    </div>`).join("") : `<p class="panel-note">No models uploaded yet.</p>`;
+}
+
+function modelStatus(text) {
+  $("models-status").hidden = !text;
+  $("models-status").textContent = text || "";
+}
+
+// One file after the other: model files are large, and the server writes each in full before the next.
+async function uploadModels(files) {
+  const accepted = files.filter(file => MODEL_EXTENSIONS.test(file.name));
+  if (accepted.length < files.length) deps.toast("Only .pt, .pth and .onnx files can be uploaded as models", "error");
+  if (!accepted.length) return;
+  modelUploads += 1;
+  $("upload-models").disabled = true;
+  let uploaded = 0;
+  try {
+    for (const [index, file] of accepted.entries()) {
+      modelStatus(`Uploading ${file.name} (${formatBytes(file.size)})${accepted.length > 1 ? ` · ${index + 1} of ${accepted.length}` : ""}…`);
+      try {
+        await api(`/models/upload?name=${encodeURIComponent(file.name)}`, { method: "PUT", body: file, headers: { "Content-Type": "application/octet-stream" } });
+        uploaded += 1;
+      } catch (error) { deps.toast(`${file.name}: ${error.message}`, "error"); }
+    }
+  } finally {
+    modelUploads -= 1;
+    $("upload-models").disabled = modelUploads > 0;
+    if (!modelUploads) modelStatus("");
+  }
+  if (uploaded) deps.toast(`Uploaded ${plural(uploaded, "model")}`);
+  await loadModels();
+}
+
+async function loadFolderModel(path) {
+  await deps.useModel(path);
+  await loadModels();
+}
+
+async function deleteModel(name) {
+  const item = modelItems.find(model => model.name === name);
+  if (!item) return;
+  const loaded = item.loaded ? " It is loaded for prediction and will be unloaded." : "";
+  if (!confirm(`Permanently delete ${name} (${formatBytes(item.size)})?${loaded} This cannot be undone.`)) return;
+  try {
+    renderModels(await api(`/models/${encodeURIComponent(name)}`, { method: "DELETE" }));
+    deps.toast(`Deleted ${name}`);
+    if (item.loaded) deps.modelDeleted(item.path);
   } catch (error) { deps.toast(error.message, "error"); }
 }
 

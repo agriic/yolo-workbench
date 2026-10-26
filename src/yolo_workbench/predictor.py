@@ -60,6 +60,11 @@ UPLOAD_MODEL_EXTENSIONS = MODEL_EXTENSIONS | {".onnx"}
 UNLOAD_WAIT = 10.0  # seconds an unload waits for a batch run's current image
 
 
+def models_folder(dataset: Dataset) -> Path:
+    """The dataset's models/ folder (a project's models/), where uploaded models go."""
+    return (dataset.yaml_path if dataset.yaml_path.is_dir() else dataset.yaml_path.parent) / "models"
+
+
 def model_upload_target(dataset: Dataset, name: str) -> Path:
     """Where an uploaded model goes: the dataset's models/ folder (a project's models/), under a free name.
     Weights files are pickles: loading one runs code from it, so only trusted users may upload them."""
@@ -69,7 +74,7 @@ def model_upload_target(dataset: Dataset, name: str) -> Path:
     suffix = Path(clean).suffix.lower()
     if not clean or suffix not in UPLOAD_MODEL_EXTENSIONS:
         raise DatasetError(f"Upload a model file ({', '.join(sorted(UPLOAD_MODEL_EXTENSIONS))})")
-    directory = (dataset.yaml_path if dataset.yaml_path.is_dir() else dataset.yaml_path.parent) / "models"
+    directory = models_folder(dataset)
     directory.mkdir(parents=True, exist_ok=True)
     target, counter = directory / clean, 2
     while target.exists():
@@ -519,6 +524,59 @@ class PredictorManager:
         # older recents may name the same file differently (backslashes on Windows, relative paths)
         recents = [path] + [item for item in self._recent_models() if not _same_file(item, path)]
         self._save_settings(recent_models=recents[:10])
+
+    def folder_models(self) -> dict:
+        """The model files in the dataset's models/ folder (uploads), newest first; `loaded` marks the one loaded or parked."""
+        directory = models_folder(self.dataset)
+        with self._lock:
+            loaded = self.model_path if self.status in ("ready", "loading", "parked") else None
+        items = []
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry.name.startswith(".") or entry.suffix.lower() not in UPLOAD_MODEL_EXTENSIONS:
+                continue  # dot-prefixed: an upload still being received
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
+            if entry.is_file():
+                path = entry.resolve().as_posix()
+                items.append({"name": entry.name, "path": path, "size": stat.st_size, "mtime": int(stat.st_mtime), "loaded": bool(loaded) and _same_file(loaded, path)})
+        items.sort(key=lambda item: item["mtime"], reverse=True)
+        return {"folder": directory.as_posix(), "items": items, "total_bytes": sum(item["size"] for item in items)}
+
+    def folder_model(self, name: str) -> Path:
+        """A file of the models/ folder by its name (KeyError when there is none)."""
+        if not name or name != Path(name).name or name.startswith(".") or "\\" in name or Path(name).suffix.lower() not in UPLOAD_MODEL_EXTENSIONS:
+            raise KeyError(f"Unknown model: {name}")
+        path = models_folder(self.dataset) / name
+        if not path.is_file():
+            raise KeyError(f"Unknown model: {name}")
+        return path
+
+    def delete_model(self, name: str) -> dict:
+        """Delete a file of the models/ folder for good. The loaded (or parked) model is unloaded first, unless a
+        batch run, Label QA or an inference is using it."""
+        path = self.folder_model(name)
+        with self._lock:
+            loaded = self.status in ("ready", "loading", "parked") and bool(self.model_path) and _same_file(self.model_path, path.as_posix())
+        if loaded:
+            if self.busy():
+                raise DatasetError(f"{name} is in use ({self.external_busy or 'a prediction run'}); wait for it to finish")
+            self.unload("", reason=f"The model file {name} was deleted; load another model")
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise DatasetError(f"Could not delete {name} ({exc.strerror or exc})") from exc
+        recents = self._recent_models()
+        kept = [item for item in recents if not _same_file(item, path.as_posix())]
+        if kept != recents:
+            self._save_settings(recent_models=kept)
+        log.info("predictor: deleted model %s of %s", name, self.dataset.root.name)
+        return self.folder_models()
 
     def set_options(self, max_points: int | None) -> dict:
         """Change the polygon point limit; pending predictions are re-simplified from the model's own polygons."""

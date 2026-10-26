@@ -263,6 +263,13 @@
             <div class="panel-head"><h2>Splits</h2></div>
             <div id="split-overview"></div>
           </article>
+          <article class="stats-panel manage-panel" id="models-panel">
+            <div class="panel-head"><h2>Models <span id="models-total" class="muted"></span></h2><span class="row-actions"><button id="refresh-models" class="secondary mini" type="button">Refresh</button><button id="upload-models" class="secondary mini" type="button" title="Upload model files (.pt, .pth, .onnx) into this dataset's models/ folder">Upload…</button></span></div>
+            <p class="panel-note">Prediction models in this dataset's <code>models/</code> folder, for model-assisted labeling and Label QA. Drop <code>.pt</code>, <code>.pth</code> or <code>.onnx</code> files here to upload them.</p>
+            <input id="models-file" type="file" accept=".pt,.pth,.onnx" multiple hidden>
+            <p id="models-status" class="panel-note" hidden></p>
+            <div id="models-list"></div>
+          </article>
           <article class="stats-panel manage-panel" id="storage-panel">
             <div class="panel-head"><h2>Trash &amp; backups <span id="storage-total" class="muted"></span></h2><button id="refresh-storage" class="secondary mini" type="button">Refresh</button></div>
             <p class="panel-note">Deleted images go to the dataset trash, and the first edit of each label file in a session is backed up. Ctrl+Z covers the current session; restore or delete earlier sessions here.</p>

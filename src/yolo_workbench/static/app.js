@@ -26,7 +26,7 @@ import {
   acceptSam, configureSam, drawSam, hasPrompts, clearPrompts, refreshSam, removeLastPrompt, samEditorClosed,
   samHint, samImageOpened, samMaxPointsChanged, samPointerDown, samPointerMove, samPointerUp, samRightClick, toggleSam,
 } from "./sam.js";
-import { bindManage, configureManage, loadClasses, loadStorage, renderManageMeta } from "./manage.js";
+import { bindManage, configureManage, loadClasses, loadModels, loadStorage, renderManageMeta } from "./manage.js";
 import { bindRepair, configureRepair, openLabelText, renderUnknownClasses } from "./repair.js";
 import { bindLabelQA, configureLabelQA, labelsChangedForQA, showLabelQA } from "./labelqa.js";
 import { bindTraining, configureTraining, hideTraining, showTraining } from "./training.js";
@@ -238,7 +238,7 @@ function showTab(tab, runId = null) {
   if (tab === "embeddings") refreshEmbeddings();
   if (tab === "statistics") loadStatistics();
   if (tab === "quality") showLabelQA();
-  if (tab === "dataset") { loadClasses(); loadStorage(); loadActivity(); }
+  if (tab === "dataset") { loadClasses(); loadModels(); loadStorage(); loadActivity(); }
 }
 
 // Other people's label or review changes (collab.js): refresh what lists the images.
@@ -1278,7 +1278,19 @@ configureRepair({ datasetChanged, labelsChanged, toast });
 configureCollab({ datasetChanged, imagesChanged, presenceChanged: () => imageGallery?.render(), reloadEditor, toast });
 configureLabelQA({ labelsChanged, openEditor, toast });
 configureEmbeddings({ classOptions, editObject, toast });
-configureManage({ datasetChanged, toast });
+configureManage({
+  datasetChanged,
+  toast,
+  // the Dataset tab's Models panel: a file of models/ becomes the prediction model (the tab stays open)
+  useModel: path => {
+    $("model-path").value = path;
+    return loadModel();
+  },
+  modelDeleted: path => {
+    if ($("model-path").value === path) $("model-path").value = "";
+    refreshPredictor();
+  },
+});
 configureTraining({
   toast,
   showTab,

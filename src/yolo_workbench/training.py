@@ -1090,6 +1090,11 @@ class TrainingManager:
             raise DatasetError(f"The run is gone from the list, but some of its files could not be deleted: {doomed.as_posix()} ({exc.strerror or exc})") from exc
         return {"deleted": run_id, "bytes": size}
 
+    def started_from(self, path: Path) -> str | None:
+        """The name of the active or a queued run whose weights argument names `path` (a run folder or a model file)."""
+        with self._lock:
+            return self._started_from(path)
+
     def _started_from(self, run_dir: Path) -> str | None:
         """The name of the active or a queued run that fine-tunes from this run's weights (a resume loads its own checkpoint)."""
         entries = ([self._queue["active"]] if self._queue["active"] else []) + self._queue["queue"]

@@ -388,6 +388,48 @@ def test_model_upload_goes_into_the_projects_models_folder(tmp_path):
     asyncio.run(run())
 
 
+def test_models_folder_lists_and_deletes_models(tmp_path):
+    dataset = make_dataset(tmp_path)
+    launcher = FakeLauncher()
+    manager = manager_for(dataset, tmp_path, launcher)
+    predictor = PredictorManager(dataset, backend_factory=lambda *args: type("Backend", (), {"names": {0: "cat"}})())
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media"), training=manager, predictor=predictor, sam=SamManager(backend_factory=lambda name: object(), gpu=False))
+    folder = dataset.yaml_path.parent / "models"
+
+    async def run():
+        async with client_for(app) as client:
+            assert (await client.get("/api/v1/models")).json()["items"] == []
+            for name in ("old.pt", "new.onnx", "base.pt"):
+                assert (await client.put(f"/api/v1/models/upload?name={name}", content=b"weights")).status_code == 200
+            os.utime(folder / "old.pt", (1, 1))
+            (folder / ".partial.pt").write_bytes(b"x")  # an upload still being received
+            (folder / "notes.txt").write_text("x")
+            listing = (await client.get("/api/v1/models")).json()
+            assert [item["name"] for item in listing["items"]][-1] == "old.pt" and len(listing["items"]) == 3
+            assert listing["total_bytes"] == 21 and not any(item["loaded"] for item in listing["items"])
+
+            loaded = (await client.post("/api/v1/predictor/load", json={"path": (folder / "old.pt").as_posix()})).json()
+            assert loaded["status"] == "ready"
+            assert [item["name"] for item in (await client.get("/api/v1/models")).json()["items"] if item["loaded"]] == ["old.pt"]
+            listing = (await client.delete("/api/v1/models/old.pt")).json()
+            assert {item["name"] for item in listing["items"]} == {"base.pt", "new.onnx"}
+            assert not (folder / "old.pt").exists()
+            state = (await client.get("/api/v1/predictor")).json()
+            assert state["status"] == "idle" and "old.pt was deleted" in state["unloaded"]
+            assert all(item["name"] != "old.pt" for item in (await client.get("/api/v1/predictor/models")).json()["items"])
+
+            for name in ("old.pt", "..%5Cbase.pt", "notes.txt", ".partial.pt"):
+                assert (await client.delete(f"/api/v1/models/{name}")).status_code == 404, name
+            assert (folder / ".partial.pt").exists() and (folder / "notes.txt").exists()
+
+            manager.enqueue(None, dataset, "", "", f"model: {(folder / 'base.pt').as_posix()}\nepochs: 5\nimgsz: 64\n")
+            response = await client.delete("/api/v1/models/base.pt")
+            assert response.status_code == 400 and "is queued to start from base.pt" in response.json()["detail"]
+            assert (folder / "base.pt").exists()
+
+    asyncio.run(run())
+
+
 def test_gpu_policy_refuses_model_loads_while_training(tmp_path):
     dataset = make_dataset(tmp_path)
     launcher = FakeLauncher()

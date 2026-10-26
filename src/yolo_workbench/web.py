@@ -663,9 +663,32 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
         def commit(partial: Path, size: int) -> dict:
             replace(partial, target)
+            log_model_change(session, f"upload model {target.name}")
             return {"path": target.as_posix(), "name": target.name, "size": size}
 
         return await receive_file(request, target, RUNTIME.max_model_upload_bytes, commit)
+
+    def log_model_change(session: DatasetSession, action: str) -> None:
+        who = identity.who()
+        if who is not None and session.dataset.activity is not None:
+            session.dataset.activity.append(who, action, [], kind="models")
+
+    @router.get("/models")
+    def folder_models(session: DatasetSession = current):
+        return session.predictor.folder_models()
+
+    @router.delete("/models/{name}")
+    def delete_folder_model(name: str, session: DatasetSession = current):
+        try:
+            path = session.predictor.folder_model(name)
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        run = training.started_from(path)
+        if run:
+            raise DatasetError(f"Training run '{run}' is queued to start from {name}; cancel it or wait until it finishes")
+        result = session.predictor.delete_model(name)
+        log_model_change(session, f"delete model {name}")
+        return result
 
     @router.put("/predictor/options")
     def predictor_options(payload: PredictorOptionsPayload, session: DatasetSession = current):
