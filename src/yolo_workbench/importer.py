@@ -19,13 +19,14 @@ import secrets
 import shutil
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 
 import yaml
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
-from . import classes
-from .dataset import IMAGE_EXTENSIONS, WORKBENCH_DIR, Dataset, DatasetError
+from . import classes, fsscan
+from .dataset import IMAGE_EXTENSIONS, READ_WORKERS, WORKBENCH_DIR, Dataset, DatasetError
 from .fsutil import ensure_free_space, replace
 from .jobs import Job
 from .runtime import RUNTIME
@@ -202,10 +203,6 @@ def resolve_source(dataset: Dataset, path: str | None, staging_id: str | None) -
     return source
 
 
-def _visible(path: Path, source: Path) -> bool:
-    return not any(part.startswith(".") for part in path.relative_to(source).parts)
-
-
 def _names_from_source(source: Path) -> tuple[dict[int, str] | None, str | None]:
     """Class names shipped with the source: data.yaml (or any dataset YAML), classes.txt, or notes.json."""
     candidates = sorted(source.glob("*.y*ml")) + sorted(source.glob("*/*.y*ml"))
@@ -259,16 +256,20 @@ def _detected_split(relative: Path) -> str | None:
 
 
 def _scan_items(source: Path, category: str) -> list[dict]:
+    # one listing per folder (with sizes): an upload staged on a network drive holds thousands of files
+    listing = fsscan.Listing()
+    found = listing.files(source, lambda path, name: name.startswith("."))  # hidden folders are left out
     items = []
-    for image in sorted(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS and path.is_file() and _visible(path, source)):
+    for image in sorted(Path(path) for path in found if os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS and not os.path.basename(path).startswith(".")):
         relative = image.relative_to(source)
-        item = {"image": image, "relative": relative, "split": _detected_split(relative), "label": None, "class": None}
+        stamp = listing.stat(image)
+        item = {"image": image, "relative": relative, "split": _detected_split(relative), "label": None, "class": None, "size": stamp[1] if stamp else None}
         if category == "classification":
             parent = image.parent.name
             inside_class = image.parent != source and SPLIT_ALIASES.get(parent.casefold()) is None and parent.casefold() != "images"
             item["class"] = parent if inside_class else UNASSIGNED
         else:
-            item["label"] = next((candidate for candidate in _label_candidates(image, source) if candidate.is_file()), None)
+            item["label"] = next((candidate for candidate in _label_candidates(image, source) if listing.stat(candidate) is not None), None)
         items.append(item)
     return items
 
@@ -322,10 +323,11 @@ def scan(dataset: Dataset, source: Path) -> dict:
     names, names_source = _names_from_source(source)
     result["names_source"] = names_source
     counts = {}
-    for item in items:
-        if item["label"] is not None:
-            result["labeled"] += 1
-            for class_id in _label_ids(item["label"]):
+    labels = [item["label"] for item in items if item["label"] is not None]
+    result["labeled"] = len(labels)
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:  # read in parallel: a round trip each on a network drive
+        for ids in pool.map(_label_ids, labels):
+            for class_id in ids:
                 counts[class_id] = counts.get(class_id, 0) + 1
     keys = sorted(set(counts) | set(names or {}))
     for class_id in keys:
@@ -617,12 +619,13 @@ def _unique(path: Path, planned: set[Path]) -> Path:
 class _Fingerprints:
     """Exact-duplicate detection: compare sizes first, hash only when sizes collide."""
 
-    def __init__(self, paths):
+    def __init__(self, files):
+        """files: (path, size or None when not known)."""
         self.by_size: dict[int, list[Path]] = {}
         self.hashes: dict[Path, str] = {}
-        for path in paths:
+        for path, size in files:
             try:
-                self.by_size.setdefault(path.stat().st_size, []).append(path)
+                self.by_size.setdefault(size if size is not None else path.stat().st_size, []).append(path)
             except OSError:
                 continue
 
@@ -635,11 +638,11 @@ class _Fingerprints:
             self.hashes[path] = digest.hexdigest()
         return self.hashes[path]
 
-    def seen(self, path: Path, data: bytes | None = None) -> bool:
+    def seen(self, path: Path, data: bytes | None = None, size: int | None = None) -> bool:
         """Whether `path` (or `data`, the bytes about to be written for it) is already known."""
         if data is not None:
             self.hashes[path] = hashlib.sha1(data).hexdigest()
-        size = len(data) if data is not None else path.stat().st_size
+        size = len(data) if data is not None else size if size is not None else path.stat().st_size
         others = self.by_size.get(size, [])
         if others:
             digest = self._hash(path)
@@ -659,14 +662,15 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
     if not items:
         raise DatasetError("No images found in the selected folder")
     _assign_splits(items, options, allowed)
-    ensure_free_space(dataset.root, sum(item["image"].stat().st_size for item in items if item["image"].is_file()), "the import")
+    ensure_free_space(dataset.root, sum(item["size"] or 0 for item in items), "the import")
     # each split may have several folders; the caller picks one per split (default: the first)
     chosen = options.get("folders") or {}
     folders = {split: dataset.resolve_folder(split, chosen.get(split)) for split in {item["target"] for item in items}}
     crop = crop_options(options.get("crop"))
     mapping = _resolve_mapping(dataset, scanned, options.get("mapping"))
     label_mapping = {int(key): value for key, value in mapping.items()} if dataset.category != "classification" and scanned["names_source"] else None
-    fingerprints = _Fingerprints(record.path for record in list(dataset.images.values())) if options.get("skip_duplicates", True) else None
+    # the dataset's image sizes as it knows them: no stat per image
+    fingerprints = _Fingerprints((record.path, record.image_size) for record in list(dataset.images.values())) if options.get("skip_duplicates", True) else None
     planned: set[Path] = set()
     stats = {"imported": 0, "labels": 0, "duplicates": 0, "dropped": 0, "renamed": 0, "cropped": 0, "crop_skipped": 0, "objects_cropped_out": 0, "by_split": {}}
     rescan: dict = {}
@@ -718,7 +722,7 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
         return
     data = cropped["data"] if cropped else None
     # a cropped image is compared by the bytes it will have, so re-importing with the same crop is still caught
-    if fingerprints is not None and fingerprints.seen(item["image"], data):
+    if fingerprints is not None and fingerprints.seen(item["image"], data, item.get("size")):
         stats["duplicates"] += 1
         return
     target, label_target = _target_paths(dataset, directory, item["image"].name, planned)

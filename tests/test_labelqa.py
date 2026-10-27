@@ -141,6 +141,10 @@ def test_changed_image_is_stale_and_classes_follow_renumbering(tmp_path):
 
     record = next(iter(dataset.images.values()))
     Image.new("RGB", (200, 160), "black").save(record.path)
+    # listings ask the disk nothing per image (a round trip each on a network drive): a replaced image shows
+    # once the dataset notices it, as labels edited outside the app do
+    assert qa.findings()["stale"] == 0
+    dataset.rescan()
     assert qa.findings() == {**qa.findings(), "total": 0, "stale": 1}
 
 

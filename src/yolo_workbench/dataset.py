@@ -16,7 +16,7 @@ from pathlib import Path
 import yaml
 from PIL import Image, UnidentifiedImageError
 
-from . import identity
+from . import fsscan, identity
 from .activity import ActivityLog
 from .fsutil import occupied, replace
 from .imaging import upright_size
@@ -30,6 +30,15 @@ SIZE_INDEX_VERSION = 2  # 2: sizes are EXIF-upright
 SIZE_INDEX_SAVE_INTERVAL = 5.0  # seconds between size-index saves while probing
 CHANGE_LOG_SIZE = 5000  # changes kept for other browsers' polls (older polls reload everything)
 REVIEW_SAVE_DELAY = 5.0  # seconds: "last edited by" bookkeeping is saved at most this often
+# label files read at once when many are (opening, rescan, class changes): on a network drive each read waits on
+# a round trip to the file server, so they overlap; parsing stays in one thread under the lock
+READ_WORKERS = 16
+READ_CHUNK = 2048  # files read per batch (bounds the texts held at once)
+_UNKNOWN = object()
+
+
+def _digest(text: str) -> bytes:
+    return hashlib.sha1(text.encode("utf-8")).digest()
 
 
 class DatasetError(ValueError):
@@ -208,7 +217,12 @@ class Dataset:
         self._split_sources: dict[str, object] = {}  # raw YAML value per split (folders, .txt lists, files)
         self._class_ids_by_name: dict[str, int] = {}
         self._mtimes: dict[Path, int | None] = {}
+        # digest of each label file's content as last read or written (None: no file): decides write conflicts
+        # where modification times cannot (a share that reports them late, or keeps whole seconds only)
+        self._digests: dict[Path, bytes | None] = {}
         self._revisions: dict[Path, int] = {}
+        # while opening or rescanning: the folders as listed, answering exists/stat without a call per file
+        self._listing: fsscan.Listing | None = None
         self._lock = threading.RLock()
         self._index_lock = threading.Lock()  # one size-index write at a time (probe threads of load and rescan)
         self._change_listeners: list = []
@@ -294,7 +308,8 @@ class Dataset:
         return {}
 
     def _classification_names(self) -> dict[int, str]:
-        class_names = sorted({child.name for directory in self._all_folders() if directory.is_dir() for child in directory.iterdir() if child.is_dir() and not child.name.startswith(".")})
+        listing = self._listing or fsscan.Listing(stat=False)
+        class_names = sorted({child.name for directory in self._all_folders() for child in listing.subfolders(directory) if not child.name.startswith(".")})
         return dict(enumerate(class_names))
 
     def _all_folders(self) -> list[Path]:
@@ -328,7 +343,7 @@ class Dataset:
             for item in values:
                 path = self._resolve_path(item)
                 if self.category == "classification":
-                    if path.is_dir():
+                    if self._is_dir(path):
                         folders.append(path)
                 elif path.suffix.lower() != ".txt" and path.suffix.lower() not in IMAGE_EXTENSIONS:
                     folders.append(path)
@@ -349,11 +364,13 @@ class Dataset:
                 raise DatasetError("Classification datasets need train/, val/, or test/ directories with one folder per class")
             if not self.names and not self.allow_empty:
                 raise DatasetError("No class directories found under the dataset splits")
+            listing = self._listing or fsscan.Listing()
             found = []
             for split, folders in self._split_folders.items():
                 for folder in folders:
-                    for class_dir in sorted(child for child in folder.iterdir() if child.is_dir() and not child.name.startswith(".")):
-                        found.extend((split, path) for path in sorted(class_dir.rglob("*")) if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(class_dir).parts)
+                    for class_dir in listing.subfolders(folder):
+                        if not class_dir.name.startswith("."):
+                            found.extend((split, path) for path in sorted(Path(item) for item in listing.files(class_dir, self._prune) if os.path.splitext(item)[1].lower() in IMAGE_EXTENSIONS))
             return found
         if not self.names and not self.allow_empty:
             raise DatasetError("Dataset YAML has no class names")
@@ -362,6 +379,13 @@ class Dataset:
         for split in ("train", "val", "test"):
             found.extend((split, image_path) for image_path in self._resolve_sources(self._split_sources.get(split)))
         return found
+
+    def data_folders(self) -> list[Path]:
+        """The split folders and their label folders: images and labels only (walks for other files skip them)."""
+        with self._lock:
+            folders = self._all_folders()
+            labels = [self._label_root_for(folder) for folder in folders] if self.category != "classification" else []
+        return list(dict.fromkeys([*folders, *labels]))
 
     def folder_label(self, folder: Path) -> str:
         """How a folder is shown and addressed in the API: relative to the dataset root when inside it."""
@@ -459,18 +483,25 @@ class Dataset:
         return record
 
     def _load(self) -> None:
-        discovered = self._discover()
-        self.reviews = ReviewStore(self.root / WORKBENCH_DIR / "review.json", self.root)
-        self.activity = ActivityLog(self.root / WORKBENCH_DIR / "activity.jsonl")
-        size_index = self._load_size_index()
-        for split, image_path in discovered:
-            record = self._make_record(split, image_path)
-            self._apply_cached_size(record, size_index)
-            self._read_record(record)
-            self.images[record.id] = record
-        if not self.images and not self.allow_empty:
-            raise DatasetError("No supported images found in dataset splits")
-        self._find_orphans()
+        self._listing = fsscan.Listing()
+        try:
+            discovered = self._discover()
+            self.reviews = ReviewStore(self.root / WORKBENCH_DIR / "review.json", self.root)
+            self.activity = ActivityLog(self.root / WORKBENCH_DIR / "activity.jsonl")
+            size_index = self._load_size_index()
+            records = []
+            for split, image_path in discovered:
+                record = self._make_record(split, image_path)
+                self._apply_cached_size(record, size_index)
+                records.append(record)
+            self._read_records(records)
+            for record in records:
+                self.images[record.id] = record
+            if not self.images and not self.allow_empty:
+                raise DatasetError("No supported images found in dataset splits")
+            self._find_orphans()
+        finally:
+            self._listing = None
         self._rebuild_indexes()
 
     def _resort(self) -> None:
@@ -496,6 +527,7 @@ class Dataset:
             if not image_ids:
                 del self._split_image_ids[record.split]
         self._mtimes.pop(record.label_path, None)
+        self._digests.pop(record.label_path, None)
 
     def _set_split(self, record: ImageRecord, split: str) -> None:
         if record.split == split:
@@ -509,46 +541,61 @@ class Dataset:
         self._split_image_ids.setdefault(split, set()).add(record.id)
 
     def rescan(self) -> dict:
-        """Pick up images and labels added, removed, or edited on disk since load."""
+        """Pick up images and labels added, removed, or edited on disk since load (an image replaced under the
+        same name too: its size is probed again)."""
         with self._lock:
-            before_names = dict(self.names)
-            discovered = self._discover()
-            by_key = {(record.split, record.path): record for record in self.images.values()}
-            wanted = set(discovered)
-            removed = [record for key, record in by_key.items() if key not in wanted]
-            for record in removed:
-                self._remove_record(record)
-            size_index = self._load_size_index()
-            added = []
-            for split, image_path in discovered:
-                if (split, image_path) in by_key:
-                    continue
-                record = self._make_record(split, image_path)
-                if record.id in self.images:
-                    continue
-                self._apply_cached_size(record, size_index)
-                self._add_record(record)
-                added.append(record)
-            self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
-            names_changed = before_names != self.names
-            updated = 0
-            updated_ids: list[str] = []
-            added_ids = {record.id for record in added}
-            for record in self.images.values():
-                if record.id in added_ids:
-                    continue
-                current = self._safe_stat(record.label_path)
-                if names_changed or (current.st_mtime_ns if current else None) != self._mtimes.get(record.label_path):
-                    self._read_record(record)
-                    updated += 1
-                    updated_ids.append(record.id)
-            self._resort()
-            self._find_orphans()
+            self._listing = fsscan.Listing()
+            try:
+                before_names = dict(self.names)
+                discovered = self._discover()
+                by_key = {(record.split, record.path): record for record in self.images.values()}
+                wanted = set(discovered)
+                removed = [record for key, record in by_key.items() if key not in wanted]
+                for record in removed:
+                    self._remove_record(record)
+                size_index = self._load_size_index()
+                added = []
+                for split, image_path in discovered:
+                    if (split, image_path) in by_key:
+                        continue
+                    record = self._make_record(split, image_path)
+                    if record.id in self.images:
+                        continue
+                    self._apply_cached_size(record, size_index)
+                    self._add_record(record, read=False)
+                    added.append(record)
+                self._class_ids_by_name = {name: class_id for class_id, name in self.names.items()}
+                names_changed = before_names != self.names
+                added_ids = {record.id for record in added}
+                stale: list[ImageRecord] = []
+                replaced: list[ImageRecord] = []
+                for record in self.images.values():
+                    if record.id in added_ids:
+                        continue
+                    stamp = self._listing.stat(record.path)
+                    renewed = stamp is not None and record.image_mtime is not None and stamp != (record.image_mtime, record.image_size)
+                    if renewed:
+                        record.width = record.height = 0
+                        record.probe_error = None
+                        replaced.append(record)
+                    if stamp is not None:
+                        record.image_mtime, record.image_size = stamp
+                    label = self._listing.stat(record.label_path)
+                    if names_changed or renewed or (label[0] if label else None) != self._mtimes.get(record.label_path):
+                        stale.append(record)
+                self._read_records(added + stale)
+                updated = len(stale)
+                updated_ids = [record.id for record in stale]
+                self._resort()
+                self._find_orphans()
+            finally:
+                self._listing = None
             self._rebuild_orphan_issues()
             self._statistics_cache = None
             pending = [record for record in added if record.width == 0 and record.probe_error is None]
-            self.indexing = {"done": self.indexing["done"] + len(added) - len(pending), "total": self.indexing["total"] + len(added) - len(removed)}
-            self.indexing["done"] = min(self.indexing["done"], self.indexing["total"])
+            self.indexing = {"done": self.indexing["done"] + len(added) - len(pending) - len(replaced), "total": self.indexing["total"] + len(added) - len(removed)}
+            self.indexing["done"] = max(0, min(self.indexing["done"], self.indexing["total"]))
+            pending += replaced
             changed = bool(added or removed or updated or names_changed)
             if changed:
                 self.annotation_generation += 1
@@ -583,14 +630,13 @@ class Dataset:
         return data["images"]
 
     def _apply_cached_size(self, record: ImageRecord, size_index: dict) -> None:
+        """Note the image's time and size (from the listing) and take its size in pixels from the index when they match."""
+        stamp = self._file_stat(record.path)
+        if stamp is None:
+            return
+        record.image_mtime, record.image_size = stamp
         entry = size_index.get(str(record.path))
-        if not entry:
-            return
-        try:
-            stat = record.path.stat()
-        except OSError:
-            return
-        if entry.get("mtime_ns") == stat.st_mtime_ns and entry.get("size") == stat.st_size:
+        if entry and entry.get("mtime_ns") == stamp[0] and entry.get("size") == stamp[1]:
             record.width, record.height = int(entry.get("width", 0)), int(entry.get("height", 0))
 
     def _probe_all(self, pending: list[ImageRecord]) -> None:
@@ -606,25 +652,32 @@ class Dataset:
     def _probe(self, record: ImageRecord) -> None:
         if self._closing:
             return  # the queued rest is skipped; the next opening probes it
+        stat = None
         try:
-            with Image.open(record.path) as image:
-                width, height = upright_size(image)
+            with open(record.path, "rb") as stream:  # its time and size come with the open file: no stat of its own
+                stat = os.fstat(stream.fileno())
+                with Image.open(stream) as image:
+                    width, height = upright_size(image)
             error = None
-        except (OSError, UnidentifiedImageError) as exc:
+        except UnidentifiedImageError:
+            width = height = 0
+            error = f"cannot identify image file {str(record.path)!r}"
+        except OSError as exc:
             width = height = 0
             error = str(exc)
         with self._lock:
             record.width, record.height = width, height
             record.probe_error = error
+            if stat is not None:
+                record.image_mtime, record.image_size = stat.st_mtime_ns, stat.st_size
             if error:
                 record.issues.append(self._issue("unreadable_image", "error", error, record))
             self._refresh_record_indexes(record)
             self.indexing["done"] += 1
 
     def _save_size_index(self) -> None:
-        with self._lock:  # snapshot only; stat() outside the lock so writers are not held up
-            probed = [(record.path, record.width, record.height) for record in self.images.values() if record.width > 0]
-        entries = {str(path): {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "width": width, "height": height} for path, width, height in probed if (stat := self._safe_stat(path))}
+        with self._lock:  # the times and sizes noted when listed or probed: no stat per image
+            entries = {str(record.path): {"mtime_ns": record.image_mtime, "size": record.image_size, "width": record.width, "height": record.height} for record in self.images.values() if record.width > 0 and record.image_mtime is not None}
         with self._index_lock:
             try:
                 self._index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -639,6 +692,38 @@ class Dataset:
         except OSError:
             return None
 
+    # while opening or rescanning these answer from the folder listing; otherwise they ask the filesystem
+    def _exists(self, path: Path) -> bool:
+        return self._listing.exists(path) if self._listing is not None else path.exists()
+
+    def _is_dir(self, path: Path) -> bool:
+        return self._listing.is_dir(path) if self._listing is not None else path.is_dir()
+
+    def _file_stat(self, path: Path) -> tuple[int, int] | None:
+        """(mtime_ns, size) of a file, None when there is none."""
+        if self._listing is not None:
+            return self._listing.stat(path)
+        stat = self._safe_stat(path)
+        return (stat.st_mtime_ns, stat.st_size) if stat else None
+
+    def _prune(self, path: str, name: str) -> bool:
+        """Folders a walk of the dataset leaves out: the workbench's own state and training runs."""
+        return name == WORKBENCH_DIR or self._excluded(Path(path))
+
+    def image_stamp(self, record: ImageRecord) -> tuple[int, int] | None:
+        """The image file's (mtime_ns, size) as last seen (opening, rescan, size probe), asked once when not known
+        yet: cache keys and Label QA use it without a call per image. A replaced image shows after a rescan."""
+        if record.image_mtime is None:
+            stat = self._safe_stat(record.path)
+            if stat is None:
+                return None
+            record.image_mtime, record.image_size = stat.st_mtime_ns, stat.st_size
+        return record.image_mtime, record.image_size
+
+    def label_mtime(self, record: ImageRecord) -> int:
+        """The label file's modification time as last read or written (0: none)."""
+        return self._mtimes.get(record.label_path) or 0
+
     def _resolve_sources(self, value) -> list[Path]:
         if not value:
             return []
@@ -647,30 +732,45 @@ class Dataset:
         for item in values:
             source = Path(str(item))
             source = (self.root / source).resolve() if not source.is_absolute() else source.resolve()
-            if source.is_dir():
+            if self._is_dir(source):
                 self._label_scan_roots.add(self._label_root_for(source))
-                found.extend(path for path in source.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS and WORKBENCH_DIR not in path.relative_to(source).parts and not self._excluded(path))
-            elif source.suffix.lower() == ".txt" and source.exists():
+                if not self._excluded(source):
+                    listing = self._listing or fsscan.Listing()
+                    found.extend(Path(path) for path in listing.files(source, self._prune) if os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS)
+            elif source.suffix.lower() == ".txt" and self._exists(source):
+                folders: dict[Path, Path] = {}
                 for line in source.read_text(encoding="utf-8").splitlines():
                     if line.strip():
                         path = Path(line.strip())
-                        resolved = (self.root / path).resolve() if not path.is_absolute() else path.resolve()
-                        if not resolved.exists():
-                            resolved = self._relocate_listed_image(path, resolved)
+                        resolved = self._resolve_listed(path if path.is_absolute() else self.root / path, folders)
+                        if not self._exists(resolved):
+                            resolved = self._relocate_listed_image(path, resolved, folders)
                         found.append(resolved)
-            elif source.suffix.lower() in IMAGE_EXTENSIONS and source.exists():
+            elif source.suffix.lower() in IMAGE_EXTENSIONS and self._exists(source):
                 found.append(source)
         return sorted(set(found))
 
-    def _relocate_listed_image(self, path: Path, resolved: Path) -> Path:
+    def _resolve_listed(self, path: Path, folders: dict[Path, Path]) -> Path:
+        """Path.resolve() of a file named by a .txt list, with its folder resolved once per folder (a list names
+        thousands of files in a few folders, and resolving asks the filesystem about every path component)."""
+        if path.name in ("", ".", ".."):
+            return path.resolve()
+        folder = folders.get(path.parent)
+        if folder is None:
+            folder = folders[path.parent] = path.parent.resolve()
+        resolved = folder / path.name
+        linked = self._listing.is_symlink(resolved) if self._listing is not None else resolved.is_symlink()
+        return resolved.resolve() if linked else resolved
+
+    def _relocate_listed_image(self, path: Path, resolved: Path, folders: dict[Path, Path]) -> Path:
         # File-list entries exported from another machine or layout often carry a stale
         # prefix (e.g. "data/images/train/x.png" when the file is at "<root>/images/train/x.png").
         # Retry with leading components stripped until the entry matches under the root.
         parts = path.parts[1:] if path.is_absolute() else path.parts
         for start in range(1, len(parts)):
             candidate = self.root.joinpath(*parts[start:])
-            if candidate.exists():
-                return candidate.resolve()
+            if self._exists(candidate):
+                return self._resolve_listed(candidate, folders)
         return resolved
 
     def _label_root_for(self, image_root: Path) -> Path:
@@ -678,7 +778,7 @@ class Dataset:
         if "images" in parts:
             index = len(parts) - 1 - parts[::-1].index("images")
             candidate = Path(*parts[:index], "labels", *parts[index + 1 :])
-            if candidate.exists() or (self.root / "labels").exists():
+            if self._exists(candidate) or self._exists(self.root / "labels"):
                 return candidate
         return image_root
 
@@ -688,11 +788,38 @@ class Dataset:
             index = len(parts) - 1 - parts[::-1].index("images")
             candidate = Path(*parts[:index], "labels", *parts[index + 1 :]).with_suffix(".txt")
             label_root = self.root / "labels"
-            if candidate.exists() or label_root.exists():
+            if self._exists(candidate) or self._exists(label_root):
                 return candidate
         return image_path.with_suffix(".txt")
 
-    def _read_record(self, record: ImageRecord) -> None:
+    def _read_records(self, records: list[ImageRecord], known: dict | None = None) -> None:
+        """_read_record for many records, their label files read in parallel (see READ_WORKERS). `known`: label
+        path -> its file as fsscan.read_text returns it, for files just written (not read back)."""
+        known = known or {}
+        if self.category == "classification" or len(records) < 8:
+            for record in records:
+                self._read_record(record, known.get(record.label_path))
+            return
+        with ThreadPoolExecutor(max_workers=READ_WORKERS, thread_name_prefix="read-labels") as pool:
+            for start in range(0, len(records), READ_CHUNK):
+                chunk = records[start : start + READ_CHUNK]
+                # the listing (consulted here, not in the pool) already knows which labels are missing
+                wanted = list(dict.fromkeys(record.label_path for record in chunk if record.label_path not in known and (self._listing is None or self._listing.exists(record.label_path))))
+                labels = dict(zip(wanted, pool.map(fsscan.read_text, wanted)))
+                for record in chunk:
+                    self._read_record(record, known.get(record.label_path) or labels.get(record.label_path, (None, None, None)))
+
+    def _read_texts(self, paths: list[Path]) -> dict[Path, tuple[str | None, int | None, str | None]]:
+        """Many files as fsscan.read_text returns them, read in parallel."""
+        paths = list(dict.fromkeys(paths))
+        if len(paths) < 8:
+            return {path: fsscan.read_text(path) for path in paths}
+        with ThreadPoolExecutor(max_workers=READ_WORKERS, thread_name_prefix="read-labels") as pool:
+            return dict(zip(paths, pool.map(fsscan.read_text, paths)))
+
+    def _read_record(self, record: ImageRecord, label: tuple[str | None, int | None, str | None] | None = None) -> None:
+        """(Re)parse a record's labels. `label`: its file as fsscan.read_text returns it, when already read (or
+        just written); otherwise it is read here with one open, or not at all when the listing knows it is missing."""
         if self.category == "classification":
             record.issues.clear()
             if record.probe_error:
@@ -700,21 +827,27 @@ class Dataset:
             class_id = self._class_ids_by_name[self._class_name_for(record)]
             record.annotations = [Annotation(f"{record.id}:1", class_id, [])]
             record.class_ids = {class_id}
-            self._mtimes[record.label_path] = record.path.stat().st_mtime_ns if record.path.exists() else None
+            # moving a file keeps its time: re-reading the moved records of a class change asks nothing
+            known = record.image_mtime is not None and self._listing is None
+            stamp = (record.image_mtime, record.image_size) if known else self._file_stat(record.path)
+            if stamp is not None:
+                record.image_mtime, record.image_size = stamp
+            self._mtimes[record.label_path] = stamp[0] if stamp else None
             self._revisions[record.label_path] = self._revisions.get(record.label_path, 0) + 1
             self._refresh_record_indexes(record)
             return
         record.issues.clear()
         if record.probe_error:
             record.issues.append(self._issue("unreadable_image", "error", record.probe_error, record))
-        text = ""
-        if record.label_path.exists():
-            try:
-                text = record.label_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                record.issues.append(self._issue("unreadable_label", "error", str(exc), record))
-        else:
+        if label is None:
+            known_missing = self._listing is not None and not self._listing.exists(record.label_path)
+            label = (None, None, None) if known_missing else fsscan.read_text(record.label_path)
+        content, mtime, error = label
+        if error is not None:
+            record.issues.append(self._issue("unreadable_label", "error", error, record))
+        elif content is None:
             record.issues.append(self._issue("missing_label", "warning", "Label file is missing", record, fixable=True))
+        text = content or ""
         record.annotations = []
         seen: dict[tuple, str] = {}
         for line_number, line in enumerate(text.splitlines(), 1):
@@ -745,7 +878,9 @@ class Dataset:
                 record.issues.append(self._issue("malformed_label", "error", f"Line {line_number}: {exc}", record, fixable=True, line=line_number))
         record.issues.extend(self._overlap_issues(record))
         record.class_ids = {annotation.class_id for annotation in record.annotations}
-        self._mtimes[record.label_path] = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
+        self._mtimes[record.label_path] = mtime
+        # an unreadable file matches no content: saving over it is a conflict until it reads again
+        self._digests[record.label_path] = _digest(content) if content is not None else (b"" if error is not None else None)
         self._revisions[record.label_path] = self._revisions.get(record.label_path, 0) + 1
         self._refresh_record_indexes(record)
 
@@ -778,13 +913,18 @@ class Dataset:
         if self.category == "classification":
             self.orphan_labels = []
             return
-        expected = {record.label_path.resolve() for record in self.images.values()}
-        candidates = set()
+        # compared as spelled, not resolved (resolving asks about every path component of every file): label
+        # paths are built from resolved folders, and the walk joins the names it lists onto the same folders
+        listing = self._listing or fsscan.Listing(stat=False)
+        expected = {os.path.normcase(record.label_path) for record in self.images.values()}
         roots = self._label_scan_roots | {record.label_path.parent for record in self.images.values()}
+        found: dict[str, str] = {}
         for root in roots:
-            if root.exists():
-                candidates.update(path.resolve() for path in root.rglob("*.txt") if WORKBENCH_DIR not in path.parts and not self._excluded(path))
-        self.orphan_labels = sorted(candidates - expected)
+            for path in listing.files(root, self._prune):
+                key = os.path.normcase(path)
+                if key.endswith(".txt") and key not in expected:
+                    found[key] = path
+        self.orphan_labels = sorted(Path(path) for path in found.values())
 
     def _rebuild_indexes(self) -> None:
         """Build immutable ordering/split indexes and mutable annotation indexes once."""
@@ -1369,8 +1509,10 @@ class Dataset:
             planned = []
             for record, class_id in moves:
                 src = record.path
-                if not src.exists() or src.stat().st_mtime_ns != self._mtimes.get(record.label_path):
-                    self._mtimes[record.label_path] = src.stat().st_mtime_ns if src.exists() else None
+                stat = self._safe_stat(src)
+                current = stat.st_mtime_ns if stat else None
+                if current is None or current != self._mtimes.get(record.label_path):
+                    self._mtimes[record.label_path] = current
                     raise WriteConflict(f"{src.name} changed outside this application; reload before saving")
                 if expected_revision is not None and expected_revision != self._revisions[record.label_path]:
                     raise WriteConflict(f"{src.name} has a newer revision; reload before saving")
@@ -1412,14 +1554,14 @@ class Dataset:
 
     def _prepare_text(self, record: ImageRecord, content: str, expected_revision: int | None = None) -> PreparedChange:
         """Capture the label state a change to `content` (written as is) is based on."""
-        before_exists = record.label_path.exists()
-        before = record.label_path.read_text(encoding="utf-8") if before_exists else ""
-        base_mtime = record.label_path.stat().st_mtime_ns if before_exists else None
+        before, base_mtime, error = fsscan.read_text(record.label_path)
+        if error is not None:
+            raise DatasetError(f"Cannot read {record.label_path.name}: {error}")
         return PreparedChange(
             record=record,
-            before=before,
+            before=before or "",
             after=content,
-            before_exists=before_exists,
+            before_exists=before is not None,
             after_exists=True,
             base_mtime=base_mtime,
             base_revision=self._revisions[record.label_path],
@@ -1441,12 +1583,10 @@ class Dataset:
             record = self.require_image(image_id)
             if self.category == "classification":
                 raise DatasetError("Classification images have no label file")
-            exists = record.label_path.exists()
-            try:
-                text = record.label_path.read_text(encoding="utf-8") if exists else ""
-            except (OSError, UnicodeDecodeError) as exc:
-                raise DatasetError(f"Cannot read {record.label_path.name}: {exc}") from exc
-            return {"image_id": record.id, "name": record.label_path.name, "path": self.folder_label(record.label_path), "exists": exists, "text": text, "revision": self._revisions[record.label_path], "issues": list(record.issues)}
+            text, _, error = fsscan.read_text(record.label_path)
+            if error is not None:
+                raise DatasetError(f"Cannot read {record.label_path.name}: {error}")
+            return {"image_id": record.id, "name": record.label_path.name, "path": self.folder_label(record.label_path), "exists": text is not None, "text": text or "", "revision": self._revisions[record.label_path], "issues": list(record.issues)}
 
     def write_label_text(self, image_id: str, text: str, expected_revision: int | None = None, schema_generation: int | None = None) -> dict:
         """Replace one label file with raw text (malformed lines allowed) through the normal commit path."""
@@ -1489,32 +1629,40 @@ class Dataset:
             raise DatasetLocked(f"The dataset is read-only while {reason}")
 
     def _commit_many(self, changes: list[PreparedChange], history=True) -> None:
-        """Write all changes as one transaction: every mtime is checked before any file is touched."""
+        """Write all changes as one transaction: every file is checked before any is touched."""
         with self._lock:
             self.check_writable()
             for change in changes:
                 record = change.record
-                current_mtime = record.label_path.stat().st_mtime_ns if record.label_path.exists() else None
-                if current_mtime != self._mtimes.get(record.label_path):
+                path = record.label_path
+                before = change.before if change.before_exists else None
+                # by content: a share may report a new time for the same content, or one time for two contents
+                if not self._matches_known(path, before):
                     self._read_record(record)
-                    raise WriteConflict(f"{record.label_path.name} changed outside this application; reload before saving")
-                if current_mtime != change.base_mtime or self._revisions[record.label_path] != change.base_revision:
-                    raise WriteConflict(f"{record.label_path.name} changed while this edit was pending; reload before saving")
+                    raise WriteConflict(f"{path.name} changed outside this application; reload before saving")
+                stat = self._safe_stat(path)
+                current_mtime = stat.st_mtime_ns if stat else None
+                if self._revisions[path] != change.base_revision or (current_mtime != change.base_mtime and fsscan.read_text(path)[0] != before):
+                    raise WriteConflict(f"{path.name} changed while this edit was pending; reload before saving")
                 if change.expected_revision is not None and change.expected_revision != change.base_revision:
-                    raise WriteConflict(f"{record.label_path.name} has a newer revision; reload before saving")
+                    raise WriteConflict(f"{path.name} has a newer revision; reload before saving")
+                self._mtimes[path] = current_mtime  # the content is as known; only its time may be new
             transaction = []
-            for change in changes:
-                record = change.record
-                self._backup(record.label_path, change.before)
-                self._write_state(record.label_path, change.after, change.after_exists)
+            try:
+                mtimes = self._write_labels([(change.record.label_path, change.before, change.after, change.after_exists) for change in changes])
+            except Exception:
+                self._read_records([change.record for change in changes])  # some were written: as they are now
+                raise
+            for change, mtime in zip(changes, mtimes):
                 transaction.append(HistoryEntry(
-                    record.label_path,
+                    change.record.label_path,
                     change.before,
                     change.after,
                     change.before_exists,
                     change.after_exists,
                 ))
-                self._read_record(record)
+                # parsed from what was written, not read back
+                self._read_record(change.record, (change.after if change.after_exists else None, mtime, None))
             pushed = self._push_history(transaction) if history and transaction else None
             changed_ids = [change.record.id for change in changes]
             if changed_ids:
@@ -1525,30 +1673,61 @@ class Dataset:
         if changed_ids:
             self._notify_changes(changed_ids)
 
+    def _write_label(self, path: Path, before: str, after: str, after_exists: bool) -> int | None:
+        """Back up and write (or delete) one label file; returns its new modification time (None: deleted)."""
+        self._backup(path, before)
+        self._write_state(path, after, after_exists)
+        stat = self._safe_stat(path) if after_exists else None
+        return stat.st_mtime_ns if stat else None
+
+    def _write_labels(self, writes: list[tuple[Path, str, str, bool]]) -> list[int | None]:
+        """_write_label for many files: in parallel when there are many different ones (on a network drive each
+        write is several round trips). Every write is tried; the first failure is raised after them."""
+        if len(writes) < 8 or len({path for path, *_ in writes}) < len(writes):
+            return [self._write_label(*write) for write in writes]
+        with ThreadPoolExecutor(max_workers=READ_WORKERS, thread_name_prefix="write-labels") as pool:
+            futures = [pool.submit(self._write_label, *write) for write in writes]
+        return [future.result() for future in futures]
+
+    def _matches_known(self, path: Path, text: str | None) -> bool:
+        """Is `text` (None: no file) what this application last read or wrote at `path`?"""
+        return self._digests.get(path, _UNKNOWN) == (None if text is None else _digest(text))
+
+    def _root_relative(self, path: Path) -> Path:
+        # paths are built from resolved folders: no resolve() (a call per path component on a network drive)
+        return path.relative_to(self.root) if path.is_relative_to(self.root) else Path(path.name)
+
     def _backup(self, label_path: Path, content: str) -> None:
         if label_path in self._backed_up:
             return
+        backup = self.root / ".yolo-workbench" / "backups" / self.session_id / self._root_relative(label_path)
         try:
-            relative = label_path.resolve().relative_to(self.root)
-        except ValueError:
-            relative = Path(label_path.name)
-        backup = self.root / ".yolo-workbench" / "backups" / self.session_id / relative
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        backup.write_text(content, encoding="utf-8", newline="\n")
+            backup.write_text(content, encoding="utf-8", newline="\n")
+        except FileNotFoundError:  # the first backup into this folder (asked only then: each call is a round trip)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.write_text(content, encoding="utf-8", newline="\n")
         self._backed_up.add(label_path)
 
     def _atomic_write(self, path: Path, content: str) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        except FileNotFoundError:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+        written = False
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:  # LF on Windows too
                 stream.write(content)
                 stream.flush()
                 os.fsync(stream.fileno())
             replace(temporary, path)
+            written = True
         finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+            if not written:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     def _write_state(self, path: Path, content: str, exists: bool) -> None:
         if exists:
@@ -1693,26 +1872,34 @@ class Dataset:
                 raise WriteConflict(f"Cannot {direction}: the class list changed since this change was made")
             ordered = list(reversed(entries)) if direction == "undo" else list(entries)
             records_by_label = {record.label_path: record for record in self.images.values()}
+            # a new transaction's label entries hold what its builder has just read; history is read again
+            current = {} if fresh else self._read_texts([entry.label_path for entry in ordered if isinstance(entry, HistoryEntry)])
             for entry in ordered:
-                self._check_entry(entry, direction, records_by_label, exact=not fresh)
+                self._check_entry(entry, direction, records_by_label, exact=not fresh, current=current)
             # images this leaves out of the dataset (deleted, or a restore undone): other browsers must hear of them
             removed = [entry.image_id for entry in ordered if isinstance(entry, RecordMoveEntry) and (entry.split_after if direction == "redo" else entry.split_before) is None]
             touched: dict[str, ImageRecord] = {}
+            written: dict[Path, tuple] = {}  # label files as written, parsed from memory afterwards
             schema: SchemaEntry | None = None
             resort = False
-            for entry in ordered:
+            batch: list[HistoryEntry] = []  # label writes in a row, written together (see _write_labels)
+            for entry in [*ordered, None]:
+                if isinstance(entry, HistoryEntry):
+                    batch.append(entry)
+                    continue
+                if batch:
+                    self._apply_label_entries(batch, direction, records_by_label, touched, written)
+                    batch = []
                 if isinstance(entry, SchemaEntry):
                     schema = entry
-                else:
+                elif entry is not None:
                     resort |= self._apply_entry(entry, direction, records_by_label, touched)
             if schema is not None:
-                self._reload_schema(classes_changed=not schema.layout_only)
+                self._reload_schema(classes_changed=not schema.layout_only, known=written)
                 if not schema.layout_only:
                     self._schema_log.append((self.schema_generation, schema.mapping if direction == "redo" else schema.inverse(), identity.who()))
             else:
-                for record in touched.values():
-                    if record.id in self.images:
-                        self._read_record(record)
+                self._read_records([record for record in touched.values() if record.id in self.images], known=written)
             if resort:
                 self._resort()
                 self._find_orphans()
@@ -1737,23 +1924,29 @@ class Dataset:
             return (entry.after, entry.after_exists), (entry.before, entry.before_exists)
         return (entry.before, entry.before_exists), (entry.after, entry.after_exists)
 
-    def _check_entry(self, entry, direction: str, records_by_label: dict, exact: bool = True) -> None:
+    def _check_entry(self, entry, direction: str, records_by_label: dict, exact: bool = True, current: dict | None = None) -> None:
         """Can `entry` be applied in `direction`? exact: also compare label files with the content the entry
-        expects (replaying history; a new transaction has just read them)."""
+        expects (replaying history; a new transaction has just read them). current: label files read already."""
         if isinstance(entry, HistoryEntry):
             record = records_by_label.get(entry.label_path)
             if record is None:
                 raise WriteConflict(f"{entry.label_path.name} is no longer part of the dataset; cannot {direction}")
-            current = entry.label_path.stat().st_mtime_ns if entry.label_path.exists() else None
-            if current != self._mtimes.get(entry.label_path):
+            if current and entry.label_path in current:
+                text, mtime, error = current[entry.label_path]
+            elif not exact:  # a new transaction: the content it was built from was read just now
+                (expected, expected_exists), _ = self._states(entry, direction)
+                text, mtime, error = expected if expected_exists else None, self._mtimes.get(entry.label_path), None
+            else:  # one open: its content and time
+                text, mtime, error = fsscan.read_text(entry.label_path)
+            if error is not None or not self._matches_known(entry.label_path, text):
                 self._read_record(record)
                 raise WriteConflict(f"{entry.label_path.name} changed outside this application; reload before saving")
+            self._mtimes[entry.label_path] = mtime  # the content is as known; only its time may be new
             # undo/redo need not be the latest change (each user has their own history): the file must
             # still hold exactly what this entry left (or expects)
             if exact:
                 (expected, expected_exists), _ = self._states(entry, direction)
-                exists = entry.label_path.exists()
-                if exists != expected_exists or (exists and entry.label_path.read_text(encoding="utf-8") != expected):
+                if (text is not None) != expected_exists or (text is not None and text != expected):
                     raise WriteConflict(f"{entry.label_path.name} changed since; cannot {direction}")
         elif isinstance(entry, FileEntry):
             (expected, expected_exists), _ = self._states(entry, direction)
@@ -1797,15 +1990,19 @@ class Dataset:
             if occupied(dst, src):
                 raise WriteConflict(f"Cannot {direction}: folder {dst.name}/ already exists")
 
-    def _apply_entry(self, entry, direction: str, records_by_label: dict, touched: dict) -> bool:
-        """Apply one checked entry; returns True when record membership or order changed."""
-        if isinstance(entry, HistoryEntry):
-            record = records_by_label[entry.label_path]
+    def _apply_label_entries(self, entries: list[HistoryEntry], direction: str, records_by_label: dict, touched: dict, written: dict) -> None:
+        """Apply checked label entries (written together); `written` gets each file as written."""
+        writes = []
+        for entry in entries:
             (before, _), (after, after_exists) = self._states(entry, direction)
-            self._backup(entry.label_path, before)
-            self._write_state(entry.label_path, after, after_exists)
+            writes.append((entry.label_path, before, after, after_exists))
+        for entry, (path, _, after, after_exists), mtime in zip(entries, writes, self._write_labels(writes)):
+            record = records_by_label[path]
             touched[record.id] = record
-            return False
+            written[path] = (after if after_exists else None, mtime, None)
+
+    def _apply_entry(self, entry, direction: str, records_by_label: dict, touched: dict) -> bool:
+        """Apply one checked entry other than a label entry; returns True when record membership or order changed."""
         if isinstance(entry, FileEntry):
             (before, before_exists), (after, after_exists) = self._states(entry, direction)
             if before_exists:
@@ -1876,25 +2073,22 @@ class Dataset:
         if old_label != label_path:
             self._revisions[label_path] = self._revisions.pop(old_label, 0)
             self._mtimes.pop(old_label, None)
+            self._digests[label_path] = self._digests.pop(old_label, None)
         stat = self._safe_stat(label_path)
         self._mtimes[label_path] = stat.st_mtime_ns if stat else None
 
-    def _reload_schema(self, classes_changed: bool = True) -> None:
+    def _reload_schema(self, classes_changed: bool = True, known: dict | None = None) -> None:
         """Re-read class names and split folders from disk and re-interpret every record against them.
-        classes_changed=False (split folders only): saves made with the current class list stay valid."""
+        classes_changed=False (split folders only): saves made with the current class list stay valid.
+        known: label files just written (see _read_records)."""
         self._read_layout()
         if classes_changed:
             self.schema_generation += 1
-        for record in list(self.images.values()):
-            self._read_record(record)
+        self._read_records(list(self.images.values()), known)
         self._statistics_cache = None
 
     def _trash_path(self, path: Path) -> Path:
-        try:
-            relative = path.resolve().relative_to(self.root)
-        except ValueError:
-            relative = Path(path.name)
-        target = self.root / WORKBENCH_DIR / "trash" / self.session_id / relative
+        target = self.root / WORKBENCH_DIR / "trash" / self.session_id / self._root_relative(path)
         counter = 1
         while target.exists():
             target = target.with_name(f"{path.stem}.{counter}{path.suffix}")

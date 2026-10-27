@@ -11,10 +11,13 @@ chunks (images stored as they are, text deflated; ZIP64 past 4 GB).
 
 from __future__ import annotations
 
+import contextlib
 import io
 import os
 import time
 import zipfile
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Literal
@@ -25,6 +28,10 @@ from .yamledit import remove_key, write_key
 Kind = Literal["labels", "full"]
 CHUNK = 1 << 20
 SPLITS = ("train", "val", "test")
+# files opened ahead of the one being written: on a network drive every open waits on a round trip, so one
+# file after another would take a round trip per label; files up to SMALL bytes are read whole meanwhile
+READ_AHEAD = 16
+SMALL = 1 << 20
 
 
 @dataclass
@@ -84,6 +91,8 @@ def plan(dataset: Dataset, kind: Kind) -> list[Entry]:
         split_folders = {split: list(folders) for split, folders in dataset._split_folders.items()}
         sources = dict(dataset._split_sources)
         folder_of = {record.id: dataset._folder_of(record) for record in records}
+        # labels the dataset knows exist (an is_file() per label is a round trip each on a network drive)
+        labelled = {record.label_path for record in records if dataset._mtimes.get(record.label_path) is not None}
         yaml_text = dataset.yaml_path.read_text(encoding="utf-8") if dataset.yaml_path.is_file() else None
         label_root_for = dataset._label_root_for
 
@@ -120,7 +129,7 @@ def plan(dataset: Dataset, kind: Kind) -> list[Entry]:
         exported.setdefault(record.split, []).append(image_name)
         if kind == "full":
             entries.append(Entry(image_name, record.path, compress=record.path.suffix.lower() in (".bmp", ".tif", ".tiff")))
-        if not classification and record.label_path not in labels_seen and record.label_path.is_file():
+        if not classification and record.label_path not in labels_seen and record.label_path in labelled:
             labels_seen.add(record.label_path)
             entries.append(Entry(names.claim(label_name), record.label_path))
 
@@ -160,33 +169,65 @@ def _portable(item, root: Path) -> bool:
     return (root / path).resolve().is_relative_to(root)
 
 
+def _fetch(path: Path) -> tuple[os.stat_result, bytes | None, io.BufferedReader | None] | None:
+    """A file's (stat, content) when small, else (stat, its open stream); None when it is gone."""
+    try:
+        source = path.open("rb")
+    except OSError:
+        return None
+    try:
+        stat = os.fstat(source.fileno())
+        if stat.st_size <= SMALL:
+            with source:
+                return stat, source.read(), None
+    except OSError:
+        source.close()
+        return None
+    return stat, None, source
+
+
 def stream(entries: list[Entry]) -> Iterator[bytes]:
     """Write the entries into a zip and yield it in chunks. A file that vanished meanwhile is left out."""
     sink = _Sink()
-    with zipfile.ZipFile(sink, "w", allowZip64=True) as archive:
-        for entry in entries:
-            if entry.path is None:
-                info = zipfile.ZipInfo(entry.name, time.localtime()[:6])
-                info.compress_type = zipfile.ZIP_DEFLATED
-                archive.writestr(info, entry.text.encode("utf-8"))
-            else:
-                try:
-                    source = entry.path.open("rb")
-                except OSError:
-                    continue
-                with source:
-                    stat = os.fstat(source.fileno())
-                    info = zipfile.ZipInfo(entry.name, time.localtime(max(stat.st_mtime, 315532800))[:6])  # zip dates start in 1980
-                    info.compress_type = zipfile.ZIP_DEFLATED if entry.compress else zipfile.ZIP_STORED
-                    info.file_size = stat.st_size  # decides ZIP64 for this entry up front
-                    with archive.open(info, "w") as target:
-                        while chunk := source.read(CHUNK):
-                            target.write(chunk)
-                            if sink.pending() >= CHUNK:
-                                yield sink.drain()
-            if sink.pending() >= CHUNK:
-                yield sink.drain()
-    yield sink.drain()
+    queue = iter(entries)
+    ahead: deque[tuple[Entry, Future | None]] = deque()
+    with ThreadPoolExecutor(max_workers=READ_AHEAD, thread_name_prefix="download") as pool:
+
+        def refill() -> None:
+            while len(ahead) < 2 * READ_AHEAD and (entry := next(queue, None)) is not None:
+                ahead.append((entry, pool.submit(_fetch, entry.path) if entry.path is not None else None))
+
+        try:
+            with zipfile.ZipFile(sink, "w", allowZip64=True) as archive:
+                refill()
+                while ahead:
+                    entry, future = ahead.popleft()
+                    refill()
+                    if future is None:
+                        info = zipfile.ZipInfo(entry.name, time.localtime()[:6])
+                        info.compress_type = zipfile.ZIP_DEFLATED
+                        archive.writestr(info, entry.text.encode("utf-8"))
+                    elif (fetched := future.result()) is not None:
+                        stat, data, source = fetched
+                        with source or contextlib.nullcontext():
+                            info = zipfile.ZipInfo(entry.name, time.localtime(max(stat.st_mtime, 315532800))[:6])  # zip dates start in 1980
+                            info.compress_type = zipfile.ZIP_DEFLATED if entry.compress else zipfile.ZIP_STORED
+                            info.file_size = len(data) if data is not None else stat.st_size  # decides ZIP64 for this entry up front
+                            with archive.open(info, "w") as target:
+                                if data is not None:
+                                    target.write(data)
+                                while source is not None and (chunk := source.read(CHUNK)):
+                                    target.write(chunk)
+                                    if sink.pending() >= CHUNK:
+                                        yield sink.drain()
+                    if sink.pending() >= CHUNK:
+                        yield sink.drain()
+            yield sink.drain()
+        finally:  # stopped midway (the client went away): close what was opened ahead
+            for _, future in ahead:
+                fetched = future.result() if future is not None else None
+                if fetched is not None and fetched[2] is not None:
+                    fetched[2].close()
 
 
 def archive_name(name: str, kind: Kind) -> str:

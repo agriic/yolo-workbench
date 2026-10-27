@@ -140,6 +140,17 @@ Everything else works without it; the Embeddings tab then reports that it is una
 
 Label and YAML files are written with LF line endings on every platform.
 
+## Datasets on network drives
+
+A dataset or projects folder can be on a network drive: an SMB share, a mapped Windows drive, or NFS. There, every file operation is a round trip to the file server, so the workbench does not ask about images one at a time:
+
+- Opening a dataset and **Rescan** read each folder with one directory listing (names, sizes, times) and read the label files in parallel. Image sizes are kept in `index.json`, so only the first opening reads every image.
+- Between rescans, the gallery, thumbnails, Label QA and the model list work from what the workbench already knows. A cached thumbnail or a Label QA filter change makes no call to the share.
+- Changes made outside the app (labels edited by another tool, an image replaced under the same name) show after **Rescan**. Saving over a label that changed outside the app is still refused. The label's content decides that, not its time, so a share that reports file times late or in whole seconds causes no false conflicts.
+- Keep the thumbnail cache (`~/.cache/yolo-workbench`, or the server's `cache_dir`) on a local disk.
+- Training reads the images over the network in every epoch. **Cache images: RAM** in the Training form (Ultralytics' `cache: ram`) avoids that when the dataset fits in memory.
+- On a share with file locks, two workbenches on two machines cannot open the same folder at once. Some NAS or FUSE mounts have no lock support. On those the workbench logs a warning and opens the folder anyway, so make sure only one workbench uses it.
+
 ## Running it on a server
 
 `yolo-workbench-server` runs projects mode as an unattended systemd service for a team on an internal network: configuration file, no prompts or browser, a required Host allow-list, sign-in with accounts made by `yolo-workbench-server user add`, training runs paused at a checkpoint on restart and resumed, idle models unloaded, retention for trash and backups, health endpoints, journald logging. Several people can work in the same project at once: everyone undoes only their own changes, other people's edits show up within seconds, the editor says who else has an image open, and every change is attributed (who last edited or reviewed an image, a per-project activity log). See [docs/server.md](docs/server.md) for installation (`sudo bash deploy/install.sh`), configuration and operation.

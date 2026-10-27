@@ -81,13 +81,7 @@ def resolve_unknown(dataset: Dataset, class_id: int, action: str, target_id: int
             mapping = {class_id: None}
         else:
             raise DatasetError("Action must be 'map', 'add', or 'delete'")
-        entries = []
-        for record in dataset.images.values():
-            if record.label_path.exists() and any(annotation.class_id == class_id for annotation in record.annotations):
-                before = record.label_path.read_text(encoding="utf-8")
-                after = remap_label_text(before, mapping)
-                if after != before:
-                    entries.append(HistoryEntry(record.label_path, before, after, True, True))
+        entries = _remapped_labels(dataset, [record for record in dataset.images.values() if any(annotation.class_id == class_id for annotation in record.annotations)], mapping)
         if not entries:
             raise DatasetError(f"No label file uses class {class_id}")
         dataset._execute(entries)
@@ -227,21 +221,28 @@ def _remap(dataset: Dataset, mapping: dict[int, int | None], new_names: dict[int
     entries: list = []
     changes = {class_id: target for class_id, target in mapping.items() if target != class_id}
     if changes:
-        for record in dataset.images.values():
-            if not record.label_path.exists():
-                continue
-            # malformed rows are not parsed into annotations but may still carry a class token
-            affected = any(annotation.class_id in changes for annotation in record.annotations) or any(issue["kind"] == "malformed_label" for issue in record.issues)
-            if not affected:
-                continue
-            before = record.label_path.read_text(encoding="utf-8")
-            after = remap_label_text(before, mapping)
-            if after != before:
-                entries.append(HistoryEntry(record.label_path, before, after, True, True))
+        # malformed rows are not parsed into annotations but may still carry a class token
+        affected = [record for record in dataset.images.values() if any(annotation.class_id in changes for annotation in record.annotations) or any(issue["kind"] == "malformed_label" for issue in record.issues)]
+        entries = _remapped_labels(dataset, affected, mapping)
     entries.append(_names_entry(dataset, new_names))
     entries.append(SchemaEntry(dict(mapping)))
     dataset._execute(entries)
     return _result(dataset, mapping, len(entries) - 2)
+
+
+def _remapped_labels(dataset: Dataset, records: list, mapping: dict[int, int | None]) -> list[HistoryEntry]:
+    """An entry per label file of `records` the mapping changes; the files are read in parallel (a network drive
+    answers each read over the network)."""
+    entries = []
+    for path, (before, _, error) in dataset._read_texts([record.label_path for record in records]).items():
+        if error is not None:
+            raise DatasetError(f"Cannot read {path.name}: {error}")
+        if before is None:
+            continue  # no label file
+        after = remap_label_text(before, mapping)
+        if after != before:
+            entries.append(HistoryEntry(path, before, after, True, True))
+    return entries
 
 
 def _names_entry(dataset: Dataset, new_names: dict[int, str]) -> FileEntry:

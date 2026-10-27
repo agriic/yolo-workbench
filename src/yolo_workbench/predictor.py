@@ -6,6 +6,7 @@ import gc
 import importlib.util
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -654,9 +655,11 @@ class PredictorManager:
             roots |= {Path(recent).parent for recent in recents}
             if RUNTIME.scan_cwd_for_models:
                 roots.add(Path.cwd())
+        # the image and label folders hold no models, and may hold many thousands of files
+        skip = {os.path.normcase(folder) for folder in self.dataset.data_folders() if folder != self.dataset.root}
         found: list[Path] = []
         for root in roots:
-            found.extend(self._scan(root))
+            found.extend(self._scan(root, skip))
         for path in sorted(found, key=lambda item: item.name.casefold()):
             if len(items) >= SCAN_LIMIT:
                 break
@@ -664,25 +667,33 @@ class PredictorManager:
         return {"items": items}
 
     @staticmethod
-    def _scan(root: Path) -> list[Path]:
+    def _scan(root: Path, skip: set[str] = frozenset()) -> list[Path]:
+        """Model files below `root` (not in hidden folders or the folders in `skip`, as normcase'd paths). Folder
+        entries say whether they are folders: no call per file, which a network drive answers over the network."""
         found: list[Path] = []
 
-        def walk(directory: Path, depth: int) -> None:
+        def walk(directory: str, depth: int) -> None:
             if depth > SCAN_DEPTH or len(found) >= SCAN_LIMIT:
                 return
             try:
-                entries = sorted(directory.iterdir())
+                with os.scandir(directory) as iterator:
+                    entries = sorted(iterator, key=lambda entry: os.path.normcase(entry.name))
             except OSError:
                 return
             for entry in entries:
                 if entry.name.startswith("."):
                     continue
-                if entry.is_dir():
-                    walk(entry, depth + 1)
-                elif entry.suffix.lower() in MODEL_EXTENSIONS:
-                    found.append(entry)
+                try:
+                    is_dir = entry.is_dir()
+                except OSError:
+                    continue
+                if is_dir:
+                    if os.path.normcase(entry.path) not in skip:
+                        walk(entry.path, depth + 1)
+                elif os.path.splitext(entry.name)[1].lower() in MODEL_EXTENSIONS:
+                    found.append(Path(entry.path))
 
-        walk(root, 0)
+        walk(os.fspath(root), 0)
         return found
 
     def _auto_map(self, model_names: dict[int, str]) -> dict[int, int | None]:

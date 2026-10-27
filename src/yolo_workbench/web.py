@@ -320,17 +320,14 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     current = Depends(get_session)
     peeked = Depends(peek_session or get_session)
 
-    def label_mtime(record: ImageRecord) -> int:
-        try:
-            return record.label_path.stat().st_mtime_ns
-        except OSError:
-            return 0
+    # cache keys from the times the dataset knows (its own writes, opening, rescan): a thumbnail served from the
+    # cache asks the dataset's disk nothing, which on a network drive is a round trip per image
+    def label_mtime(session: DatasetSession, record: ImageRecord) -> int:
+        return session.dataset.label_mtime(record)
 
-    def image_mtime(record: ImageRecord) -> int:
-        try:
-            return record.path.stat().st_mtime_ns
-        except OSError:
-            return 0
+    def image_mtime(session: DatasetSession, record: ImageRecord) -> int:
+        stamp = session.dataset.image_stamp(record)
+        return stamp[0] if stamp else 0
 
     def require_image(session: DatasetSession, image_id: str) -> ImageRecord:
         try:
@@ -411,7 +408,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def thumbnail(request: Request, image_id: str, size: int = Query(320, ge=64, le=1024), annotated: bool = False, session: DatasetSession = current):
         record = require_image(session, image_id)
         category = session.dataset.category
-        key = cache.key("thumbnail", record.path, image_mtime(record), size, annotated, label_mtime(record) if annotated else 0, PALETTE_VERSION)
+        key = cache.key("thumbnail", record.path, image_mtime(session, record), size, annotated, label_mtime(session, record) if annotated else 0, PALETTE_VERSION)
         if request.headers.get("if-none-match") == f'"{key}"':
             return Response(status_code=304)
         content = cache.get_or_render(key, lambda: render_thumbnail(record, size, category if annotated else None))
@@ -472,7 +469,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         if not annotation:
             raise HTTPException(404, "Annotation not found")
         category = session.dataset.category
-        key = cache.key("crop", record.path, image_mtime(record), annotation.class_id, annotation.points, padding, PALETTE_VERSION)
+        key = cache.key("crop", record.path, image_mtime(session, record), annotation.class_id, annotation.points, padding, PALETTE_VERSION)
         if request.headers.get("if-none-match") == f'"{key}"':
             return Response(status_code=304)
         content = cache.get_or_render(key, lambda: render_crop(record, annotation, category, padding))
@@ -781,7 +778,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def qa_crop(request: Request, image_id: str, key: str, session: DatasetSession = current):
         record = require_image(session, image_id)
         # the finding key encodes both shapes and their classes, so it names the picture
-        cache_key = cache.key("qa", record.path, image_mtime(record), key, session.predictor.max_points, PALETTE_VERSION)
+        cache_key = cache.key("qa", record.path, image_mtime(session, record), key, session.predictor.max_points, PALETTE_VERSION)
         if request.headers.get("if-none-match") == f'"{cache_key}"':
             return Response(status_code=304)
         content = cache.get_or_render(cache_key, lambda: labelqa(session).crop(image_id, key, class_color))

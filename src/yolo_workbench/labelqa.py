@@ -24,6 +24,7 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import threading
 import time
 from pathlib import Path
@@ -72,8 +73,11 @@ class LabelQAManager:
         return self.dataset.root / WORKBENCH_DIR / "labelqa.json"
 
     def _key(self, path: Path) -> str:
-        root = self.dataset.root
-        return path.relative_to(root).as_posix() if path.is_relative_to(root) else path.as_posix()
+        # a string prefix test: Path.relative_to for every analyzed image takes long on large datasets
+        text, root = str(path), os.path.join(str(self.dataset.root), "")
+        if os.path.normcase(text).startswith(os.path.normcase(root)):
+            text = text[len(root):]
+        return text.replace(os.sep, "/") if os.sep != "/" else text
 
     def _load(self) -> None:
         try:
@@ -214,7 +218,10 @@ class LabelQAManager:
                 try:
                     with self.predictor.backend_lock:
                         raw = backend.predict(record.path, conf=QA_CONF) if accepts_conf else backend.predict(record.path)
-                    mtime = record.path.stat().st_mtime_ns
+                    stamp = self.dataset.image_stamp(record)  # as the dataset knows it: what listings compare with
+                    if stamp is None:
+                        raise FileNotFoundError(record.path)
+                    mtime = stamp[0]
                 except Exception:  # one unreadable image must not stop the analysis
                     with self._lock:
                         self.job["failed"] += 1
@@ -253,23 +260,15 @@ class LabelQAManager:
 
     # ---------- findings ----------
 
-    def _record_for(self, key: str, entry: dict) -> ImageRecord | None:
-        record = self.dataset.images.get(entry.get("id"))
-        if record is not None and self._key(record.path) == key:
-            return record
-        return next((candidate for candidate in self.dataset.images.values() if self._key(candidate.path) == key), None)
-
     def _image_findings(self, key: str, entry: dict, record: ImageRecord, tolerance: float = 0.0) -> list[dict] | None:
         """Every finding of one image at any confidence (None when the image changed since it was analyzed).
 
         tolerance 0 reports every box difference: a superset of what any listing shows, which is
-        what looking a finding up by its key needs.
+        what looking a finding up by its key needs. Whether the image changed is judged by the time the
+        dataset knows (opening, rescan): a stat per image made every listing wait on a network drive.
         """
-        try:
-            mtime = record.path.stat().st_mtime_ns
-        except OSError:
-            return None
-        if mtime != entry["mtime"]:
+        stamp = self.dataset.image_stamp(record)
+        if stamp is None or stamp[0] != entry["mtime"]:
             return None
         dismissed = tuple(self.result["dismissed"].get(key, ()))
         inputs = (id(entry), self.dataset._revisions.get(record.label_path), dismissed, self.dataset.schema_generation, record.width, record.height)
@@ -300,8 +299,13 @@ class LabelQAManager:
             if self.result is None:
                 return {"total": 0, "images": 0, "stale": 0, "counts": {name: 0 for name in KINDS}, "items": []}
             items, stale = [], 0
+            by_key = None  # images analyzed under another id (opened again after a move): found by path
             for key, entry in self.result["images"].items():
-                record = self._record_for(key, entry)
+                record = self.dataset.images.get(entry.get("id"))
+                if record is None or self._key(record.path) != key:
+                    if by_key is None:
+                        by_key = {self._key(candidate.path): candidate for candidate in self.dataset.images.values()}
+                    record = by_key.get(key)
                 if record is None:
                     continue
                 if split not in (None, "all") and record.split != split:

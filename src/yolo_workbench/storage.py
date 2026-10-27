@@ -17,6 +17,7 @@ import shutil
 import time
 from pathlib import Path
 
+from . import fsscan
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError, IMAGE_EXTENSIONS
 from .runtime import RUNTIME
 
@@ -38,8 +39,9 @@ def _session_dir(dataset: Dataset, kind: str, session: str) -> Path:
     return path
 
 
-def _files(directory: Path) -> list[Path]:
-    return [path for path in directory.rglob("*") if path.is_file()]
+def _files(directory: Path, listing: fsscan.Listing | None = None) -> list[Path]:
+    # listed folder by folder (with sizes and times): a session holds a file per edited label or deleted image
+    return [Path(path) for path in (listing or fsscan.Listing(stat=False)).files(directory)]
 
 
 def _started(session: str) -> str | None:
@@ -56,10 +58,11 @@ def summary(dataset: Dataset) -> dict:
     for kind in KINDS:
         base = dataset.root / WORKBENCH_DIR / kind
         sessions = []
-        if base.is_dir():
-            for directory in sorted((entry for entry in base.iterdir() if entry.is_dir() and SESSION_PATTERN.match(entry.name)), key=lambda entry: entry.name, reverse=True):
-                files = _files(directory)
-                size = sum(path.stat().st_size for path in files)
+        listing = fsscan.Listing()
+        if listing.is_dir(base):
+            for directory in sorted((entry for entry in listing.subfolders(base) if SESSION_PATTERN.match(entry.name)), key=lambda entry: entry.name, reverse=True):
+                files = _files(directory, listing)
+                size = sum((listing.stat(path) or (0, 0))[1] for path in files)
                 sessions.append({
                     "session": directory.name,
                     "started": _started(directory.name),
@@ -119,10 +122,14 @@ def purge_expired(root: Path, kind: str, days: float, protected: set[str] = froz
     for directory in base.iterdir():
         if not directory.is_dir() or not SESSION_PATTERN.match(directory.name) or directory.name in protected:
             continue
+        listing = fsscan.Listing()
         try:
-            newest = max((path.stat().st_mtime for path in directory.rglob("*")), default=directory.stat().st_mtime)
-        except OSError:
-            continue
+            newest = max((listing.stat(path) or (0, 0))[0] / 1e9 for path in _files(directory, listing))
+        except ValueError:  # an empty session: its folder's time
+            try:
+                newest = directory.stat().st_mtime
+            except OSError:
+                continue
         if newest < cutoff:
             shutil.rmtree(directory, ignore_errors=True)
             purged.append(directory.name)

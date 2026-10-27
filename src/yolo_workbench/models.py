@@ -33,6 +33,10 @@ class ImageRecord:
     probe_error: str | None = None
     review: str | None = None  # "done", "needs_work", or None (unreviewed); see review.py
     reviewed_by: str | None = None  # the user name that set `review` (with sign-in)
+    # the image file's modification time and size as last seen (opening, rescan, size probe): what cache keys and
+    # Label QA compare with, without asking a network drive about every image (see Dataset.image_stamp)
+    image_mtime: int | None = None
+    image_size: int | None = None
 
     def summary(self) -> dict:
         return {

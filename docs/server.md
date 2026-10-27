@@ -4,11 +4,11 @@
 under systemd, needs no terminal or logged-in user, and is used from other machines' browsers at
 `http://<server>:8765`. The desktop command (`yolo-workbench`) is unchanged.
 
-This guide assumes one Linux host with local storage (and usually one NVIDIA GPU) on a trusted internal
-network. Everyone signs in with an account made on the server (`yolo-workbench-server user add`), but over
-plain HTTP: passwords and session cookies cross the network unencrypted, every signed-in user can use every
-project, and model files (`.pt`/`.pth`) run code when loaded. Keep the port reachable only from the network
-that should use it.
+This guide assumes one Linux host with local storage or a network share for the projects (see *Folders*),
+and usually one NVIDIA GPU, on a trusted internal network. Everyone signs in with an account made on the
+server (`yolo-workbench-server user add`), but over plain HTTP: passwords and session cookies cross the
+network unencrypted, every signed-in user can use every project, and model files (`.pt`/`.pth`) run code
+when loaded. Keep the port reachable only from the network that should use it.
 
 ## What the server does differently
 
@@ -128,6 +128,15 @@ the configured paths are resolved, so the unit names the real folders. Settings 
 cover go into a drop-in (`sudo systemctl edit yolo-workbench`), which stays; `apply-config.sh` lists the
 drop-ins it finds. One that adds `ReadWritePaths=`, `RequiresMountsFor=` or `TimeoutStopSec=` by hand (as
 an earlier version of this guide said to) is not needed anymore: remove those lines.
+
+`projects_root` may be on a network share (an NFS or SMB mount in `/etc/fstab`, with `_netdev` for SMB).
+`RequiresMountsFor=` waits for that mount like for a local disk. Opening a project lists each folder once
+and reads its label files in parallel; after that, requests work from memory, so the gallery, thumbnails and
+Label QA are as quick as on a local disk. Keep `cache_dir` on a local disk. Mount NFS with lock support (the
+default, not `nolock`) so that the owner lock also refuses a second server on another machine. On a mount
+without file locks, the server logs a warning and starts anyway. Training reads images over the network in
+every epoch: **Cache images: RAM** (`cache: ram`) in the Training form avoids that when the dataset fits in
+memory. See the README's *Datasets on network drives* for what changes outside the app look like there.
 
 ## Configuration
 

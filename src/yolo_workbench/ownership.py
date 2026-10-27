@@ -3,11 +3,17 @@
 Locks and mtime checks inside one process do not coordinate two processes, so a second server, or a
 desktop session on the same folder, refuses to start. The lock is released by the OS when the process
 ends, so a crash leaves nothing stale; `owner.json` beside it only says who holds it.
+
+Network filesystems with lock support (SMB, NFS with its lock service) honour the lock across machines. One
+without it (some NAS and FUSE mounts) fails every lock attempt: that is logged and the folder opens anyway,
+since refusing would make it unusable; only a lock held by another process refuses.
 """
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
 import os
 import socket
 import sys
@@ -18,6 +24,10 @@ from .release import release_name
 
 LOCK_NAME = "owner.lock"
 INFO_NAME = "owner.json"
+# what a filesystem without lock support answers (not "held by someone else", which is EAGAIN/EACCES)
+UNSUPPORTED = {errno.ENOLCK, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EINVAL}
+
+log = logging.getLogger(__name__)
 
 
 class AlreadyOwned(RuntimeError):
@@ -29,6 +39,7 @@ class OwnerLock:
         self.directory = Path(directory)
         self.path = self.directory / LOCK_NAME
         self._stream = None
+        self.unlocked: str | None = None  # why no OS lock is held (the filesystem has no lock support)
 
     @property
     def held(self) -> bool:
@@ -39,9 +50,12 @@ class OwnerLock:
         stream = open(self.path, "a+b")
         try:
             _lock(stream)
-        except OSError:
-            stream.close()
-            raise AlreadyOwned(self._describe_owner()) from None
+        except OSError as exc:
+            if isinstance(exc, BlockingIOError) or exc.errno not in UNSUPPORTED:
+                stream.close()
+                raise AlreadyOwned(self._describe_owner()) from None
+            self.unlocked = f"{exc.strerror or exc} (errno {exc.errno})"
+            log.warning("%s: the filesystem does not support file locks (%s): a second workbench on this folder would not be refused", self.path, self.unlocked)
         self._stream = stream
         info = {"pid": os.getpid(), "host": socket.gethostname(), "started": time.strftime("%Y-%m-%dT%H:%M:%S"), "command": " ".join(sys.argv), "release": release_name()}
         try:
@@ -59,7 +73,8 @@ class OwnerLock:
         except OSError:
             pass
         try:
-            _unlock(stream)
+            if self.unlocked is None:
+                _unlock(stream)
         finally:
             stream.close()
 
