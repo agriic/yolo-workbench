@@ -573,14 +573,8 @@ function bind() {
   }, { passive: false });
   new ResizeObserver(resizeCanvas).observe($("canvas-wrap"));
 
-  $("editor").addEventListener("cancel", e => {
-    if (state.drawing) { e.preventDefault(); cancelDrawing(); }
-    // Esc in smart annotation clears the prompts, then leaves the mode, before it closes the editor
-    else if (state.sam.active) {
-      e.preventDefault();
-      if (hasPrompts()) { clearPrompts(); render(); } else toggleSam(false);
-    }
-  });
+  // Esc reaches keyDown first; this is Esc pressed in one of the editor's fields
+  $("editor").addEventListener("cancel", e => { if (escapeEditorStep()) e.preventDefault(); });
   $("editor").addEventListener("close", () => {
     editorShows(null);
     clearEditorNotice();
@@ -626,6 +620,16 @@ function bind() {
   });
 }
 
+// Esc cancels a drawing, in smart annotation clears the prompts, then leaves the mode, before it closes the
+// editor; false when there is nothing left but closing.
+function escapeEditorStep() {
+  if (state.drawing) cancelDrawing();
+  else if (state.sam.active) {
+    if (hasPrompts()) { clearPrompts(); render(); } else toggleSam(false);
+  } else return false;
+  return true;
+}
+
 function keyDown(e) {
   if (/^(input|select|textarea)$/i.test(e.target.tagName)) return;
   const key = e.key;
@@ -639,6 +643,9 @@ function keyDown(e) {
     if (key === "Escape" && state.imageSelection.size && $("annotation").classList.contains("active")) clearImageSelection();
     return;
   }
+  // on keydown, not in the dialog's cancel event: Chrome lets a page cancel that only once between clicks or
+  // other key presses, so the second of two Esc presses in a row both did its step and closed the editor
+  if (key === "Escape") { if (escapeEditorStep()) e.preventDefault(); return; }
   if (key === " ") { e.preventDefault(); state.spaceDown = true; $("canvas").style.cursor = "grab"; return; }
   if ((key === "Delete" || key === "Backspace") && state.sam.active && hasPrompts()) return removeLastPrompt();
   if (key === "Delete" || key === "Backspace") return deleteSelected();
