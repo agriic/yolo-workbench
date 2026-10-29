@@ -107,6 +107,7 @@ export async function navigate(step) {
     ? (step > 0 ? state.editorGridIndex : Math.min(state.editorGridIndex, total) - 1)
     : state.editorGridIndex + step;
   if (target < 0 || target >= total) return;
+  cancelDrawing();
   try {
     const item = await deps.imageGallery().itemAt(target);
     if (item) openEditor(item.id, null, target);
@@ -561,6 +562,14 @@ export async function pointerUp() {
       render();
     }
   }
+}
+
+// Drop a box or polygon in progress (Esc, or the editor moving on to another image: until the next
+// image opens, the old one is still on screen, and its clicks must not go on drawing or close the shape).
+export function cancelDrawing() {
+  if (!state.drawing) return;
+  state.drawing = null;
+  render();
 }
 
 export async function finishPolygon() {

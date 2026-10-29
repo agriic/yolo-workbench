@@ -5,7 +5,7 @@ import { $, api, apiUrl, setApiBase, esc, debounce, classColor } from "./api.js"
 import { state } from "./state.js";
 import { VirtualGallery } from "./grid.js";
 import {
-  applyHistory, bounds, closeEditorSession, configureCanvas, deleteSelected,
+  applyHistory, bounds, cancelDrawing, closeEditorSession, configureCanvas, deleteSelected,
   editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerMove,
   pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
   savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
@@ -549,7 +549,7 @@ function bind() {
   new ResizeObserver(resizeCanvas).observe($("canvas-wrap"));
 
   $("editor").addEventListener("cancel", e => {
-    if (state.drawing) { e.preventDefault(); state.drawing = null; render(); }
+    if (state.drawing) { e.preventDefault(); cancelDrawing(); }
     // Esc in smart annotation clears the prompts, then leaves the mode, before it closes the editor
     else if (state.sam.active) {
       e.preventDefault();
@@ -865,6 +865,7 @@ async function reviewSelection(status) {
 // (under the "Unreviewed" filter the image drops out of the list, and its successor takes its place).
 async function reviewCurrent(status, advance) {
   if (!state.detail) return;
+  if (advance) cancelDrawing();
   const id = state.detail.id;
   const next = advance || state.detail.review !== status ? status : null;
   try {
@@ -884,6 +885,7 @@ async function reviewCurrent(status, advance) {
 
 // Open the first unreviewed image after the editor's position (or from `start`), wrapping around the list.
 async function openNextUnreviewed(start = null) {
+  cancelDrawing();
   const from = start ?? (state.detail && state.editorGridIndex != null ? state.editorGridIndex + (state.editorDetached ? 0 : 1) : 0);
   const params = imageFilterParams();
   params.set("start", String(from));
