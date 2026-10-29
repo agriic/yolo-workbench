@@ -1,4 +1,6 @@
 import asyncio
+import io
+import json
 from pathlib import Path
 
 import pytest
@@ -432,5 +434,146 @@ def test_import_sample_preview(tmp_path):
             assert response.status_code == 200 and response.headers["x-image-size"] == "32x24"
             bad = await client.get("/api/v1/projects/pets/import/sample", params={"path": str(source), "file": "../export/data.yaml"})
             assert bad.status_code == 400
+
+    asyncio.run(run())
+
+
+def write_json(path: Path, content: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(content))
+
+
+def make_coco_source(tmp_path: Path) -> Path:
+    """A Roboflow COCO export: <split>/_annotations.coco.json next to the images; the project itself is an unused
+    category, cat has another id in valid, and train has a stray YOLO label that must not be used."""
+    source = tmp_path / "coco"
+    for index, (split, name) in enumerate([("train", "a"), ("train", "b"), ("valid", "c"), (".", "d")]):
+        (source / split).mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (100, 50), (0, 0, index * 40)).save(source / split / f"{name}.jpg")
+    (source / "train" / "a.txt").write_text("0 0.5 0.5 0.1 0.1\n")
+    animals = {"id": 0, "name": "animals", "supercategory": "none"}
+    write_json(source / "train" / "_annotations.coco.json", {
+        "categories": [animals, {"id": 1, "name": "dog", "supercategory": "animals"}, {"id": 2, "name": "cat", "supercategory": "animals"}],
+        "images": [{"id": 1, "file_name": "a.jpg", "width": 100, "height": 50}, {"id": 2, "file_name": "b.jpg", "width": 100, "height": 50}, {"id": 3, "file_name": "gone.jpg", "width": 100, "height": 50}],
+        "annotations": [
+            {"id": 1, "image_id": 1, "category_id": 1, "bbox": [10, 10, 20, 20], "segmentation": [[10, 10, 30, 10, 30, 30]], "iscrowd": 0},
+            # one cat in two parts, the second turned the other way round
+            {"id": 2, "image_id": 1, "category_id": 2, "bbox": [50, 10, 30, 10], "segmentation": [[50, 10, 60, 10, 60, 20, 50, 20], [70, 10, 70, 20, 80, 20, 80, 10]], "iscrowd": 0},
+            {"id": 3, "image_id": 1, "category_id": 1, "bbox": [40, 30, 20, 10], "segmentation": [], "iscrowd": 0},
+            {"id": 4, "image_id": 1, "category_id": 2, "bbox": [0, 0, 10, 10], "segmentation": {"size": [50, 100], "counts": [0, 10]}, "iscrowd": 1},
+            {"id": 5, "image_id": 1, "category_id": 9, "bbox": [0, 0, 10, 10], "segmentation": [], "iscrowd": 0},
+            {"id": 6, "image_id": 3, "category_id": 1, "bbox": [0, 0, 10, 10], "segmentation": [], "iscrowd": 0},
+        ],
+    })
+    write_json(source / "valid" / "_annotations.coco.json", {
+        "categories": [{"id": 1, "name": "cat"}],
+        "images": [{"id": 7, "file_name": "c.jpg"}],  # no size: the image's own
+        "annotations": [{"id": 1, "image_id": 7, "category_id": 1, "bbox": [-10, 0, 60, 25], "iscrowd": 0}],  # sticks out on the left
+    })
+    write_json(source / "notes.json", {"categories": [{"id": 0, "name": "zebra"}]})  # not COCO
+    return source
+
+
+def test_coco_scan(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Pets", "segmentation", ["cat"])
+    scanned = importer.scan(workspace.session("pets").dataset, make_coco_source(tmp_path))
+    assert scanned["format"] == "coco" and scanned["images"] == 4 and scanned["labeled"] == 3
+    assert scanned["splits"] == {"train": 2, "val": 1}
+    assert scanned["coco"] == {"files": ["train/_annotations.coco.json", "valid/_annotations.coco.json"], "missing_images": 1, "skipped": {"crowd": 1, "unknown_class": 1, "no_shape": 0}}
+    # cat is one class although its id differs between the files; the unused parent category is not suggested
+    classes = [(item["key"], item["name"], item["count"], item["suggested"]) for item in scanned["classes"]]
+    assert classes == [("0", "animals", 0, None), ("1", "dog", 2, "new"), ("2", "cat", 2, 0)]
+
+
+def test_coco_import_into_segmentation_and_detection(tmp_path):
+    workspace = make_workspace(tmp_path)
+    source = make_coco_source(tmp_path)
+    workspace.create("Seg", "segmentation", ["cat"])
+    dataset = workspace.session("seg").dataset
+    result = importer.run_import(dataset, source, {"split_mode": "source", "split": "train"})
+    assert result["imported"] == 4 and result["labels"] == 3 and result["by_split"] == {"train": 3, "val": 1}
+    assert dataset.names == {0: "cat", 1: "dog"}
+    labels = dataset.root / "labels"
+    assert (labels / "train" / "a.txt").read_text() == (
+        "1 0.1 0.2 0.3 0.2 0.3 0.6\n"
+        # the parts joined by a zero-width bridge between their closest corners
+        "0 0.5 0.2 0.6 0.2 0.7 0.2 0.8 0.2 0.8 0.4 0.7 0.4 0.7 0.2 0.6 0.2 0.6 0.4 0.5 0.4\n"
+        "1 0.4 0.6 0.6 0.6 0.6 0.8 0.4 0.8\n"  # only a box: its rectangle
+    )
+    assert (labels / "train" / "b.txt").read_text() == ""  # listed without objects: a background image
+    assert (labels / "val" / "c.txt").read_text() == "0 0 0 0.5 0 0.5 0.5 0 0.5\n"
+    assert not (labels / "train" / "d.txt").exists()
+    assert not any(issue["kind"] != "missing_label" for record in dataset.images.values() for issue in record.issues)
+
+    workspace.create("Det", "detection", ["cat", "dog"])
+    dataset = workspace.session("det").dataset
+    importer.run_import(dataset, source, {"split_mode": "source", "mapping": {"1": None}})
+    labels = dataset.root / "labels"
+    assert (labels / "train" / "a.txt").read_text() == "0 0.65 0.3 0.3 0.2\n"  # dogs dropped by the mapping
+    assert (labels / "val" / "c.txt").read_text() == "0 0.25 0.25 0.5 0.5\n"  # clipped to the image
+
+
+def rle_string(counts: list[int]) -> str:
+    """pycocotools' rleToString, to check the decoder against."""
+    text = []
+    for index, value in enumerate(counts):
+        if index > 2:
+            value -= counts[index - 2]
+        more = True
+        while more:
+            char = value & 0x1F
+            value >>= 5
+            more = value != -1 if char & 0x10 else value != 0
+            text.append(chr((char | 0x20 if more else char) + 48))
+    return "".join(text)
+
+
+def test_coco_official_layout_with_rle_masks(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Rle", "segmentation")
+    dataset = workspace.session("rle").dataset
+    source = tmp_path / "coco2017"
+    (source / "val2017").mkdir(parents=True)
+    Image.new("RGB", (20, 10)).save(source / "val2017" / "x.jpg")
+    # a 10×5 block at x 5..14, y 2..6, in column-major runs; and a 4×4 block at x 0..3, y 0..3
+    block = [52] + [5, 5] * 9 + [5, 53]
+    image = {"id": 1, "file_name": "x.jpg", "width": 20, "height": 10}
+    write_json(source / "annotations" / "instances_val2017.json", {
+        "categories": [{"id": 1, "name": "sign"}, {"id": 2, "name": "dot"}], "images": [image],
+        "annotations": [
+            {"id": 1, "image_id": 1, "category_id": 1, "segmentation": {"size": [10, 20], "counts": rle_string(block)}, "iscrowd": 0, "bbox": [5, 2, 10, 5]},
+            {"id": 2, "image_id": 1, "category_id": 2, "segmentation": {"size": [10, 20], "counts": [0, 4, 6, 4, 6, 4, 6, 4, 166]}, "iscrowd": 0, "bbox": [0, 0, 4, 4]},
+        ],
+    })
+    # the people again, with keypoints: left out, or each person would come in twice
+    write_json(source / "annotations" / "person_keypoints_val2017.json", {
+        "categories": [{"id": 1, "name": "person", "keypoints": ["nose"]}], "images": [image],
+        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [0, 0, 5, 5], "segmentation": [], "iscrowd": 0}],
+    })
+    scanned = importer.scan(dataset, source)
+    assert scanned["coco"]["files"] == ["annotations/instances_val2017.json"]
+    assert scanned["splits"] == {"val": 1}  # from the file's name
+    assert [(item["name"], item["count"]) for item in scanned["classes"]] == [("sign", 1), ("dot", 1)]
+    importer.run_import(dataset, source, {"split_mode": "source"})
+    lines = [list(map(float, line.split())) for line in (dataset.root / "labels" / "val" / "x.txt").read_text().splitlines()]
+    assert [line[0] for line in lines] == [0, 1]
+    assert sorted(set(lines[0][1::2])) == [0.25, 0.7] and sorted(set(lines[0][2::2])) == [0.2, 0.6]
+    assert sorted(set(lines[1][1::2])) == [0.0, 0.15] and sorted(set(lines[1][2::2])) == [0.0, 0.3]
+
+
+def test_coco_sample_preview_draws_the_objects(tmp_path):
+    workspace = make_workspace(tmp_path)
+    workspace.create("Pets", "segmentation", ["cat"])
+    source = make_coco_source(tmp_path)
+
+    async def run():
+        app = make_app(workspace, tmp_path)
+        async with client_for(app) as client:
+            response = await client.get("/api/v1/projects/pets/import/sample", params={"path": str(source), "file": "train/a.jpg"})
+            assert response.status_code == 200 and response.headers["x-image-size"] == "100x50"
+            with Image.open(io.BytesIO(response.content)) as preview:
+                red, green, blue = preview.convert("RGB").getpixel((20, 10))  # on the dog's top edge
+            assert red > 150 and green > 120 and blue < 100
 
     asyncio.run(run())

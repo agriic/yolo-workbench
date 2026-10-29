@@ -543,6 +543,7 @@ function renderImportReview() {
   const splitCounts = Object.entries(scan.splits);
   const targetSplits = scan.target_splits;
   const nameSource = classification ? null : scan.names_source;
+  const coco = classification ? null : scan.coco;
   clearCropSample();
   $("import-progress").hidden = true;
   $("import-start").hidden = true;
@@ -550,7 +551,9 @@ function renderImportReview() {
   $("import-review").innerHTML = `
     <p class="import-summary"><strong>${plural(scan.images, "image")}</strong> found${classification ? "" : ` · ${scan.labeled.toLocaleString()} with labels`}
       ${classification ? (scan.classes.some(item => item.named) ? " · classes from folder names" : "")
+        : coco ? ` · COCO annotations from ${coco.files.length > 3 ? `${coco.files.length} files` : coco.files.map(file => `<code>${esc(file)}</code>`).join(", ")}`
         : nameSource ? ` · class names from <code>${esc(nameSource)}</code>` : scan.classes.length ? " · no class names shipped: ids are kept as they are" : ""}</p>
+    ${coco ? cocoNote(coco) : ""}
     <fieldset class="import-fieldset"><legend>Splits</legend>
       <label class="radio-row"><input type="radio" name="split-mode" value="fixed" ${splitCounts.length ? "" : "checked"}><span>All into <select id="import-split">${targetSplits.map(split => `<option>${esc(split)}</option>`).join("")}</select></span></label>
       <label class="radio-row"><input type="radio" name="split-mode" value="auto"><span>Random split
@@ -573,6 +576,20 @@ function renderImportReview() {
   renderFolderSelects();
   updateImportSummary();
   updateCropPreview();
+}
+
+function cocoNote(coco) {
+  const { crowd, no_shape: noShape, unknown_class: unknown } = coco.skipped;
+  const left = [
+    coco.missing_images && `${plural(coco.missing_images, "listed image")} not found among the files`,
+    crowd && `${plural(crowd, "crowd region")} left out`,
+    noShape && `${plural(noShape, "object")} without a box or polygon left out`,
+    unknown && `${plural(unknown, "object")} of an unlisted category left out`,
+  ].filter(Boolean);
+  const how = state.meta.category === "segmentation"
+    ? "Each object becomes one polygon: parts are joined, an object with only a box becomes its rectangle."
+    : "Each object becomes its bounding box.";
+  return `<p class="panel-note">${how}${left.length ? ` <span class="warn-text">${left.join(" · ")}.</span>` : ""}</p>`;
 }
 
 const cropNumber = (key, label, value, max = "") => `<label class="crop-input">${label} <input type="number" min="0" ${max && `max="${max}"`} step="1" data-crop="${key}" value="${value}"></label>`;
@@ -747,6 +764,7 @@ function trackJob(job, schema) {
       result.cropped && `${result.cropped} cropped`, result.duplicates && `${result.duplicates} duplicates skipped`, result.renamed && `${result.renamed} renamed`,
       result.dropped && `${result.dropped} skipped`, result.crop_skipped && `${result.crop_skipped} outside the crop region`,
       result.objects_cropped_out && `${plural(result.objects_cropped_out, "object")} cropped out`,
+      result.objects_skipped && `${plural(result.objects_skipped, "object")} without a usable shape left out`,
     ].filter(Boolean);
     deps.toast(`Imported ${plural(result.imported, "image")}${result.labels ? ` and ${plural(result.labels, "label")}` : ""}${extra.length ? ` · ${extra.join(", ")}` : ""}`);
   } else if (job.state === "cancelled") {
