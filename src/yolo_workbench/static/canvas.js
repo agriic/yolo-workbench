@@ -12,6 +12,7 @@ let cssH = 0;
 export let editorRequest = 0;
 export let saveQueue = Promise.resolve();
 let saveSequence = 0;
+let vertexPress = null;  // {a, index, time}: the last press on a polygon vertex, until something moves
 const latestSaveByImage = new Map();
 export const savedRevisionByImage = new Map();
 
@@ -282,14 +283,31 @@ export function drawShape(ctx, annotation, selected) {
       ctx.strokeRect(sx - 4, sy - 4, 8, 8);
     }
   } else {
+    const hover = state.polyHover?.a === annotation ? state.polyHover : null;
     for (let i = 0; i < annotation.points.length; i += 2) {
       const [sx, sy] = toScreen(annotation.points[i], annotation.points[i + 1]);
+      const hovered = hover?.vertex === i / 2;
       ctx.beginPath();
-      ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
-      ctx.fillStyle = "#fff";
+      ctx.arc(sx, sy, hovered ? 6 : 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = hovered && hover.remove ? "#ef4444" : "#fff";
       ctx.fill();
       ctx.strokeStyle = color;
       ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    if (hover?.edge != null) {
+      // where a press adds a vertex
+      const [sx, sy] = toScreen(...hover.point);
+      ctx.beginPath();
+      ctx.arc(sx, sy, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sx - 2.5, sy); ctx.lineTo(sx + 2.5, sy);
+      ctx.moveTo(sx, sy - 2.5); ctx.lineTo(sx, sy + 2.5);
       ctx.stroke();
     }
   }
@@ -379,6 +397,8 @@ export function updateStatus() {
     hint = "Click to add points · click the first point or press ⏎ to close · Esc cancels";
   else if (state.drawing) hint = "Release to create the box";
   else if (state.meta.category === "detection") hint = "Drag on empty space to draw a box · scroll to zoom · Space+drag to pan";
+  else if (selectedAnnotation())
+    hint = "Drag a point to move it · click an edge to add a point · double-click or Alt+click a point to remove it";
   else hint = "Click on empty space to start a polygon · scroll to zoom · Space+drag to pan";
   $("status-hint").textContent = hint;
 }
@@ -398,6 +418,28 @@ export function hitHandle(screen) {
         return { mode: "vertex", index: i, a: annotation };
   }
   return null;
+}
+
+// The edge of the selected polygon under the cursor, with its point nearest the cursor and the vertex index
+// a point inserted there gets.
+export function hitEdge(screen) {
+  const annotation = selectedAnnotation();
+  if (!annotation || state.meta.category !== "segmentation") return null;
+  const points = annotation.points, count = points.length / 2;
+  let best = null;
+  for (let i = 0; i < count; i++) {
+    const j = (i + 1) % count;
+    const a = toScreen(points[i * 2], points[i * 2 + 1]), b = toScreen(points[j * 2], points[j * 2 + 1]);
+    const dx = b[0] - a[0], dy = b[1] - a[1], length2 = dx * dx + dy * dy;
+    const t = length2 ? clamp(((screen[0] - a[0]) * dx + (screen[1] - a[1]) * dy) / length2, 0, 1) : 0;
+    const distance = screenDistance([a[0] + t * dx, a[1] + t * dy], screen);
+    if (distance <= 6 && !(best?.distance <= distance))
+      best = {
+        distance, a: annotation, index: i + 1,
+        point: [points[i * 2] + t * (points[j * 2] - points[i * 2]), points[i * 2 + 1] + t * (points[j * 2 + 1] - points[i * 2 + 1])],
+      };
+  }
+  return best;
 }
 
 export function hitShape([x, y]) {
@@ -438,11 +480,27 @@ export function pointerDown(e) {
     state.drawing.points.push(clamped);
     return render();
   }
+  state.polyHover = null;
   const handle = hitHandle(screen);
   if (handle) {
-    if (handle.mode === "vertex" && e.altKey) return removeVertex(handle.a, handle.index);
+    if (handle.mode === "vertex") {
+      // Alt+click, or a second press on the same vertex soon after one that did not move it, removes it
+      const again = vertexPress?.a === handle.a && vertexPress.index === handle.index && e.timeStamp - vertexPress.time < 400;
+      vertexPress = null;
+      if (e.altKey || again) return removeVertex(handle.a, handle.index);
+      vertexPress = { a: handle.a, index: handle.index, time: e.timeStamp };
+    }
     state.drag = { ...handle, start: norm, original: [...handle.a.points] };
     return;
+  }
+  vertexPress = null;
+  const edge = hitEdge(screen);
+  if (edge) {
+    // a press on an edge inserts a vertex there and drags it; the release saves it
+    const original = [...edge.a.points];
+    edge.a.points.splice(edge.index * 2, 0, ...edge.point);
+    state.drag = { mode: "vertex", a: edge.a, index: edge.index, start: norm, original };
+    return render();
   }
   const found = hitShape(norm);
   if (found) {
@@ -487,7 +545,7 @@ export function pointerMove(e) {
     return render();
   }
   // hover feedback
-  let cursor = "crosshair", hovered = null, prediction = null;
+  let cursor = "crosshair", hovered = null, prediction = null, polyHover = null, edge;
   if (state.meta.category === "classification") {
     cursor = "grab";
   } else if (state.spaceDown) {
@@ -496,6 +554,10 @@ export function pointerMove(e) {
     const handle = hitHandle(screen);
     if (handle) {
       cursor = handle.mode === "resize" ? HANDLE_CURSORS[handle.index] : "move";
+      if (handle.mode === "vertex") polyHover = { a: handle.a, vertex: handle.index, remove: e.altKey };
+    } else if ((edge = hitEdge(screen))) {
+      cursor = "copy";
+      polyHover = { a: edge.a, edge: edge.index, point: edge.point };
     } else {
       const found = hitShape(norm);
       if (found) { cursor = "move"; hovered = found.id; }
@@ -504,12 +566,18 @@ export function pointerMove(e) {
   }
   $("canvas").style.cursor = cursor;
   const predictionChanged = deps.hoverPrediction(prediction?.id ?? null, "canvas");
-  if (hovered !== state.hovered || predictionChanged) { state.hovered = hovered; render(); }
+  const polyKey = hover => hover && [hover.vertex, hover.remove, hover.point].join("|");
+  const polyChanged = polyHover?.a !== state.polyHover?.a || polyKey(polyHover) !== polyKey(state.polyHover);
+  if (hovered !== state.hovered || predictionChanged || polyChanged) {
+    state.hovered = hovered;
+    state.polyHover = polyHover;
+    render();
+  }
 }
 
 export function pointerLeave() {
   const predictionChanged = deps.hoverPrediction(null);
-  if (state.hovered || predictionChanged) { state.hovered = null; render(); }
+  if (state.hovered || state.polyHover || predictionChanged) { state.hovered = null; state.polyHover = null; render(); }
 }
 
 export function applyDrag(norm) {
@@ -551,6 +619,7 @@ export async function pointerUp() {
   if (state.drag) {
     const changed = JSON.stringify(state.drag.a.points) !== JSON.stringify(state.drag.original);
     state.drag = null;
+    if (changed) vertexPress = null;
     if (changed) await save(); else render();
     return;
   }
@@ -589,6 +658,7 @@ export async function finishPolygon() {
 export function removeVertex(annotation, index) {
   if (annotation.points.length <= 6) return deps.toast("A polygon needs at least 3 points", "error");
   annotation.points.splice(index * 2, 2);
+  render();
   save();
 }
 

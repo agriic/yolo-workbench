@@ -26,6 +26,7 @@ export const state = {
   focusHint: null,     // points of a shape outlined in the editor (a Label QA prediction), or null
   drawing: null,       // {start,end} box or {points,cursor} polygon in progress
   drag: null,          // {mode:"move"|"resize"|"vertex", a, index, start, original}
+  polyHover: null,     // selected polygon under the mouse: {a, vertex, remove} or {a, edge, point} (where a press adds a vertex)
   pan: null,
   spaceDown: false,
   view: { scale: 1, x: 0, y: 0 },

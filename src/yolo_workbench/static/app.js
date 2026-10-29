@@ -301,7 +301,11 @@ function renderShortcuts() {
   const detection = state.meta.category === "detection";
   const rows = [
     [detection ? "Drag" : "Click", detection ? "Draw a box" : "Add polygon points"],
-    ...(detection ? [] : [["⏎", "Close the polygon"], ["Alt+Click", "Remove a vertex"]]),
+    ...(detection ? [] : [
+      ["⏎", "Close the polygon"],
+      ["Click an edge", "Add a vertex (drag to place it)"],
+      ["Double-click / Alt+Click", "Remove a vertex"],
+    ]),
     ["Scroll", "Zoom at cursor"],
     ["Space+Drag", "Pan the image"],
     ["1–9", "Set class of selection"],
