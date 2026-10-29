@@ -131,6 +131,30 @@
       <div class="filters">
         <label class="field">Class<select id="object-class"></select></label>
         <label class="field">Split<select id="object-split"><option value="all">All splits</option></select></label>
+        <div class="field object-size-filter" title="Width of the object's box (a polygon's enclosing box)">Width<div class="count-range">
+          <input id="object-min-width" type="number" min="0" step="any" inputmode="decimal" placeholder="min px" aria-label="Minimum width">
+          <span aria-hidden="true">–</span>
+          <input id="object-max-width" type="number" min="0" step="any" inputmode="decimal" placeholder="max px" aria-label="Maximum width">
+        </div></div>
+        <div class="field object-size-filter" title="Height of the object's box (a polygon's enclosing box)">Height<div class="count-range">
+          <input id="object-min-height" type="number" min="0" step="any" inputmode="decimal" placeholder="min px" aria-label="Minimum height">
+          <span aria-hidden="true">–</span>
+          <input id="object-max-height" type="number" min="0" step="any" inputmode="decimal" placeholder="max px" aria-label="Maximum height">
+        </div></div>
+        <label class="field object-size-filter" title="Unit of the width and height filters, the size sorts, and the size on the cards">Unit<select id="object-size-unit"><option value="px">Pixels</option><option value="percent">% of image</option></select></label>
+        <div class="field object-size-filter" title="Width ÷ height of the box in pixels: below 1 is tall, above 1 is wide">Aspect W÷H<div class="count-range">
+          <input id="object-min-aspect" type="number" min="0" step="any" inputmode="decimal" placeholder="min" aria-label="Minimum aspect ratio">
+          <span aria-hidden="true">–</span>
+          <input id="object-max-aspect" type="number" min="0" step="any" inputmode="decimal" placeholder="max" aria-label="Maximum aspect ratio">
+        </div></div>
+        <label class="field object-size-filter">Sort<select id="object-sort">
+          <option value="name">Image name</option>
+          <option value="smallest">Smallest first</option>
+          <option value="largest">Largest first</option>
+          <option value="widest">Widest first</option>
+          <option value="tallest">Tallest first</option>
+        </select></label>
+        <button id="object-filters-reset" class="link-btn object-size-filter" type="button" title="Clear the size filters and the sort" hidden>Reset</button>
         <label class="field" id="crop-padding-field"><span class="field-label">Crop padding <span id="padding-value" class="muted">15%</span></span><input id="crop-padding" type="range" min="0" max="0.6" step="0.05" value="0.15"></label>
         <div id="object-bulk" class="bulk-bar" hidden>
           <strong id="object-selected-count"></strong>

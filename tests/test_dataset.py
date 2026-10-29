@@ -50,6 +50,54 @@ def test_list_images_filters_by_label_count(tmp_path):
     assert names(class_id=1, max_labels=1) == ["many.jpg", "sample.jpg"]
     assert dataset.list_images(min_labels=1, limit=1)["total"] == 2
 
+def test_list_objects_filters_and_sorts_by_box_size(tmp_path):
+    dataset, label = make_dataset(tmp_path)  # 100×80 image
+    # 20×32 px; 5×4 px; 90×8 px (wide); 10×64 px (tall)
+    label.write_text("0 0.5 0.5 0.2 0.4\n0 0.5 0.5 0.05 0.05\n0 0.5 0.5 0.9 0.1\n0 0.5 0.5 0.1 0.8\n")
+    dataset = Dataset(tmp_path / "dataset.yaml", "detection")
+
+    def boxes(**kwargs):
+        record = next(iter(dataset.images.values()))
+        return [tuple(round(value * size) for value, size in zip(item["box"], (record.width, record.height))) for item in dataset.list_objects(0, **kwargs)["items"]]
+
+    assert boxes() == [(20, 32), (5, 4), (90, 8), (10, 64)]
+    assert boxes(width=(None, 20)) == [(20, 32), (5, 4), (10, 64)]  # inclusive: 0.2 * 100 is not above 20
+    assert boxes(width=(10, 20), height=(32, None)) == [(20, 32), (10, 64)]
+    assert boxes(unit="percent", width=(50, None)) == [(90, 8)]
+    assert boxes(unit="percent", height=(5, 10)) == [(5, 4), (90, 8)]  # 5% and 10% of the height
+    assert boxes(aspect=(2, None)) == [(90, 8)]
+    assert boxes(aspect=(None, 0.5)) == [(10, 64)]
+    # equal areas (20×32, 10×64) keep the name order
+    assert boxes(sort="smallest") == [(5, 4), (20, 32), (10, 64), (90, 8)]
+    assert boxes(sort="largest") == [(90, 8), (20, 32), (10, 64), (5, 4)]
+    assert boxes(sort="widest") == [(90, 8), (5, 4), (20, 32), (10, 64)]
+    assert boxes(sort="tallest") == [(10, 64), (20, 32), (5, 4), (90, 8)]
+    assert boxes(sort="smallest", width=(10, None)) == [(20, 32), (10, 64), (90, 8)]
+    page = dataset.list_objects(0, sort="largest", width=(10, None), offset=1, limit=1)
+    assert page["total"] == 3
+    assert page["items"][0]["box"] == (0.2, 0.4) and page["items"][0]["image_size"] == [100, 80]
+
+
+def test_list_objects_size_filters_skip_images_of_unknown_size(tmp_path):
+    dataset, _ = make_dataset(tmp_path, "segmentation")
+    split = tmp_path / "train"
+    Image.new("RGB", (100, 80), "white").save(split / "other.jpg")
+    (split / "other.txt").write_text("1 0.1 0.1 0.3 0.1 0.3 0.3\n")
+    dataset = Dataset(tmp_path / "dataset.yaml", "segmentation")
+    unknown = next(record for record in dataset.images.values() if record.path.name == "sample.jpg")
+    unknown.width = unknown.height = 0  # not probed yet
+
+    def names(**kwargs):
+        return [item["image_name"] for item in dataset.list_objects(1, **kwargs)["items"]]
+
+    assert names(width=(1, None)) == ["other.jpg"]  # 20×16 px
+    assert names(sort="smallest") == ["other.jpg", "sample.jpg"]  # an unmeasured object sorts last
+    assert names(unit="percent", width=(50, None)) == ["sample.jpg"]  # percent needs no image size
+    # polygons are measured by their enclosing box: 20×16 px (1.25); while the size is unknown the normalized 0.6 ÷ 0.6
+    assert names(aspect=(1.1, None)) == ["other.jpg"]
+    assert names(aspect=(None, 1.1)) == ["sample.jpg"]
+
+
 def test_annotation_indexes_and_cached_aggregates_refresh_after_write(tmp_path):
     dataset, _ = make_dataset(tmp_path)
     record = next(iter(dataset.images.values()))

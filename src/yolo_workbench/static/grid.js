@@ -147,7 +147,7 @@ export class VirtualGallery {
       return;
     }
     if (this.total === 0) {
-      this.grid.innerHTML = `<p class="empty">${esc(this.emptyMessage)}</p>`;
+      this.grid.innerHTML = `<p class="empty">${esc(typeof this.emptyMessage === "function" ? this.emptyMessage() : this.emptyMessage)}</p>`;
       this.rail.hidden = true;
       return;
     }

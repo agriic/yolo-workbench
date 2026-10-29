@@ -460,8 +460,19 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         return {"items": session.dataset.recent_activity(limit, image_id, user)}
 
     @router.get("/objects")
-    def objects(class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):
-        return session.dataset.list_objects(class_id, split, max(0, offset), limit)
+    def objects(
+        class_id: int, split: str = "all", offset: int = 0, limit: int = Query(100, ge=1, le=500),
+        unit: Literal["px", "percent"] = "px",
+        min_width: float | None = Query(None, ge=0), max_width: float | None = Query(None, ge=0),
+        min_height: float | None = Query(None, ge=0), max_height: float | None = Query(None, ge=0),
+        min_aspect: float | None = Query(None, ge=0), max_aspect: float | None = Query(None, ge=0),
+        sort: Literal["name", "smallest", "largest", "widest", "tallest"] = "name",  # dataset.OBJECT_SORTS
+        session: DatasetSession = current,
+    ):
+        return session.dataset.list_objects(
+            class_id, split, max(0, offset), limit, unit=unit, sort=sort,
+            width=(min_width, max_width), height=(min_height, max_height), aspect=(min_aspect, max_aspect),
+        )
 
     @router.get("/objects/{image_id}/{annotation_id:path}/crop")
     def object_crop(request: Request, image_id: str, annotation_id: str, padding: float = Query(0.15, ge=0, le=1), session: DatasetSession = current):

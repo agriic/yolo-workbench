@@ -137,6 +137,12 @@ def test_image_and_object_endpoints_support_random_access_slices(tmp_path):
             objects_end = (await client.get("/api/v1/objects", params={"class_id": 0, "offset": 6, "limit": 2})).json()
             assert objects_end == {"total": 6, "items": []}
 
+            sized = (await client.get("/api/v1/objects", params={"class_id": 0, "unit": "percent", "max_width": 100, "min_aspect": 0, "sort": "largest"})).json()
+            assert sized["total"] == 6
+            assert (await client.get("/api/v1/objects", params={"class_id": 0, "min_width": 101, "unit": "percent"})).json()["total"] == 0
+            assert (await client.get("/api/v1/objects", params={"class_id": 0, "sort": "random"})).status_code == 422
+            assert (await client.get("/api/v1/objects", params={"class_id": 0, "min_width": -1})).status_code == 422
+
     asyncio.run(run())
 
 

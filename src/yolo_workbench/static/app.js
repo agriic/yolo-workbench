@@ -353,6 +353,16 @@ function bind() {
     $("image-options-toggle").focus();
   });
   [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects({ reset: true }); });
+  const reloadObjectFilters = () => { clearObjectSelection(); loadObjects({ reset: true }); };
+  const reloadObjectFiltersDebounced = debounce(reloadObjectFilters, 250);
+  OBJECT_RANGE_INPUTS.forEach(id => $(id).oninput = reloadObjectFiltersDebounced);
+  $("object-sort").onchange = reloadObjectFilters;
+  $("object-size-unit").onchange = () => { renderObjectSizeUnit(); reloadObjectFilters(); };
+  $("object-filters-reset").onclick = () => {
+    OBJECT_RANGE_INPUTS.forEach(id => $(id).value = "");
+    $("object-sort").value = "name";
+    reloadObjectFilters();
+  };
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
   $("bulk-delete").onclick = () => runObjectBulk("delete");
   $("bulk-clear").onclick = () => { clearObjectSelection(); objectGallery.render(); };
@@ -693,7 +703,9 @@ function setupVirtualGalleries() {
     railId: "object-scroll-labels",
     errorId: "object-load-error",
     noun: "Objects",
-    emptyMessage: "No objects of this class in the selected split.",
+    emptyMessage: () => [...objectFilterParams().keys()].some(key => /^(min|max)_/.test(key))
+      ? "No objects of this class in the selected split match the size filters."
+      : "No objects of this class in the selected split.",
     fetchPage: fetchObjectPage,
     renderCard: renderObjectCard,
     isPinned: item => state.objectSelection.has(objectKey(item)),
@@ -740,10 +752,31 @@ function fetchImagePage(offset, limit, signal) {
   return api(`/images?${params}`, { signal });
 }
 
+// The Exploration tab's size filters (width, height and aspect ranges) and sort as query parameters.
+const OBJECT_RANGE_INPUTS = ["object-min-width", "object-max-width", "object-min-height", "object-max-height", "object-min-aspect", "object-max-aspect"];
+
+function objectFilterParams() {
+  const params = new URLSearchParams();
+  if (state.meta.category === "classification") return params;
+  for (const id of OBJECT_RANGE_INPUTS) {
+    const value = $(id).value.trim();
+    if (value !== "" && Number.isFinite(+value) && +value >= 0) params.set(id.slice("object-".length).replace("-", "_"), value);
+  }
+  if ($("object-sort").value !== "name") params.set("sort", $("object-sort").value);
+  if ([...params.keys()].length) params.set("unit", $("object-size-unit").value);
+  return params;
+}
+
+function renderObjectSizeUnit() {
+  const unit = $("object-size-unit").value === "percent" ? "%" : "px";
+  for (const id of OBJECT_RANGE_INPUTS.slice(0, 4)) $(id).placeholder = `${id.includes("min") ? "min" : "max"} ${unit}`;
+}
+
 function fetchObjectPage(offset, limit, signal) {
   const classId = $("object-class").value || Object.keys(state.meta.names)[0];
   if (classId === undefined) return Promise.resolve({ total: 0, items: [] });
   const params = new URLSearchParams({ class_id: classId, split: $("object-split").value, limit: String(limit), offset: String(offset) });
+  for (const [key, value] of objectFilterParams()) params.set(key, value);
   return api(`/objects?${params}`, { signal });
 }
 
@@ -959,8 +992,17 @@ const reloadObjectsDebounced = debounce(loadObjects, 300);
 
 export async function loadObjects(options = {}) {
   if (!state.meta || !objectGallery) return;
+  $("object-filters-reset").hidden = ![...objectFilterParams().keys()].length;
   await objectGallery.reload(options);
   renderObjectBulkBar();
+}
+
+// The size of an object's box in the unit the filters use (nothing while its image's size is unknown).
+function objectSizeText(item) {
+  if (state.meta.category === "classification") return "";
+  const [width, height] = item.box;
+  if ($("object-size-unit").value === "percent") return `${+(width * 100).toFixed(1)}×${+(height * 100).toFixed(1)}%`;
+  return item.image_size ? `${Math.round(width * item.image_size[0])}×${Math.round(height * item.image_size[1])} px` : "";
 }
 
 function renderObjectCard(item, index) {
@@ -973,7 +1015,7 @@ function renderObjectCard(item, index) {
       </div>
       <div class="card-body">
         <div class="name" title="${esc(item.image_name)}">${esc(item.image_name)}</div>
-        <div class="meta"><span class="split-badge">${esc(item.split)}</span></div>
+        <div class="meta"><span class="split-badge">${esc(item.split)}</span><span title="Box width × height">${objectSizeText(item)}</span></div>
         <div class="object-actions">
           <select data-object-class="${esc(item.id)}" data-owner="${item.image_id}" data-key="${item.key}" title="Reassign class">${classOptions(item.class_id)}</select>
           <button data-open-object="${esc(item.id)}" data-owner="${item.image_id}" title="Open in editor">Open</button>

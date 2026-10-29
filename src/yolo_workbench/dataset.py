@@ -27,6 +27,13 @@ from .review import STATUSES as REVIEW_STATUSES, ReviewStore
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 WORKBENCH_DIR = ".yolo-workbench"  # per-dataset state: backups, size index, trash, upload staging
 SIZE_INDEX_VERSION = 2  # 2: sizes are EXIF-upright
+# list_objects' sorts: the ranked value from an object's (width, height, aspect), smallest first; None sorts last
+OBJECT_SORTS = {
+    "smallest": lambda width, height, aspect: width * height if width is not None else None,
+    "largest": lambda width, height, aspect: -width * height if width is not None else None,
+    "widest": lambda width, height, aspect: -aspect if aspect is not None else None,
+    "tallest": lambda width, height, aspect: aspect,
+}
 SIZE_INDEX_SAVE_INTERVAL = 5.0  # seconds between size-index saves while probing
 CHANGE_LOG_SIZE = 5000  # changes kept for other browsers' polls (older polls reload everything)
 REVIEW_SAVE_DELAY = 5.0  # seconds: "last edited by" bookkeeping is saved at most this often
@@ -39,6 +46,14 @@ _UNKNOWN = object()
 
 def _digest(text: str) -> bytes:
     return hashlib.sha1(text.encode("utf-8")).digest()
+
+
+def _within(value: float | None, bounds: tuple[float | None, float | None]) -> bool:
+    """Whether `value` is inside (min, max), either end None = open; an unknown value is inside only open bounds."""
+    low, high = bounds
+    if low is None and high is None:
+        return True
+    return value is not None and (low is None or value >= low) and (high is None or value <= high)
 
 
 def object_key(annotation: Annotation) -> str:
@@ -993,6 +1008,7 @@ class Dataset:
                 "image_name": record.path.name,
                 "split": record.split,
                 "class_id": annotation.class_id,
+                "box": self._annotation_size(annotation),  # the enclosing box's normalized width and height
             }
             self._object_index.setdefault(annotation.class_id, {})[annotation.id] = item
             keys.append((annotation.class_id, annotation.id))
@@ -1461,17 +1477,50 @@ class Dataset:
                 raise DatasetError(f"Cannot save review status: {exc}") from exc
             self._reviews_dirty = True  # retried with the next change
 
-    def list_objects(self, class_id: int, split="all", offset=0, limit=100) -> dict:
+    def list_objects(self, class_id: int, split="all", offset=0, limit=100, *, unit: str = "px", width=(None, None), height=(None, None), aspect=(None, None), sort: str = "name") -> dict:
+        """One class's objects. `width`/`height` bound the enclosing box (min, max; None = open) in pixels or percent
+        of the image (`unit`), `aspect` its width ÷ height in pixels; `sort` is "name" or one of OBJECT_SORTS (by
+        area in `unit`, or by aspect). An object a bound or the sort cannot measure (image size not probed yet,
+        zero height) is left out by the bound and sorted last."""
         with self._lock:
             items = list(self._object_index.get(class_id, {}).values())
             if split != "all":
                 items = [item for item in items if item["split"] == split]
+            bounds = (width, height, aspect)
+            if any(bound != (None, None) for bound in bounds) or sort != "name":
+                measures = {}
+                for item in items:
+                    measure = self._object_measure(item, unit)
+                    if all(_within(value, bound) for value, bound in zip(measure, bounds)):
+                        measures[item["id"]] = measure
+                items = [item for item in items if item["id"] in measures]
             items.sort(key=lambda item: (item["split"], item["image_name"].casefold(), item["id"]))
+            if sort != "name":
+                rank = OBJECT_SORTS[sort]
+                ranks = {item_id: rank(*measure) for item_id, measure in measures.items()}
+                items.sort(key=lambda item: (ranks[item["id"]] is None, ranks[item["id"]] or 0))  # stable: ties keep name order
             page = []
             for item in items[offset : offset + limit]:
-                annotation = next(a for a in self.images[item["image_id"]].annotations if a.id == item["id"])
-                page.append({**item, "key": object_key(annotation)})
+                record = self.images[item["image_id"]]
+                annotation = next(a for a in record.annotations if a.id == item["id"])
+                image_size = [record.width, record.height] if record.width > 0 and record.height > 0 else None
+                page.append({**item, "key": object_key(annotation), "image_size": image_size})
             return {"total": len(items), "items": page}
+
+    def _object_measure(self, item: dict, unit: str) -> tuple[float | None, float | None, float | None]:
+        """An indexed object's box width and height in `unit` ("px" or "percent") and its pixel aspect (width ÷ height);
+        pixel sizes are None while the image size is unknown, and the aspect is then taken from the normalized box."""
+        box_width, box_height = item["box"]
+        record = self.images[item["image_id"]]
+        known = record.width > 0 and record.height > 0
+        if unit == "percent":
+            width, height = round(box_width * 100, 6), round(box_height * 100, 6)  # 0.2 * 100 is 20.000000000000004
+        elif known:
+            width, height = round(box_width * record.width, 6), round(box_height * record.height, 6)
+        else:
+            width = height = None
+        pixel_width, pixel_height = (box_width * record.width, box_height * record.height) if known else item["box"]
+        return width, height, (round(pixel_width / pixel_height, 6) if pixel_height > 0 else None)
 
     def detail(self, image_id: str) -> dict:
         with self._lock:

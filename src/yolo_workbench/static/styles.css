@@ -244,6 +244,8 @@ body.classification .toolbar-popover { grid-template-columns: minmax(0, 1fr); wi
 .popover-fields .field { gap: 3px; grid-template-columns: minmax(0, 1fr); }
 .popover-fields .field select, .popover-fields .field input { height: 32px; min-width: 0; width: 100%; }
 .count-range { display: flex; align-items: center; gap: 4px; color: var(--text-3); }
+.filters .count-range input { min-width: 0; width: 76px; padding: 0 8px; }
+#object-filters-reset { align-self: center; padding: 16px 0 0; }
 .popover-fields .count-range { min-width: 0; }
 .popover-fields .count-range input { width: auto; flex: 1; padding: 0 6px; }
 .popover-fields .toggle { height: 32px; font-size: 12px; }
@@ -934,6 +936,7 @@ body.classification #overlay-toggle,
 body.classification #prediction-filter-toggle,
 body.classification #label-count-field,
 body.classification #crop-padding-field,
+body.classification .object-size-filter,
 body.classification #draw-class-field,
 body.classification #delete,
 body.classification #predict-image,
