@@ -477,7 +477,8 @@ export function pointerMove(e) {
   if (state.drag) { applyDrag(norm); return render(); }
   if (state.sam.active) {
     $("canvas").style.cursor = state.spaceDown ? "grab" : "crosshair";
-    if (state.hovered) { state.hovered = null; render(); }
+    const predictionChanged = deps.hoverPrediction(null);
+    if (state.hovered || predictionChanged) { state.hovered = null; render(); }
     return deps.samPointerMove({ screen, norm });
   }
   if (state.drawing) {
@@ -486,7 +487,7 @@ export function pointerMove(e) {
     return render();
   }
   // hover feedback
-  let cursor = "crosshair", hovered = null;
+  let cursor = "crosshair", hovered = null, prediction = null;
   if (state.meta.category === "classification") {
     cursor = "grab";
   } else if (state.spaceDown) {
@@ -498,11 +499,17 @@ export function pointerMove(e) {
     } else {
       const found = hitShape(norm);
       if (found) { cursor = "move"; hovered = found.id; }
-      else if (deps.hitPrediction(norm)) cursor = "pointer";
+      else if ((prediction = deps.hitPrediction(norm))) cursor = "pointer";  // a click accepts it
     }
   }
   $("canvas").style.cursor = cursor;
-  if (hovered !== state.hovered) { state.hovered = hovered; render(); }
+  const predictionChanged = deps.hoverPrediction(prediction?.id ?? null, "canvas");
+  if (hovered !== state.hovered || predictionChanged) { state.hovered = hovered; render(); }
+}
+
+export function pointerLeave() {
+  const predictionChanged = deps.hoverPrediction(null);
+  if (state.hovered || predictionChanged) { state.hovered = null; render(); }
 }
 
 export function applyDrag(norm) {

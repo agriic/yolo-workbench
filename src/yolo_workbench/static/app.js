@@ -6,14 +6,14 @@ import { state } from "./state.js";
 import { VirtualGallery } from "./grid.js";
 import {
   applyHistory, bounds, cancelDrawing, closeEditorSession, configureCanvas, deleteSelected,
-  editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerMove,
+  editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerLeave, pointerMove,
   pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
   savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
   updateReviewButtons, updateStatus, zoomAt, zoomTo,
 } from "./canvas.js";
 import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor, confirmAllPending,
-  drawPredictions, hitPrediction, loadEditorPredictions, loadModel, maxPointsChanged, predictImage,
+  drawPredictions, hitPrediction, hoverPrediction, loadEditorPredictions, loadModel, maxPointsChanged, predictImage,
   refreshPredictor, rejectAllPending, rejectPredictions, renderModelMenu, renderPredList,
   retryPredict, runPredict, uploadModel,
 } from "./predictor.js";
@@ -311,6 +311,7 @@ function renderShortcuts() {
     ["D / W", "Review: done / needs work, then next"],
     ["U", "Next unreviewed image"],
     ["P", "Predict with the loaded model"],
+    ["A / R", "Predictions: accept all ≥ min confidence / reject all"],
     ["S", "Smart annotation (SAM): click the object"],
     ["Right click", "SAM: mark background (or Shift+Click)"],
     ["⏎", "SAM: add the outlined object"],
@@ -419,6 +420,11 @@ function bind() {
     if (e.target.closest(".row-delete")) return rejectPredictions([row.dataset.prediction]);
     if (e.target.closest(".row-accept")) return acceptPredictions([row.dataset.prediction]);
   });
+  // the row under the mouse is the prediction being reviewed: drawn bold, the other ghosts fade
+  $("prediction-list").addEventListener("mouseover", e => {
+    if (hoverPrediction(e.target.closest("[data-prediction]")?.dataset.prediction ?? null, "list")) render();
+  });
+  $("prediction-list").addEventListener("mouseleave", () => { if (hoverPrediction(null)) render(); });
 
   $("theme-toggle").onclick = () => {
     const root = document.documentElement;
@@ -541,6 +547,7 @@ function bind() {
   canvas.onpointermove = pointerMove;
   canvas.onpointerup = pointerUp;
   canvas.onpointercancel = pointerUp;
+  canvas.onpointerleave = pointerLeave;
   canvas.oncontextmenu = e => e.preventDefault();
   $("canvas-wrap").addEventListener("wheel", e => {
     if (!state.img) return;
@@ -627,6 +634,12 @@ function keyDown(e) {
     if (key.toLowerCase() === "d") return reviewCurrent("done", true);
     if (key.toLowerCase() === "w") return reviewCurrent("needs_work", true);
     if (key.toLowerCase() === "u") return openNextUnreviewed();
+    // the Predictions panel's Accept all ≥ / Reject all (a held key does not repeat them)
+    if (key.toLowerCase() === "a" || key.toLowerCase() === "r") {
+      const button = $(key.toLowerCase() === "a" ? "accept-all-preds" : "reject-all-preds");
+      if (!e.repeat && !$("prediction-section").hidden && !button.disabled) button.click();
+      return;
+    }
   }
   if (key.toLowerCase() === "s" && !e.ctrlKey && !e.metaKey && !e.altKey) return toggleSam();
   if (key === "Enter" && state.sam.active) { e.preventDefault(); return acceptSam(); }
@@ -1244,6 +1257,7 @@ configureCanvas({
   drawPredictions,
   drawSam,
   hitPrediction,
+  hoverPrediction,
   imageGallery: () => imageGallery,
   loadEditorPredictions,
   loadImages,

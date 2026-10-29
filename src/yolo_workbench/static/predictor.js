@@ -311,29 +311,48 @@ export async function loadEditorPredictions(id) {
 
 export const visiblePredictions = () => state.pred.items.filter(p => p.confidence >= state.pred.minConf);
 
+// The hovered prediction is drawn bold on top; while its row in the list is hovered (the one being reviewed),
+// the other ghosts fade. A hovered row is drawn even below the confidence filter.
 export function drawPredictions(ctx) {
   if (!state.detail || !state.img) return;
-  for (const prediction of visiblePredictions()) {
-    const color = prediction.class_id === null ? UNMAPPED_COLOR : classColor(prediction.class_id);
-    const path = deps.shapePath(prediction);
-    ctx.save();
-    ctx.strokeStyle = color;
+  const hovered = state.pred.items.find(p => p.id === state.pred.hovered) ?? null;
+  const fade = hovered && state.pred.hoverSource === "list";
+  for (const prediction of visiblePredictions())
+    if (prediction !== hovered) drawPrediction(ctx, prediction, fade ? 0.35 : 1, false);
+  if (hovered) drawPrediction(ctx, hovered, 1, true);
+}
+
+function drawPrediction(ctx, prediction, alpha, bold) {
+  const color = prediction.class_id === null ? UNMAPPED_COLOR : classColor(prediction.class_id);
+  const path = deps.shapePath(prediction);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  if (bold) {
+    // solid, filled, with a dark halo so it stands out on any image
+    ctx.fillStyle = `${color}33`;
+    ctx.fill(path);
+    ctx.strokeStyle = "rgb(0 0 0 / 55%)";
+    ctx.lineWidth = 5.5;
+    ctx.stroke(path);
+    ctx.lineWidth = 3;
+  } else {
     ctx.lineWidth = 1.8;
     ctx.setLineDash([7, 5]);
-    ctx.stroke(path);
-    if (state.pred.maxPoints && state.meta.category === "segmentation") {
-      // with a point limit the vertices are what is being tuned: show them
-      ctx.fillStyle = color;
-      for (let i = 0; i < prediction.points.length; i += 2) {
-        const [sx, sy] = deps.toScreen(prediction.points[i], prediction.points[i + 1]);
-        ctx.beginPath();
-        ctx.arc(sx, sy, 2.5, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-    ctx.restore();
-    drawPredictionBadge(ctx, prediction, color);
   }
+  ctx.strokeStyle = color;
+  ctx.stroke(path);
+  if (state.pred.maxPoints && state.meta.category === "segmentation") {
+    // with a point limit the vertices are what is being tuned: show them
+    ctx.fillStyle = color;
+    for (let i = 0; i < prediction.points.length; i += 2) {
+      const [sx, sy] = deps.toScreen(prediction.points[i], prediction.points[i + 1]);
+      ctx.beginPath();
+      ctx.arc(sx, sy, bold ? 3.5 : 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  drawPredictionBadge(ctx, prediction, color);
+  ctx.restore();
 }
 
 export function drawPredictionBadge(ctx, prediction, color) {
@@ -348,15 +367,26 @@ export function drawPredictionBadge(ctx, prediction, color) {
   const width = ctx.measureText(text).width + 10, height = 17;
   const y = sy - height - 1 < 2 ? sy + 1 : sy - height - 1;
   ctx.save();
-  ctx.globalAlpha = 0.85;
+  const alpha = ctx.globalAlpha;  // a faded ghost's badge fades with it
+  ctx.globalAlpha = alpha * 0.85;
   ctx.fillStyle = color;
   ctx.beginPath();
   ctx.roundRect(sx, y, width, height, 3);
   ctx.fill();
-  ctx.globalAlpha = 1;
+  ctx.globalAlpha = alpha;
   ctx.fillStyle = "#fff";
   ctx.fillText(text, sx + 5, y + 12);
   ctx.restore();
+}
+
+// Returns whether it changed (the caller renders). The row is marked too when the ghost is hovered.
+export function hoverPrediction(id, source = null) {
+  if (!id) source = null;
+  if (id === state.pred.hovered && source === state.pred.hoverSource) return false;
+  state.pred.hovered = id;
+  state.pred.hoverSource = source;
+  for (const row of $("prediction-list").children) row.classList.toggle("hover", row.dataset.prediction === id);
+  return true;
 }
 
 export function hitPrediction([x, y]) {
@@ -385,7 +415,7 @@ export function renderPredList() {
     const count = p.points.length / 2;
     const shape = state.meta.category === "segmentation"
       ? ` <span title="${count === p.raw_count ? "Points as the model drew them" : `Simplified from ${p.raw_count} points`}">· ${count} pts</span>` : "";
-    return `<div class="annotation-row pred-row ${p.confidence < state.pred.minConf ? "pred-dim" : ""}" data-prediction="${esc(p.id)}">
+    return `<div class="annotation-row pred-row ${p.confidence < state.pred.minConf ? "pred-dim" : ""} ${p.id === state.pred.hovered ? "hover" : ""}" data-prediction="${esc(p.id)}">
       <span class="swatch" style="background:${unmapped ? UNMAPPED_COLOR : classColor(p.class_id)}"></span>
       <span class="pred-name" title="${esc(name)}">${esc(name)}</span>
       <span class="row-meta">${Math.round(p.confidence * 100)}%${shape}</span>

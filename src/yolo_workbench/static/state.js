@@ -34,6 +34,7 @@ export const state = {
   pred: {
     status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
     modelPath: null, unloaded: null, job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
+    hovered: null, hoverSource: null,  // the prediction under the mouse, and where: "list" (its row) or "canvas" (its ghost)
   },
   sam: {
     status: "unavailable", model: null, message: null, error: null, unloaded: null, poll: null,

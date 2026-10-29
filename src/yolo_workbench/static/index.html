@@ -413,8 +413,8 @@
           <label class="field-label pred-threshold pred-points" id="pred-points-wrap" hidden title="Simplify predicted polygons to at most this many points (empty: keep the model's outline). Applies to pending predictions and is what Accept writes.">Max points per polygon
             <input id="pred-max-points" class="points-limit" type="number" min="3" max="10000" step="1" placeholder="all" inputmode="numeric"></label>
           <div class="pred-actions">
-            <button id="accept-all-preds" class="secondary">Accept all ≥</button>
-            <button id="reject-all-preds" class="secondary">Reject all</button>
+            <button id="accept-all-preds" class="secondary" title="Accept every prediction at or above the min confidence (A)">Accept all ≥</button>
+            <button id="reject-all-preds" class="secondary" title="Reject every prediction of this image (R)">Reject all</button>
           </div>
           <div id="prediction-list"></div>
         </div>
