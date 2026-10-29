@@ -354,9 +354,7 @@ function bind() {
   });
   [$("object-class"), $("object-split")].forEach(el => el.onchange = () => { clearObjectSelection(); loadObjects({ reset: true }); });
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
-  $("bulk-delete").onclick = () => {
-    if (confirm(`Delete ${state.objectSelection.size} annotation${state.objectSelection.size === 1 ? "" : "s"}?`)) runObjectBulk("delete");
-  };
+  $("bulk-delete").onclick = () => runObjectBulk("delete");
   $("bulk-clear").onclick = () => { clearObjectSelection(); objectGallery.render(); };
   $("crop-padding").oninput = () => {
     $("padding-value").textContent = `${Math.round($("crop-padding").value * 100)}%`;
@@ -484,7 +482,7 @@ function bind() {
     const open = e.target.closest("[data-open-object]");
     if (open) return openEditor(open.dataset.owner, open.dataset.openObject);
     const del = e.target.closest("[data-delete-object]");
-    if (del && confirm("Delete this annotation?")) editObject(del.dataset.owner, del.dataset.deleteObject, null);
+    if (del) editObject(del.dataset.owner, del.dataset.deleteObject, null);
   });
   $("object-grid").addEventListener("change", e => {
     const select = e.target.closest("[data-object-class]");
