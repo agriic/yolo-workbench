@@ -27,7 +27,15 @@ export function applyEmbedState(data) {
   embed.status = data.status;
   embed.error = data.error;
   embed.items = data.items;
-  if (!wasReady || embed.status !== "ready") { embed.selection = []; renderEmbedSelection(); }
+  if (!wasReady || embed.status !== "ready") embed.selection = [];
+  else {
+    // the same objects with the server's ids and classes now (deleting a line renumbers the ones after it)
+    const current = new Map(embed.items.map(point => [point.uid, point]));
+    embed.selection = embed.selection.map(point => current.get(point.uid)).filter(Boolean);
+  }
+  embed.hovered = null;
+  $("embed-tooltip").hidden = true;
+  renderEmbedSelection();
   clearTimeout(embed.poll);
   if (embed.status === "computing")
     embed.poll = setTimeout(refreshEmbeddings, 2000);
@@ -365,25 +373,28 @@ export function renderEmbedSelection() {
   const selection = state.embed.selection;
   $("embed-selection-count").textContent = selection.length || "";
   $("embed-clear").hidden = !selection.length;
+  $("embed-delete").hidden = !selection.length;
   const emptyHint = state.embed.mode === "3d"
     ? "Drag a box over visible points to select them. Shift adds to the selection. Ctrl + drag rotates."
     : "Drag a box to select points. Shift adds to the selection. Ctrl + drag pans and scrolling zooms.";
   $("embed-selection").innerHTML = selection.map(point => `
     <div class="embed-object">
-      <img loading="lazy" src="${apiUrl(`/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.version || 0}`)}" alt="">
+      <img loading="lazy" src="${apiUrl(`/objects/${point.image_id}/${encodeURIComponent(point.annotation_id)}/crop?padding=0.15&v=${point.key}.${point.version || 0}`)}" alt="">
       <div class="embed-object-body">
         <div class="name" title="${esc(point.image_name)}">${esc(point.image_name)}</div>
         <div class="meta"><span class="split-badge">${esc(point.split)}</span></div>
         <div class="object-actions">
-          <select data-object-class="${esc(point.annotation_id)}" data-owner="${point.image_id}" title="Reassign class">${deps.classOptions(point.class_id)}</select>
+          <select data-object-class="${esc(point.annotation_id)}" data-owner="${point.image_id}" data-key="${point.key}" title="Reassign class">${deps.classOptions(point.class_id)}</select>
           <button data-open-object="${esc(point.annotation_id)}" data-owner="${point.image_id}" title="Open in editor">Open</button>
         </div>
       </div>
     </div>`).join("") || `<p class="empty-note">${emptyHint}</p>`;
 }
 
-export async function reclassifyEmbedObject(imageId, annotationId, classId) {
-  await deps.editObject(imageId, annotationId, { classId });
+export async function reclassifyEmbedObject(imageId, annotationId, classId, key) {
+  await deps.editObject(imageId, annotationId, { classId, key });
+  if (state.meta.category !== "classification") return refreshEmbeddings();  // the class and key the server has now
+  // a classification image moves to its new class's folder, and the server no longer knows it by this id
   for (const point of state.embed.items)
     if (point.annotation_id === annotationId && point.image_id === imageId) {
       point.class_id = classId;
@@ -393,3 +404,22 @@ export async function reclassifyEmbedObject(imageId, annotationId, classId) {
   renderEmbeddings();
 }
 
+// Deletes the selected objects' annotations in one transaction (Ctrl+Z undoes it). The key names each one even
+// when an edit elsewhere has moved it to another line.
+export async function deleteEmbedSelection() {
+  const operations = state.embed.selection.map(point =>
+    ({ image_id: point.image_id, annotation_id: point.annotation_id, action: "delete", class_id: null, key: point.key }));
+  if (!operations.length) return;
+  const button = $("embed-delete");
+  button.disabled = true;  // a second click would reach the server after the first delete
+  try {
+    await deps.bulkEditObjects(operations, "delete", () => {
+      state.embed.selection = [];
+      renderEmbedSelection();
+      renderEmbeddings();
+      refreshEmbeddings();  // the deleted objects leave the plot
+    });
+  } finally {
+    button.disabled = false;
+  }
+}

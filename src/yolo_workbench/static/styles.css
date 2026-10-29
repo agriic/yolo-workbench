@@ -784,7 +784,9 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   padding: 12px;
   gap: 10px;
 }
-.embed-panel-head { display: flex; align-items: center; justify-content: space-between; }
+.embed-panel-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.embed-panel-head h2, .embed-panel-actions button { white-space: nowrap; }
+.embed-panel-actions { display: flex; gap: 6px; }
 .embed-panel h2 { font-size: 13px; margin: 0; }
 .embed-selection { overflow-y: auto; display: flex; flex-direction: column; gap: 10px; flex: 1; }
 .embed-object { display: flex; gap: 10px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; }
@@ -942,6 +944,7 @@ body.classification #delete,
 body.classification #predict-image,
 body.classification #smart-annotate,
 body.classification #bulk-delete,
+body.classification #embed-delete,
 body.classification #edit-label-text,
 body.classification [data-delete-object],
 body.classification .stats-panel:has(#stats-density),
@@ -1097,7 +1100,7 @@ dialog.modal .field input, dialog.modal .field select, dialog.modal textarea { b
 .lock-banner .link-btn { padding: 0; }
 body.on-training .lock-banner { display: none; }
 /* while a run trains this dataset the server refuses writes; take the write controls out of reach too */
-body.training-locked #image-move-split, body.training-locked #image-move, body.training-locked #image-delete, body.training-locked #object-bulk, body.training-locked .issue-actions,
+body.training-locked #image-move-split, body.training-locked #image-move, body.training-locked #image-delete, body.training-locked #object-bulk, body.training-locked #embed-delete, body.training-locked .issue-actions,
 body.training-locked .fix-all, body.training-locked #class-add-form, body.training-locked #class-table,
 body.training-locked #import-panel, body.training-locked #split-overview .link-btn,
 body.training-locked .pred-actions, body.training-locked #prediction-list, body.training-locked #confirm-all-pending, body.training-locked #editor #delete { opacity: .45; pointer-events: none; }

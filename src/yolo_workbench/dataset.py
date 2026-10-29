@@ -246,7 +246,6 @@ class Dataset:
         self._listing: fsscan.Listing | None = None
         self._lock = threading.RLock()
         self._index_lock = threading.Lock()  # one size-index write at a time (probe threads of load and rescan)
-        self._change_listeners: list = []
         self._schema_listeners: list = []
         self.annotation_generation = 0
         self.schema_generation = 0
@@ -626,8 +625,6 @@ class Dataset:
             if changed:
                 self._record_change([*(record.id for record in added), *(record.id for record in removed), *updated_ids], structure=True, schema=names_changed, kind="rescan")
         self._start_probe(pending)
-        if changed:
-            self._notify_changes([record.id for record in added])
         if names_changed:
             self._notify_schema(None)
         return {"added": len(added), "removed": len(removed), "updated": updated, "names_changed": names_changed}
@@ -1022,9 +1019,6 @@ class Dataset:
             self._issue_index[issue["id"]] = (record, issue)
         self._issue_count += len(record.issues)
 
-    def add_change_listener(self, listener) -> None:
-        self._change_listeners.append(listener)
-
     def add_schema_listener(self, listener) -> None:
         """listener(mapping) after class names change; mapping is old id -> new id (None = removed), or None if unknown."""
         self._schema_listeners.append(listener)
@@ -1035,13 +1029,6 @@ class Dataset:
                 listener(mapping)
             except Exception:
                 pass  # listeners hold derived state only; a committed schema change must stand
-
-    def _notify_changes(self, image_ids: list[str]) -> None:
-        for listener in tuple(self._change_listeners):
-            try:
-                listener(image_ids, self.annotation_generation)
-            except Exception:
-                pass  # cache invalidation must never make a committed label write fail
 
     # ---------- changes other browsers see, and who made them ----------
 
@@ -1750,8 +1737,6 @@ class Dataset:
                 self._record_change(changed_ids)
             if pushed is not None:
                 pushed.revision = self.revision
-        if changed_ids:
-            self._notify_changes(changed_ids)
 
     def _write_label(self, path: Path, before: str, after: str, after_exists: bool) -> int | None:
         """Back up and write (or delete) one label file; returns its new modification time (None: deleted)."""
@@ -1991,8 +1976,6 @@ class Dataset:
                 self.annotation_generation += 1
             if image_ids or schema is not None or resort:
                 self._record_change(image_ids + removed, structure=resort or schema is not None, schema=schema is not None and not schema.layout_only)
-        if image_ids or schema is not None:
-            self._notify_changes(image_ids)
         if schema is not None and not schema.layout_only:
             self._notify_schema(schema.mapping if direction == "redo" else schema.inverse())
         return image_ids, schema is not None

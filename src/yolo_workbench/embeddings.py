@@ -8,7 +8,7 @@ import importlib.util
 import threading
 
 from . import identity, libraries
-from .dataset import Dataset
+from .dataset import Dataset, object_key
 
 
 def fiftyone_available() -> bool:
@@ -16,7 +16,9 @@ def fiftyone_available() -> bool:
 
 
 class EmbeddingsManager:
-    """Computes and caches a 3D patch-embedding visualization of the dataset."""
+    """Computes and caches a 3D patch-embedding visualization of the dataset. The computed objects follow the labels
+    by shape (`_follow`), so the plot outlives edits: what is deleted or reshaped drops out until an undo brings it
+    back, and what is added is in it after the next computation."""
 
     def __init__(self, dataset: Dataset):
         self.dataset = dataset
@@ -27,14 +29,15 @@ class EmbeddingsManager:
         self.enabled = RUNTIME.embeddings_enabled
         self.status = "idle" if self.enabled and fiftyone_available() else "unavailable"
         self.error: str | None = None
-        self.items: list[dict] | None = None
+        self.items: list[dict] | None = None  # as computed: point, image id and shape (compute_gt_viz)
+        self._view: tuple[int, list[dict]] | None = None  # (dataset revision, the items as its labels were then)
         self.source_generation: int | None = None
         self.started_by: dict | None = None
-        dataset.add_change_listener(self._annotations_changed)
-        dataset.add_schema_listener(lambda _mapping: self._annotations_changed([], dataset.annotation_generation))
 
     def payload(self) -> dict:
-        with self._lock:
+        with self.dataset._lock, self._lock:  # every change bumps the revision holding the dataset lock
+            if self.items is not None and (self._view is None or self._view[0] != self.dataset.revision):
+                self._view = (self.dataset.revision, self._follow())
             return {
                 "status": self.status,
                 "error": self.error,
@@ -42,16 +45,39 @@ class EmbeddingsManager:
                 "dimensions": 3,
                 "source_generation": self.source_generation,
                 "started_by": self.started_by,
-                "items": self.items or [],
+                "items": self._view[1] if self.items is not None else [],
             }
 
-    def _annotations_changed(self, _image_ids: list[str], generation: int) -> None:
-        with self._lock:
-            self.items = None
-            self.source_generation = None
-            self.error = None
-            if self.status not in {"unavailable", "computing"}:
-                self.status = "idle"
+    def _follow(self) -> list[dict]:
+        """The computed objects whose shape is still in their image's labels, with that annotation's current id,
+        class and key (ids are line positions: deleting a line renumbers the ones after it). `uid` names an object
+        for as long as these items stand. Identical shapes in one image pair up in order."""
+        view, unmatched = [], {}
+        for uid, item in enumerate(self.items):
+            record = self.dataset.images.get(item["image_id"])
+            if record is None:
+                continue
+            if record.id not in unmatched:
+                shapes = unmatched[record.id] = {}
+                for annotation in record.annotations:
+                    shapes.setdefault(tuple(annotation.points), []).append(annotation)
+            same = unmatched[record.id].get(item["shape"])
+            if not same:
+                continue
+            annotation = same.pop(0)
+            view.append({
+                "uid": uid,
+                "x": item["x"],
+                "y": item["y"],
+                "z": item["z"],
+                "image_id": record.id,
+                "annotation_id": annotation.id,
+                "class_id": annotation.class_id,
+                "key": object_key(annotation),
+                "split": record.split,
+                "image_name": record.path.name,
+            })
+        return view
 
     def start(self) -> dict:
         with self._lock:
@@ -76,6 +102,7 @@ class EmbeddingsManager:
         try:
             items = compute_gt_viz(self.dataset)
             with self._lock:
+                self._view = None
                 if generation == self.dataset.annotation_generation:
                     self.items = items
                     self.source_generation = generation
@@ -95,6 +122,7 @@ class EmbeddingsManager:
 
 
 def compute_gt_viz(dataset: Dataset) -> list[dict]:
+    """One item per embedded object: its 3D point, image id and annotation shape (the points, as a tuple)."""
     libraries.load("fiftyone", "fiftyone.brain")
     import fiftyone as fo
     import fiftyone.brain as fob
@@ -105,6 +133,7 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
     if fo.dataset_exists(name):
         fo.delete_dataset(name)
     ds = fo.Dataset(name)
+    objects = []  # (record, annotation), numbered by each sample's or detection's "workbench" field
     try:
         if dataset.category == "classification":
             # whole-image embeddings: the class covers the entire image, so there are no patches
@@ -112,7 +141,8 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
             for record in dataset.images.values():
                 annotation = record.annotations[0]
                 sample = fo.Sample(filepath=str(record.path), ground_truth=fo.Classification(label=dataset.names.get(annotation.class_id, str(annotation.class_id))))
-                sample["workbench"] = "\x1f".join([record.id, annotation.id, str(annotation.class_id), record.split, record.path.name])
+                sample["workbench"] = str(len(objects))
+                objects.append((record, annotation))
                 samples.append(sample)
             if not samples:
                 raise RuntimeError("The dataset has no images to embed")
@@ -124,7 +154,7 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
             results = fob.compute_visualization(ds, brain_key="gt_viz", method=method, num_dims=num_dims, progress=False)
             result_ids = getattr(results, "sample_ids", None)
             result_ids = list(result_ids) if result_ids is not None and len(result_ids) else list(sample_ids)
-            return _build_items(meta, result_ids, _normalize_3d_points(results.points))
+            return _build_items(meta, objects, result_ids, _normalize_3d_points(results.points))
         samples = []
         for record in dataset.images.values():
             detections = []
@@ -138,7 +168,8 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
                         continue
                     box = [min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)]
                 detection = fo.Detection(label=dataset.names.get(annotation.class_id, str(annotation.class_id)), bounding_box=box)
-                detection["workbench"] = "\x1f".join([record.id, annotation.id, str(annotation.class_id), record.split, record.path.name])
+                detection["workbench"] = str(len(objects))
+                objects.append((record, annotation))
                 detections.append(detection)
             if detections:
                 samples.append(fo.Sample(filepath=str(record.path), ground_truth=fo.Detections(detections=detections)))
@@ -165,28 +196,19 @@ def compute_gt_viz(dataset: Dataset) -> list[dict]:
 
         result_ids = getattr(results, "label_ids", None)
         result_ids = list(result_ids) if result_ids is not None and len(result_ids) else list(label_ids)
-        return _build_items(meta, result_ids, _normalize_3d_points(results.points))
+        return _build_items(meta, objects, result_ids, _normalize_3d_points(results.points))
     finally:
         fo.delete_dataset(name)
 
 
-def _build_items(meta: dict, result_ids: list, points: list[tuple[float, float, float]]) -> list[dict]:
+def _build_items(meta: dict, objects: list, result_ids: list, points: list[tuple[float, float, float]]) -> list[dict]:
     items = []
     for result_id, (x, y, z) in zip(result_ids, points):
-        raw = meta.get(result_id)
-        if not raw:
+        number = meta.get(result_id)
+        if number is None:
             continue
-        image_id, annotation_id, class_id, split, image_name = raw.split("\x1f")
-        items.append({
-            "x": x,
-            "y": y,
-            "z": z,
-            "image_id": image_id,
-            "annotation_id": annotation_id,
-            "class_id": int(class_id),
-            "split": split,
-            "image_name": image_name,
-        })
+        record, annotation = objects[int(number)]
+        items.append({"x": x, "y": y, "z": z, "image_id": record.id, "shape": tuple(annotation.points)})
     return items
 
 

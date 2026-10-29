@@ -19,7 +19,7 @@ import {
 } from "./predictor.js";
 import {
   computeEmbeddings, configureEmbeddings, embedPointerCancel, embedPointerDown, embedPointerMove,
-  embedPointerUp, embedWheel, refreshEmbeddings, reclassifyEmbedObject,
+  deleteEmbedSelection, embedPointerUp, embedWheel, refreshEmbeddings, reclassifyEmbedObject,
   renderEmbeddings, renderEmbedSelection, resetEmbedView, setEmbedMode,
 } from "./embeddings.js";
 import {
@@ -463,13 +463,14 @@ function bind() {
   embedCanvas.onwheel = embedWheel;
   embedCanvas.onpointerleave = () => { state.embed.hovered = null; $("embed-tooltip").hidden = true; renderEmbeddings(); };
   $("embed-clear").onclick = () => { state.embed.selection = []; renderEmbedSelection(); renderEmbeddings(); };
+  $("embed-delete").onclick = deleteEmbedSelection;
   $("embed-selection").addEventListener("click", e => {
     const open = e.target.closest("[data-open-object]");
     if (open) openEditor(open.dataset.owner, open.dataset.openObject);
   });
   $("embed-selection").addEventListener("change", e => {
     const select = e.target.closest("[data-object-class]");
-    if (select) reclassifyEmbedObject(select.dataset.owner, select.dataset.objectClass, +select.value);
+    if (select) reclassifyEmbedObject(select.dataset.owner, select.dataset.objectClass, +select.value, select.dataset.key);
   });
   new ResizeObserver(() => { if ($("embeddings").classList.contains("active")) renderEmbeddings(); }).observe($("embed-wrap"));
 
@@ -1074,7 +1075,12 @@ function clearObjectSelection() {
 async function runObjectBulk(action, classId = null) {
   const operations = [...state.objectSelection.values()].map(item =>
     ({ image_id: item.image_id, annotation_id: item.id, action, class_id: classId, key: item.key }));
-  if (!operations.length) return;
+  if (operations.length) await bulkEditObjects(operations, action, clearObjectSelection);
+}
+
+// Relabels or deletes annotations in one transaction (Ctrl+Z undoes it) and refreshes what lists them;
+// `edited` runs once the server has applied it (to clear the selection that named them).
+async function bulkEditObjects(operations, action, edited) {
   try {
     const result = await api("/objects/bulk", { method: "POST", body: JSON.stringify({ operations, schema_generation: state.meta.schema_generation }) });
     state.canUndo = true;
@@ -1083,7 +1089,7 @@ async function runObjectBulk(action, classId = null) {
     statisticsChanged();
     const skipped = result.skipped.length ? ` · ${result.skipped.length} skipped` : "";
     toast(`${action === "delete" ? "Deleted" : "Relabeled"} ${result.applied} annotation${result.applied === 1 ? "" : "s"} in ${result.files} file${result.files === 1 ? "" : "s"}${skipped} — Ctrl+Z undoes`);
-    clearObjectSelection();
+    edited();
     await Promise.all([loadImages(), loadObjects(), loadIssues()]);
   } catch (error) {
     toast(error.message, "error");
@@ -1338,7 +1344,7 @@ configureSam({ render, save, shapePath, toast, toScreen, updateStatus });
 configureRepair({ datasetChanged, labelsChanged, toast });
 configureCollab({ datasetChanged, imagesChanged, presenceChanged: () => imageGallery?.render(), reloadEditor, toast });
 configureLabelQA({ labelsChanged, openEditor, toast });
-configureEmbeddings({ classOptions, editObject, toast });
+configureEmbeddings({ bulkEditObjects, classOptions, editObject, toast });
 configureManage({
   datasetChanged,
   toast,

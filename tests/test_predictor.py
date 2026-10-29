@@ -9,7 +9,6 @@ from PIL import Image
 
 from test_dataset import make_dataset
 from yolo_workbench.dataset import Dataset, DatasetError
-from yolo_workbench.embeddings import EmbeddingsManager
 from yolo_workbench.jobs import JobManager
 from yolo_workbench.media_cache import MediaCache
 from yolo_workbench.predictor import PredictorManager
@@ -144,22 +143,6 @@ def test_batch_cancellation_is_cooperative(tmp_path):
     assert manager.job["state"] == "cancelled"
     assert manager.job["completed"] == 1
     assert manager.job["cancelled"] == 1
-
-
-def test_annotation_write_invalidates_ready_embeddings(tmp_path):
-    dataset, _ = make_dataset(tmp_path)
-    embeddings = EmbeddingsManager(dataset)
-    embeddings.status = "ready"
-    embeddings.items = [{"annotation_id": "old"}]
-    embeddings.source_generation = dataset.annotation_generation
-    record = next(iter(dataset.images.values()))
-
-    dataset.replace_annotations(record.id, [{"class_id": 0, "points": [0.4, 0.4, 0.1, 0.1]}])
-
-    state = embeddings.payload()
-    assert state["status"] == "idle"
-    assert state["items"] == []
-    assert state["source_generation"] is None
 
 
 def test_only_unlabeled_skips_annotated_images(tmp_path):
