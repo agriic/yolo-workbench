@@ -886,3 +886,44 @@ class PredictorManager:
             chosen, kept = self._take(record.id, prediction_ids)
             self.predictions[record.id] = kept
             return {"rejected": len(chosen), "predictions": _public(kept)}
+
+    def accept_all(self) -> dict:
+        """Accept every image's pending predictions as one transaction (one undo). As per image, unmapped ones stay
+        pending and duplicates of an existing annotation are dropped; an image that fails validation keeps its own."""
+        # the labels are read and written in one step; the dataset lock before ours, as for schema changes
+        with self.dataset._lock:
+            with self._lock:
+                if self.job["state"] == "running":
+                    raise DatasetError("Wait for the prediction run to finish")
+                pending = {image_id: [item for item in items if item["class_id"] is not None] for image_id, items in self.predictions.items()}
+            chosen, dropped = {}, {}
+            for image_id, items in pending.items():
+                record = self.dataset.images.get(image_id)
+                if record is None or not items:
+                    continue
+                fresh = self._filter_new(record, items)
+                dropped[image_id] = {item["id"] for item in items}
+                if fresh:
+                    chosen[image_id] = fresh
+            if not chosen:
+                raise DatasetError("No predictions to accept")
+            result = self.dataset.add_annotations({image_id: [{"class_id": item["class_id"], "points": item["points"]} for item in items] for image_id, items in chosen.items()})
+            skipped = {item["image_id"] for item in result["skipped"]}
+            with self._lock:
+                for image_id, ids in dropped.items():
+                    if image_id not in skipped and image_id in self.predictions:
+                        self.predictions[image_id] = [item for item in self.predictions[image_id] if item["id"] not in ids]
+        return {
+            "accepted": sum(len(chosen[image_id]) for image_id in result["image_ids"]),
+            "images": len(result["image_ids"]),
+            "skipped": result["skipped"],
+        }
+
+    def reject_all(self) -> dict:
+        """Drop every image's pending predictions (nothing on disk changes)."""
+        with self._lock:
+            if self.job["state"] == "running":
+                raise DatasetError("Wait for the prediction run to finish")
+            images = [items for items in self.predictions.values() if items]
+            self.predictions.clear()
+            return {"rejected": sum(len(items) for items in images), "images": len(images)}

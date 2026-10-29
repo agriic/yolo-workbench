@@ -87,6 +87,11 @@
                   <button id="cancel-predict" class="secondary" hidden>Cancel</button>
                   <button id="retry-predict" class="secondary" hidden>Retry failed</button>
                 </div>
+                <div id="pending-row" class="predict-row pending-row" hidden>
+                  <span id="pending-summary" class="pending-summary"></span>
+                  <button id="confirm-all-pending" class="secondary" title="Add the pending predictions of every image to its labels (unmapped classes stay pending); Ctrl+Z undoes the whole batch">Confirm all</button>
+                  <button id="reject-all-pending" class="secondary" title="Discard the pending predictions of every image (the labels are not changed)">Reject all</button>
+                </div>
                 <div id="mapping-panel" class="mapping-panel" hidden>
                   <div class="prediction-options-title">Class mapping</div>
                   <div id="mapping-list" class="mapping-list"></div>

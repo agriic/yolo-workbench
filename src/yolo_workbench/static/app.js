@@ -12,9 +12,9 @@ import {
   updateReviewButtons, updateStatus, zoomAt, zoomTo,
 } from "./canvas.js";
 import {
-  acceptPredictions, applyPredictorState, cancelPredict, configurePredictor,
+  acceptPredictions, applyPredictorState, cancelPredict, configurePredictor, confirmAllPending,
   drawPredictions, hitPrediction, loadEditorPredictions, loadModel, maxPointsChanged, predictImage,
-  refreshPredictor, rejectPredictions, renderModelMenu, renderPredList,
+  refreshPredictor, rejectAllPending, rejectPredictions, renderModelMenu, renderPredList,
   retryPredict, runPredict, uploadModel,
 } from "./predictor.js";
 import {
@@ -391,6 +391,8 @@ function bind() {
   $("run-predict").onclick = runPredict;
   $("cancel-predict").onclick = cancelPredict;
   $("retry-predict").onclick = retryPredict;
+  $("confirm-all-pending").onclick = confirmAllPending;
+  $("reject-all-pending").onclick = rejectAllPending;
   $("mapping-list").addEventListener("change", async e => {
     const select = e.target.closest("[data-model-class]");
     if (!select) return;

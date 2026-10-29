@@ -717,6 +717,17 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def predictor_retry(session: DatasetSession = current):
         return predictor_payload(session, with_model(session, session.predictor.retry_failed))
 
+    @router.post("/predictor/accept-all")
+    def predictor_accept_all(session: DatasetSession = current):
+        with identity.action("accept all predictions"):
+            result = session.predictor.accept_all()
+        return {**result, "predictor": predictor_payload(session, session.predictor.payload())}
+
+    @router.post("/predictor/reject-all")
+    def predictor_reject_all(session: DatasetSession = current):
+        result = session.predictor.reject_all()
+        return {**result, "predictor": predictor_payload(session, session.predictor.payload())}
+
     @router.post("/images/{image_id}/predictions/compute")
     def compute_predictions(image_id: str, session: DatasetSession = current):
         try:

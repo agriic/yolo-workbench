@@ -257,6 +257,7 @@ body.classification .toolbar-popover { grid-template-columns: minmax(0, 1fr); wi
 .predict-row:not(:has(> :not([hidden]))) { display: none; }
 .predict-row .toggle { height: 32px; font-size: 12px; margin-right: auto; }
 .predict-row button { min-height: 32px; padding: 6px 12px; }
+.pending-summary { font-size: 12px; color: var(--text-2); margin-right: auto; }
 
 /* top-bar note of the loaded model; opens the popup */
 .model-chip {
@@ -1096,7 +1097,7 @@ body.on-training .lock-banner { display: none; }
 body.training-locked #image-move-split, body.training-locked #image-move, body.training-locked #image-delete, body.training-locked #object-bulk, body.training-locked .issue-actions,
 body.training-locked .fix-all, body.training-locked #class-add-form, body.training-locked #class-table,
 body.training-locked #import-panel, body.training-locked #split-overview .link-btn,
-body.training-locked .pred-actions, body.training-locked #prediction-list, body.training-locked #editor #delete { opacity: .45; pointer-events: none; }
+body.training-locked .pred-actions, body.training-locked #prediction-list, body.training-locked #confirm-all-pending, body.training-locked #editor #delete { opacity: .45; pointer-events: none; }
 body.training-locked .editor-status::before { content: "Read-only while training"; color: var(--warn); font-weight: 600; }
 
 .training-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 16px; align-items: start; }

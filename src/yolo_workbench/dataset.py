@@ -1503,6 +1503,27 @@ class Dataset:
             self._commit_many([self._prepare(record, raw_annotations, expected_revision)])
             return self.detail(image_id)
 
+    def add_annotations(self, additions: dict[str, list[dict]]) -> dict:
+        """Append annotations to many images in one transaction; skips images that fail validation."""
+        with self._lock:
+            if self.category == "classification":
+                raise DatasetError("Classification images have exactly one class and no geometry")
+            self.check_writable()  # before reading every label file
+            changes, added, skipped = [], [], []
+            for image_id, raw_annotations in additions.items():
+                record = self.images.get(image_id)
+                if record is None:
+                    skipped.append({"image_id": image_id, "image_name": None, "reason": "Image not found"})
+                    continue
+                try:
+                    changes.append(self._prepare(record, [a.as_dict() for a in record.annotations] + raw_annotations))
+                    added.append(image_id)
+                except DatasetError as exc:
+                    skipped.append({"image_id": record.id, "image_name": record.path.name, "reason": str(exc)})
+            if changes:
+                self._commit_many(changes)
+            return {"image_ids": added, "skipped": skipped}
+
     def _commit_moves(self, moves: list[tuple[ImageRecord, int]], history: bool = True, expected_revision: int | None = None) -> None:
         """Reassign classification classes by moving files; all targets are checked before any move."""
         with self._lock:

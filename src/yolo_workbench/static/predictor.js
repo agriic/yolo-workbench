@@ -92,15 +92,68 @@ export function applyPredictorState(data) {
   renderModelChip();
   renderMapping();
   renderModelMenu();
+  renderPending();
   clearTimeout(pred.poll);
   if (running) {
     pred.poll = setTimeout(refreshPredictor, 800);
   } else if (wasRunning) {
-    const count = Object.values(pred.pending).reduce((sum, n) => sum + n, 0);
+    const count = pendingCounts().predictions;
     if (pred.job.state === "done") deps.toast(`Predicted ${pred.job.completed} image${pred.job.completed === 1 ? "" : "s"}${pred.job.failed ? ` · ${pred.job.failed} failed` : ""} · ${count} pending prediction${count === 1 ? "" : "s"}`, pred.job.failed ? "error" : undefined);
     if (pred.job.state === "cancelled") deps.toast(`Prediction cancelled · ${pred.job.completed} completed · ${pred.job.cancelled} skipped`);
     deps.loadImages();
     if (state.detail) loadEditorPredictions(state.detail.id);
+  }
+}
+
+const plural = (count, noun) => `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
+
+const pendingCounts = () => {
+  const counts = Object.values(state.pred.pending).filter(n => n > 0);
+  return { predictions: counts.reduce((sum, n) => sum + n, 0), images: counts.length };
+};
+
+// pending predictions of every image (kept while the model is parked or unloaded): confirm or reject them at once
+export function renderPending() {
+  const { predictions, images } = pendingCounts();
+  $("pending-row").hidden = !predictions;
+  $("pending-summary").textContent = predictions ? `${plural(predictions, "pending prediction")} in ${plural(images, "image")}` : "";
+  const running = state.pred.job.state === "running";
+  $("confirm-all-pending").disabled = running;
+  $("reject-all-pending").disabled = running;
+}
+
+export async function confirmAllPending() {
+  const { predictions, images } = pendingCounts();
+  const unmapped = Object.values(state.pred.mapping).some(value => value === null) ? " Predictions of unmapped classes stay pending." : "";
+  if (!confirm(`Confirm ${plural(predictions, "pending prediction")} in ${plural(images, "image")}?${unmapped} Ctrl+Z undoes the whole batch.`)) return;
+  try {
+    await deps.saveQueue();
+    const result = await api("/predictor/accept-all", { method: "POST" });
+    applyPredictorState(result.predictor);
+    state.canUndo = true;
+    state.canRedo = false;
+    deps.updateHistoryButtons();
+    deps.statisticsChanged();
+    const skipped = result.skipped.length ? ` · ${plural(result.skipped.length, "image")} skipped (${result.skipped[0].reason})` : "";
+    deps.toast(`Confirmed ${plural(result.accepted, "prediction")} in ${plural(result.images, "image")} — Ctrl+Z undoes${skipped}`, result.skipped.length ? "error" : undefined);
+    await Promise.all([deps.loadImages(), deps.loadObjects(), deps.loadIssues()]);
+  } catch (error) {
+    deps.toast(error.message, "error");
+    refreshPredictor();
+  }
+}
+
+export async function rejectAllPending() {
+  const { predictions, images } = pendingCounts();
+  if (!confirm(`Reject ${plural(predictions, "pending prediction")} in ${plural(images, "image")}? They are discarded; the labels do not change.`)) return;
+  try {
+    const result = await api("/predictor/reject-all", { method: "POST" });
+    applyPredictorState(result.predictor);
+    deps.toast(`Rejected ${plural(result.rejected, "prediction")} in ${plural(result.images, "image")}`);
+    deps.loadImages();
+  } catch (error) {
+    deps.toast(error.message, "error");
+    refreshPredictor();
   }
 }
 
@@ -234,6 +287,7 @@ export async function predictImage() {
       deps.render();
     }
     state.pred.pending[id] = data.items.length;
+    renderPending();
     deps.toast(data.items.length ? `${data.items.length} prediction${data.items.length === 1 ? "" : "s"} — click a ghost or use the panel to accept` : "The model found nothing on this image");
     deps.loadImages();
   } catch (error) {
@@ -351,6 +405,7 @@ export async function acceptPredictions(predictionIds, minConfidence = null) {
     await deps.saveQueue();
     const result = await api(`/images/${imageId}/predictions/accept`, { method: "POST", body: JSON.stringify(body) });
     state.pred.pending[imageId] = result.predictions.length;
+    renderPending();
     state.canUndo = true;
     state.canRedo = false;
     deps.updateHistoryButtons();
@@ -373,6 +428,7 @@ export async function rejectPredictions(predictionIds) {
   try {
     const result = await api(`/images/${imageId}/predictions/reject`, { method: "POST", body: JSON.stringify({ prediction_ids: predictionIds }) });
     state.pred.pending[imageId] = result.predictions.length;
+    renderPending();
     if (request === deps.editorRequest() && state.detail?.id === imageId) {
       state.pred.items = result.predictions;
       renderPredList(); deps.render();

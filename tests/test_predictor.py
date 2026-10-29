@@ -222,6 +222,98 @@ def test_reject_never_touches_disk(tmp_path):
     assert label.stat().st_mtime_ns == mtime
 
 
+def predict_two_images(tmp_path, second_label="0 0.2 0.2 0.1 0.1\n"):
+    """Two images, each with a mapped and an unmapped pending prediction."""
+    dataset, label = make_dataset(tmp_path)
+    Image.new("RGB", (100, 80), "white").save(tmp_path / "train" / "second.jpg")
+    second = tmp_path / "train" / "second.txt"
+    second.write_text(second_label)
+    dataset = Dataset(dataset.yaml_path, "detection")
+    manager = PredictorManager(dataset, backend_factory=FakeBackend)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    manager.run()
+    wait_job(manager)
+    return dataset, [label, second], manager
+
+
+def test_accept_all_confirms_every_image_as_one_undo(tmp_path):
+    dataset, labels, manager = predict_two_images(tmp_path)
+    before = [label.read_text() for label in labels]
+    assert manager.accept_all() == {"accepted": 2, "images": 2, "skipped": []}
+    assert all("1 0.85 0.85 0.2 0.2" in label.read_text() for label in labels)
+    assert manager.payload()["pending"] == {image_id: 1 for image_id in dataset.images}  # unmapped stay pending
+    dataset.history("undo")
+    assert [label.read_text() for label in labels] == before
+
+
+def test_accept_all_skips_an_image_that_fails_validation(tmp_path):
+    dataset, labels, manager = predict_two_images(tmp_path, second_label="0 0.2 0.2 0.1 0.1\nnot a label\n")
+    result = manager.accept_all()
+    assert (result["accepted"], result["images"]) == (1, 1)
+    assert [item["image_name"] for item in result["skipped"]] == ["second.jpg"]
+    assert "0.85" in labels[0].read_text()
+    assert labels[1].read_text() == "0 0.2 0.2 0.1 0.1\nnot a label\n"
+    second = next(record for record in dataset.images.values() if record.path.name == "second.jpg")
+    assert len(manager.predictions_for(second.id)["items"]) == 2  # kept to confirm after the repair
+
+
+def test_reject_all_discards_every_image_without_touching_disk(tmp_path):
+    _, labels, manager = predict_two_images(tmp_path)
+    before = [(label.read_text(), label.stat().st_mtime_ns) for label in labels]
+    assert manager.reject_all() == {"rejected": 4, "images": 2}
+    assert manager.payload()["pending"] == {}
+    assert [(label.read_text(), label.stat().st_mtime_ns) for label in labels] == before
+    with pytest.raises(DatasetError):
+        manager.accept_all()  # nothing left
+
+
+def test_accept_all_and_reject_all_wait_for_a_running_batch(tmp_path):
+    dataset, _ = make_dataset(tmp_path)
+    started, release = threading.Event(), threading.Event()
+
+    class BlockingBackend(FakeBackend):
+        def predict(self, image_path):
+            started.set()
+            release.wait(2)
+            return super().predict(image_path)
+
+    manager = PredictorManager(dataset, backend_factory=BlockingBackend)
+    model = tmp_path / "model.pt"
+    model.write_bytes(b"fake")
+    manager.load(str(model))
+    manager.run()
+    assert started.wait(1)
+    with pytest.raises(DatasetError):
+        manager.accept_all()
+    with pytest.raises(DatasetError):
+        manager.reject_all()
+    release.set()
+    wait_job(manager)
+
+
+def test_accept_all_and_reject_all_endpoints(tmp_path):
+    dataset, labels, manager = predict_two_images(tmp_path)
+    app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"), predictor=manager)
+
+    async def run():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            dataset.write_guard = lambda: "training"
+            assert (await client.post("/api/v1/predictor/accept-all")).status_code == 409
+            assert sum(manager.payload()["pending"].values()) == 4  # nothing taken
+            dataset.write_guard = None
+            response = await client.post("/api/v1/predictor/accept-all")
+            assert response.status_code == 200
+            assert (response.json()["accepted"], response.json()["images"]) == (2, 2)
+            assert response.json()["predictor"]["pending"] == {image_id: 1 for image_id in dataset.images}
+            response = await client.post("/api/v1/predictor/reject-all")
+            assert (response.json()["rejected"], response.json()["predictor"]["pending"]) == (2, {})
+            assert (await client.post("/api/v1/predictor/accept-all")).status_code == 400
+
+    asyncio.run(run())
+
+
 def test_set_mapping_updates_pending_predictions(tmp_path):
     dataset, _, manager, model = make_predictor(tmp_path)
     manager.load(str(model))
