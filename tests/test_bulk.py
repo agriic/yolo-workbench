@@ -95,3 +95,19 @@ def test_bulk_fix_missing_labels(tmp_path):
     result = dataset.fix_issues_bulk("missing_label")
     assert result["fixed"] == 1
     assert label.read_text() == ""
+
+
+def test_object_operation_follows_the_shape_after_lines_shift(tmp_path):
+    # Ids are line positions: a gallery drawn before a delete in the same file names the next line by the old id.
+    dataset = make_multi_dataset(tmp_path, {"a": "0 0.1 0.1 0.1 0.1\n0 0.5 0.5 0.1 0.1\n0 0.8 0.8 0.1 0.1\n"})
+    first, second, third = dataset.list_objects(0)["items"]
+    assert dataset.bulk_edit_objects([{"image_id": first["image_id"], "annotation_id": first["id"], "action": "delete", "key": first["key"]}])["applied"] == 1
+    result = dataset.bulk_edit_objects([{"image_id": second["image_id"], "annotation_id": second["id"], "action": "delete", "key": second["key"]}])
+    assert result["applied"] == 1
+    assert (tmp_path / "train" / "a.txt").read_text() == "0 0.8 0.8 0.1 0.1\n"
+    # The same card clicked again: its annotation is gone, so nothing else is deleted in its place.
+    result = dataset.bulk_edit_objects([{"image_id": second["image_id"], "annotation_id": second["id"], "action": "delete", "key": second["key"]}])
+    assert result["applied"] == 0 and result["skipped"][0]["reason"] == "Annotation changed or was deleted"
+    relabel = dataset.bulk_edit_objects([{"image_id": third["image_id"], "annotation_id": third["id"], "action": "relabel", "class_id": 1, "key": third["key"]}])
+    assert relabel["applied"] == 1
+    assert (tmp_path / "train" / "a.txt").read_text() == "1 0.8 0.8 0.1 0.1\n"

@@ -383,7 +383,7 @@ export function renderEmbedSelection() {
 }
 
 export async function reclassifyEmbedObject(imageId, annotationId, classId) {
-  await deps.editObject(imageId, annotationId, a => a.class_id = classId);
+  await deps.editObject(imageId, annotationId, { classId });
   for (const point of state.embed.items)
     if (point.annotation_id === annotationId && point.image_id === imageId) {
       point.class_id = classId;

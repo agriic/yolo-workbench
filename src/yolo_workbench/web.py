@@ -75,6 +75,7 @@ class BulkObjectOperation(BaseModel):
     annotation_id: str
     action: Literal["relabel", "delete"]
     class_id: int | None = None
+    key: str | None = None  # the listed object's `key`: names it even when the id has moved to another line
 
 
 class BulkObjectPayload(BaseModel):

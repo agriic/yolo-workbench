@@ -482,11 +482,14 @@ function bind() {
     const open = e.target.closest("[data-open-object]");
     if (open) return openEditor(open.dataset.owner, open.dataset.openObject);
     const del = e.target.closest("[data-delete-object]");
-    if (del) editObject(del.dataset.owner, del.dataset.deleteObject, null);
+    if (del) {
+      del.disabled = true;  // a second click would reach the server after the first delete
+      editObject(del.dataset.owner, del.dataset.deleteObject, { key: del.dataset.key }).finally(() => del.disabled = false);
+    }
   });
   $("object-grid").addEventListener("change", e => {
     const select = e.target.closest("[data-object-class]");
-    if (select) editObject(select.dataset.owner, select.dataset.objectClass, a => a.class_id = +select.value);
+    if (select) editObject(select.dataset.owner, select.dataset.objectClass, { classId: +select.value, key: select.dataset.key });
   });
   $("issue-summary").addEventListener("click", e => {
     const show = e.target.closest("[data-show-kind]");
@@ -964,7 +967,7 @@ function renderObjectCard(item, index) {
   const padding = $("crop-padding").value;
   return `<article class="card object-card">
       <div class="thumb">
-        <img loading="lazy" src="${apiUrl(`/objects/${item.image_id}/${encodeURIComponent(item.id)}/crop?padding=${padding}`)}" alt="">
+        <img loading="lazy" src="${apiUrl(`/objects/${item.image_id}/${encodeURIComponent(item.id)}/crop?padding=${padding}&v=${item.key}`)}" alt="">
         <input type="checkbox" class="card-check" data-index="${index}" title="Select (Shift-click for range)" ${state.objectSelection.has(objectKey(item)) ? "checked" : ""}>
         <span class="class-tag" style="background:${classColor(item.class_id)}">${esc(state.meta.names[item.class_id] ?? `class ${item.class_id}`)}</span>
       </div>
@@ -972,15 +975,17 @@ function renderObjectCard(item, index) {
         <div class="name" title="${esc(item.image_name)}">${esc(item.image_name)}</div>
         <div class="meta"><span class="split-badge">${esc(item.split)}</span></div>
         <div class="object-actions">
-          <select data-object-class="${esc(item.id)}" data-owner="${item.image_id}" title="Reassign class">${classOptions(item.class_id)}</select>
+          <select data-object-class="${esc(item.id)}" data-owner="${item.image_id}" data-key="${item.key}" title="Reassign class">${classOptions(item.class_id)}</select>
           <button data-open-object="${esc(item.id)}" data-owner="${item.image_id}" title="Open in editor">Open</button>
-          <button data-delete-object="${esc(item.id)}" data-owner="${item.image_id}" title="Delete annotation">×</button>
+          <button data-delete-object="${esc(item.id)}" data-owner="${item.image_id}" data-key="${item.key}" title="Delete annotation">×</button>
         </div>
       </div>
     </article>`;
 }
 
-const objectKey = item => `${item.image_id}|${item.id}`;
+// Ids are line positions and move when an earlier line of the file is deleted, so a selection follows the
+// object's shape (identical duplicates are selected together).
+const objectKey = item => `${item.image_id}|${item.key}`;
 
 async function handleObjectCheck(check, shiftKey) {
   if (state.objectSelectionBusy) {
@@ -1026,7 +1031,7 @@ function clearObjectSelection() {
 
 async function runObjectBulk(action, classId = null) {
   const operations = [...state.objectSelection.values()].map(item =>
-    ({ image_id: item.image_id, annotation_id: item.id, action, class_id: classId }));
+    ({ image_id: item.image_id, annotation_id: item.id, action, class_id: classId, key: item.key }));
   if (!operations.length) return;
   try {
     const result = await api("/objects/bulk", { method: "POST", body: JSON.stringify({ operations, schema_generation: state.meta.schema_generation }) });
@@ -1059,15 +1064,13 @@ async function labelsChanged(imageId, detail) {
   await Promise.all([loadImages(), loadObjects(), loadIssues()].map(task => task.catch(error => toast(error.message, "error"))));
 }
 
-export async function editObject(imageId, id, change) {
+// Deletes one annotation, or gives it `classId`. `key` is the listed object's: the id is a line position, and once an
+// earlier line of the file is deleted it names the next annotation — the key keeps the edit on the one shown.
+export async function editObject(imageId, id, { classId = null, key = null } = {}) {
+  const operation = { image_id: imageId, annotation_id: id, action: classId == null ? "delete" : "relabel", class_id: classId, key };
   try {
-    const detail = await api(`/images/${imageId}`);
-    if (change) change(detail.annotations.find(a => a.id === id));
-    else detail.annotations = detail.annotations.filter(a => a.id !== id);
-    await api(`/images/${imageId}/annotations`, {
-      method: "PUT",
-      body: JSON.stringify({ revision: detail.revision, schema_generation: state.meta.schema_generation, annotations: detail.annotations }),
-    });
+    const result = await api("/objects/bulk", { method: "POST", body: JSON.stringify({ operations: [operation], schema_generation: state.meta.schema_generation }) });
+    if (!result.applied) throw new Error(result.skipped[0]?.reason || "Annotation not found");
     state.canUndo = true;
     state.canRedo = false;
     updateHistoryButtons();

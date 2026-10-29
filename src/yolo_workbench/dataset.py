@@ -41,6 +41,12 @@ def _digest(text: str) -> bytes:
     return hashlib.sha1(text.encode("utf-8")).digest()
 
 
+def object_key(annotation: Annotation) -> str:
+    """An annotation's class and shape, digested. Ids are line positions, so they name another line once an earlier
+    line of the file is deleted; the object gallery sends this key with an operation to name the one it showed."""
+    return hashlib.sha1(f"{annotation.class_id}:{annotation.points!r}".encode()).hexdigest()[:16]
+
+
 class DatasetError(ValueError):
     pass
 
@@ -1461,7 +1467,11 @@ class Dataset:
             if split != "all":
                 items = [item for item in items if item["split"] == split]
             items.sort(key=lambda item: (item["split"], item["image_name"].casefold(), item["id"]))
-            return {"total": len(items), "items": items[offset : offset + limit]}
+            page = []
+            for item in items[offset : offset + limit]:
+                annotation = next(a for a in self.images[item["image_id"]].annotations if a.id == item["id"])
+                page.append({**item, "key": object_key(annotation)})
+            return {"total": len(items), "items": page}
 
     def detail(self, image_id: str) -> dict:
         with self._lock:
@@ -2258,6 +2268,13 @@ class Dataset:
             count = 0
             for operation in group:
                 annotation = next((a for a in annotations if a.id == operation["annotation_id"]), None)
+                key = operation.get("key")
+                if key is not None and (annotation is None or object_key(annotation) != key):
+                    # the file changed since the client listed it: the shape it showed decides, not the line
+                    annotation = next((a for a in annotations if object_key(a) == key), None)
+                    if not annotation:
+                        skipped.append({"image_id": image_id, "annotation_id": operation["annotation_id"], "reason": "Annotation changed or was deleted"})
+                        continue
                 if not annotation:
                     skipped.append({"image_id": image_id, "annotation_id": operation["annotation_id"], "reason": "Annotation not found"})
                     continue
