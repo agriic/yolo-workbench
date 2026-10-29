@@ -10,6 +10,7 @@ from PIL import Image
 from test_dataset import make_dataset
 from yolo_workbench.dataset import DatasetError
 from yolo_workbench.media_cache import MediaCache
+from yolo_workbench.masks import mask_trace
 from yolo_workbench.sam import BASE, LARGE, SamManager, drop_specks, mask_box, mask_outlines
 from yolo_workbench.web import create_app
 
@@ -93,7 +94,7 @@ def test_detection_returns_box_around_mask(tmp_path):
     assert result["found"]
     # positive points at x=30,50 y=40 → mask x 20..60, y 30..50
     assert result["points"] == pytest.approx([0.4, 0.5, 0.4, 0.25])
-    assert len(result["outlines"]) == 1 and len(result["outlines"][0]) >= 6
+    assert len(result["mask"]) == 1 and len(result["mask"][0]) >= 6
 
 
 class SpeckledSam(FakeSam):
@@ -111,7 +112,7 @@ def test_specks_do_not_stretch_the_box(tmp_path):
     manager = ready_manager(SpeckledSam)
     result = manager.segment(record.path, "detection", [{"x": 0.3, "y": 0.5, "positive": True}, {"x": 0.5, "y": 0.5, "positive": True}], None)
     assert result["points"] == pytest.approx([0.4, 0.5, 0.4, 0.25])  # as without the speck
-    assert len(result["outlines"]) == 1
+    assert len(result["mask"]) == 1
 
 
 def test_segmentation_returns_polygon_and_box_prompt_works(tmp_path):
@@ -124,6 +125,23 @@ def test_segmentation_returns_polygon_and_box_prompt_works(tmp_path):
     assert len(xs) >= 3 and len(result["points"]) % 2 == 0
     assert min(xs) == pytest.approx(0.1) and max(xs) == pytest.approx(0.59, abs=0.011)
     assert min(ys) == pytest.approx(0.25) and max(ys) == pytest.approx(0.4875, abs=0.013)
+
+
+def test_segmentation_shows_every_part_and_adds_the_largest(tmp_path):
+    dataset, _ = make_dataset(tmp_path, "segmentation")  # 100×80 image
+    record = next(iter(dataset.images.values()))
+
+    class TwoPartSam(FakeSam):
+        def segment(self, features, shape, points, labels, box):
+            mask = np.zeros(shape, dtype=bool)
+            mask[10:50, 10:50] = True
+            mask[20:40, 70:90] = True  # e.g. a part beyond an occluder, or something the next click should remove
+            return mask, 0.9
+
+    result = ready_manager(TwoPartSam).segment(record.path, "segmentation", [{"x": 0.3, "y": 0.4, "positive": True}], None)
+    largest, other = result["mask"]
+    assert result["points"] == largest
+    assert min(other[0::2]) == pytest.approx(0.7)
 
 
 def test_prompt_validation(tmp_path):
@@ -150,6 +168,7 @@ def test_mask_helpers_cover_every_part():
     largest, small = mask_outlines(mask)  # every part, largest first
     assert min(largest[0::2]) == pytest.approx(0.5) and min(largest[1::2]) == pytest.approx(0.5)
     assert max(small[0::2]) == pytest.approx(0.15) and max(small[1::2]) == pytest.approx(0.3)
+    assert mask_trace(mask) == [largest, small]  # rectangles: nothing to simplify
 
 
 def test_drop_specks_keeps_object_parts():
@@ -244,6 +263,21 @@ def test_point_limit_fits_vertices_into_rounded_corners():
     assert mask_outlines(mask, max_points=1000) == [mask_outlines(mask, max_points=1000)[0]]  # under the limit: untouched
 
 
+def test_mask_trace_follows_the_mask_edge():
+    import cv2
+
+    mask, _ = rounded_rectangle_mask()
+    height, width = mask.shape
+    (trace,) = mask_trace(mask)
+    polygon = np.round(np.array(trace).reshape(-1, 2) * [width, height]).astype(np.int32)
+    assert len(polygon) > 2 * (len(mask_outlines(mask)[0]) // 2)  # finer than the polygon the editor gets
+    contour = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0].reshape(-1, 2)
+    on_edge = {tuple(point) for point in contour.tolist()}
+    assert all(tuple(point) in on_edge for point in polygon.tolist())
+    redrawn = cv2.fillPoly(np.zeros(mask.shape, np.uint8), [polygon], 1).astype(bool)
+    assert (redrawn != mask).sum() < len(contour) / 4  # only the pixel staircase is smoothed away
+
+
 def test_segment_applies_the_point_limit(tmp_path):
     image = tmp_path / "large.png"
     Image.new("RGB", (640, 480)).save(image)
@@ -256,7 +290,8 @@ def test_segment_applies_the_point_limit(tmp_path):
     prompt = [{"x": 0.5, "y": 0.5, "positive": True}]
     assert len(manager.segment(image, "segmentation", prompt, None)["points"]) > 16
     limited = manager.segment(image, "segmentation", prompt, None, max_points=5)
-    assert len(limited["points"]) // 2 <= 5 and limited["outlines"] == [limited["points"]]
+    assert len(limited["points"]) // 2 <= 5
+    assert limited["mask"] == mask_trace(rounded_rectangle_mask()[0])  # the mask is shown as it is, not simplified
     box = manager.segment(image, "detection", prompt, None, max_points=5)["points"]
     assert len(box) == 4  # boxes ignore the limit
 

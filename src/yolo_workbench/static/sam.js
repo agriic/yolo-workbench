@@ -267,31 +267,39 @@ const clampPoint = ([x, y]) => [Math.min(1, Math.max(0, x)), Math.min(1, Math.ma
 
 /* ---------- drawing ---------- */
 
+// the class color mixed with white: the line of what ⏎ adds, told apart from the mask's own edge
+const lighten = (hex, amount) => `#${[1, 3, 5].map(i =>
+  Math.round(parseInt(hex.slice(i, i + 2), 16) * (1 - amount) + 255 * amount).toString(16).padStart(2, "0")).join("")}`;
+
 export function drawSam(ctx) {
   const s = sam();
   if (!s.active || !state.img || !state.detail) return;
   const color = classColor(+$("draw-class").value);
   if (s.result?.found) {
-    const outline = new Path2D();
-    for (const part of s.result.outlines) {
+    // SAM's mask as it is, filled: the shape further clicks steer
+    const mask = new Path2D();
+    for (const part of s.result.mask) {
       for (let i = 0; i < part.length; i += 2) {
         const [sx, sy] = deps.toScreen(part[i], part[i + 1]);
-        i === 0 ? outline.moveTo(sx, sy) : outline.lineTo(sx, sy);
+        i === 0 ? mask.moveTo(sx, sy) : mask.lineTo(sx, sy);
       }
-      outline.closePath();
+      mask.closePath();
     }
     ctx.save();
     ctx.fillStyle = `${color}40`;
-    ctx.fill(outline);
+    ctx.fill(mask);
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
-    ctx.stroke(outline);
-    if (state.meta.category === "detection") {
-      ctx.setLineDash([6, 4]);
-      ctx.stroke(deps.shapePath({ points: s.result.points }));
-    } else if (currentMaxPoints()) {
+    ctx.stroke(mask);
+    // what ⏎ adds, unfilled and lighter: the box, or the simplified polygon
+    const added = lighten(color, 0.6);
+    ctx.strokeStyle = added;
+    ctx.lineWidth = 1.5;
+    if (state.meta.category === "detection") ctx.setLineDash([6, 4]);
+    ctx.stroke(deps.shapePath({ points: s.result.points }));
+    if (state.meta.category === "segmentation" && currentMaxPoints()) {
       // with a point limit the vertices are what is being tuned: show them
-      ctx.fillStyle = color;
+      ctx.fillStyle = added;
       for (let i = 0; i < s.result.points.length; i += 2) {
         const [sx, sy] = deps.toScreen(s.result.points[i], s.result.points[i + 1]);
         ctx.beginPath();
@@ -336,6 +344,6 @@ export function samHint() {
   if (s.encoding === state.detail?.id) return "Encoding the image for SAM…";
   if (s.busy) return "SAM is segmenting…";
   if (s.result && !s.result.found) return "SAM found nothing here · add a point on the object or press Esc to start over";
-  if (s.result?.found) return "⏎ adds the annotation · click more points to refine · right click / Shift+click marks background · ⌫ undoes a point · Esc clears";
+  if (s.result?.found) return "⏎ adds the light outline · click more points to refine the filled mask · right click / Shift+click marks background · ⌫ undoes a point · Esc clears";
   return "Smart annotation: click the object · right click / Shift+click marks background · drag a box around it · S turns it off";
 }

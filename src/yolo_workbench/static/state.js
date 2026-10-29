@@ -43,7 +43,7 @@ export const state = {
     points: [],          // {x, y, positive} prompts, normalized
     box: null,           // [x1, y1, x2, y2] box prompt, normalized
     press: null, drag: null,
-    result: null,        // {found, score, outlines, points} from the server
+    result: null,        // {found, score, mask, points} from the server: SAM's mask outline, what ⏎ adds
     busy: false, request: 0, encoding: null, encoded: null,
   },
   embed: {

@@ -40,8 +40,30 @@ def mask_outlines(mask: np.ndarray, max_points: int | None = None) -> list[list[
             raw = [value for x, y in contour.reshape(-1, 2).tolist() for value in (x / width, y / height)]
             outlines.append(simplify_polygon(raw, max_points, width, height))
         else:
-            outlines.append([round(min(max(value, 0.0), 1.0), 6) for x, y in polygon.tolist() for value in (x / width, y / height)])
+            outlines.append(_normalized(polygon, width, height))
     return outlines
+
+
+TRACE_TOLERANCE = 0.5  # px: a traced mask outline stays this close to the mask's edge
+
+
+def mask_trace(mask: np.ndarray) -> list[list[float]]:
+    """The mask's own outline, to show it: the external contour of each part (≥3 points), largest first, as
+    normalized x,y pairs within half a pixel of the mask's edge — only its pixel staircase is smoothed away."""
+    import cv2
+
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    height, width = mask.shape
+    traces = []
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        polygon = cv2.approxPolyDP(contour, TRACE_TOLERANCE, True).reshape(-1, 2)
+        if len(polygon) >= 3:
+            traces.append(_normalized(polygon, width, height))
+    return traces
+
+
+def _normalized(polygon: np.ndarray, width: int, height: int) -> list[float]:
+    return [round(min(max(value, 0.0), 1.0), 6) for x, y in polygon.tolist() for value in (x / width, y / height)]
 
 
 FIT_ROUNDS = 6  # line-fit / re-split rounds after Douglas–Peucker picks the vertices

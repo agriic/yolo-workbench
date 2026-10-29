@@ -22,7 +22,7 @@ from PIL import Image, ImageOps
 
 from . import libraries
 from .dataset import DatasetError
-from .masks import drop_specks, mask_box, mask_outlines
+from .masks import drop_specks, mask_box, mask_outlines, mask_trace
 from .media_cache import default_weights_dir
 from .predictor import ultralytics_available
 
@@ -278,10 +278,12 @@ class SamManager:
             box_px = None if box is None else [box[0] * width, box[1] * height, box[2] * width, box[3] * height]
             mask, score = backend.segment(features, (height, width), pixels, labels, box_px)
         mask = drop_specks(mask)
-        outlines = mask_outlines(mask, max_points if category == "segmentation" else None) if mask.sum() >= MIN_AREA else []
-        if not outlines:
-            return {"found": False, "score": score, "outlines": [], "points": []}
-        # outlines show exactly what is added: a box around every part, or the largest part as the polygon
-        if category == "detection":
-            return {"found": True, "score": round(score, 4), "outlines": outlines, "points": mask_box(mask)}
-        return {"found": True, "score": round(score, 4), "outlines": outlines[:1], "points": outlines[0]}
+        # `mask` traces SAM's mask (every part) for the editor to fill, so the next click can steer toward
+        # the object's shape; `points` is what ⏎ adds: a box around every part, or the largest part as the polygon
+        parts, points = [], []
+        if mask.sum() >= MIN_AREA:
+            parts = mask_trace(mask)
+            points = mask_box(mask) if category == "detection" else next(iter(mask_outlines(mask, max_points)), [])
+        if not parts or not points:
+            return {"found": False, "score": score, "mask": [], "points": []}
+        return {"found": True, "score": round(score, 4), "mask": parts, "points": points}
