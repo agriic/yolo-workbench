@@ -58,7 +58,7 @@ from .frameworks import (  # noqa: F401  (re-exported: the Ultralytics argument 
     validate_args,
 )
 from .fsutil import WINDOWS, ensure_free_space, replace
-from .jobs import Job, JobCancelled, JobManager
+from .jobs import IMAGE_JOBS, Job, JobCancelled, JobManager
 from .media_cache import default_weights_dir
 
 log = logging.getLogger(__name__)
@@ -442,8 +442,9 @@ class TrainingManager:
                     self._queue["queue"].pop(0)  # the run folder was deleted by hand
                     self._save_queue()
                     continue
-                if self.jobs.running(entry.get("project"), "import"):
-                    self._write_state(run_dir, status="queued", waiting="an import into this dataset is running")
+                busy = self.jobs.running(entry.get("project"), tuple(IMAGE_JOBS))
+                if busy:
+                    self._write_state(run_dir, status="queued", waiting=f"{IMAGE_JOBS[busy[0]['kind']]} in this dataset")
                     break
                 self._launch(entry, target, run_dir)
             self._refresh_lock()

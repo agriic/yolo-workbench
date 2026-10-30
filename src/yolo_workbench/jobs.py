@@ -1,6 +1,6 @@
 """Background jobs with progress, polled by the UI via /api/v1/jobs.
 
-Import is the first user. The record shape (project, kind, progress, message,
+Imports and image resizing use it. The record shape (project, kind, progress, message,
 result/error, cancel) is meant to also fit future long-running work such as
 training runs executed in a subprocess.
 """
@@ -18,6 +18,8 @@ from . import identity
 log = logging.getLogger(__name__)
 
 MAX_FINISHED = 50
+# jobs that write a dataset's image files: a queued training run and closing the project wait for them
+IMAGE_JOBS = {"import": "an import is running", "resize": "images are being resized"}
 
 
 class JobCancelled(Exception):
@@ -167,7 +169,8 @@ class JobManager:
                 thread.join(max(0.0, end - time.monotonic()))
         return [job.title for job in running if job.state == "running"]
 
-    def running(self, project: str | None, kind: str | None = None) -> list[dict]:
+    def running(self, project: str | None, kind: str | tuple[str, ...] | None = None) -> list[dict]:
+        kinds = (kind,) if isinstance(kind, str) else kind
         with self._lock:
-            jobs = [job for job in self._jobs.values() if job.state == "running" and job.project == project and kind in (None, job.kind)]
+            jobs = [job for job in self._jobs.values() if job.state == "running" and job.project == project and (kinds is None or job.kind in kinds)]
         return [job.payload() for job in jobs]

@@ -1,6 +1,7 @@
 """What the workbench keeps inside a dataset: per-session trash and backups under .yolo-workbench/.
 
-Deleting images (or a classification class) moves files into trash/<session>/, and the first
+Deleting images (or a classification class) moves files into trash/<session>/ (resizing images keeps the
+originals there too), and the first
 write to each label file in a session copies it into backups/<session>/. Both mirror the
 dataset-relative paths, so a session's trash can be put back where it came from. Undo covers
 the current session (and older trash it still points into); older sessions are restored or
@@ -26,6 +27,8 @@ log = logging.getLogger(__name__)
 KINDS = ("trash", "backups")
 SESSION_PATTERN = re.compile(r"^\d{8}-\d{6}$")
 FOLDER_TRASH = "_folders"  # classification class folders keep their own subtree (see classes._trash_dir)
+# image versions the undo history swaps in and out (resize.py): they have no dataset path of their own to go back to
+VERSION_TRASH = "_versions"
 
 
 def _session_dir(dataset: Dataset, kind: str, session: str) -> Path:
@@ -85,6 +88,8 @@ def restore_trash(dataset: Dataset, session: str) -> dict:
         restored, skipped = 0, []
         for path in sorted(_files(directory)):
             relative = path.relative_to(directory)
+            if relative.parts and relative.parts[0] == VERSION_TRASH:
+                continue
             if relative.parts and relative.parts[0] == FOLDER_TRASH:
                 relative = Path(*relative.parts[1:])
             target = dataset.root / relative

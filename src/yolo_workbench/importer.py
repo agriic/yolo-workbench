@@ -6,6 +6,7 @@ with the chosen class mapping. A source with COCO annotation files has its objec
 converted to YOLO lines (its .txt files are not used). An optional crop (centered, or
 a region) re-encodes the images and clips the labels to it. Imports are not on the undo
 stack (delete the images to reverse one) but each is logged to .yolo-workbench/imports.jsonl.
+An optional resize (resize.py) then scales the images to fit within a size; the labels need no change.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from pathlib import Path, PurePosixPath
 import yaml
 from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
 
-from . import classes, fsscan, imaging
+from . import classes, fsscan, imaging, resize
 from .dataset import IMAGE_EXTENSIONS, READ_WORKERS, WORKBENCH_DIR, Dataset, DatasetError
 from .fsutil import ensure_free_space, replace
 from .jobs import Job
@@ -39,7 +40,6 @@ STAGING_PATTERN = re.compile(r"^[a-f0-9]{16}$")
 UNASSIGNED = ""  # classification images that are not inside a class folder
 SAMPLE_COUNT = 24  # images offered for the crop preview, spread over the whole import
 MIN_VISIBLE = 0.1  # a cropped object keeping less of its area than this is dropped (Ultralytics' area_thr)
-ORIENTATION = 0x0112  # EXIF tag
 
 
 # ---------- staging (browser uploads) ----------
@@ -815,41 +815,27 @@ def crop_label_text(text: str, box: tuple[int, int, int, int], width: int, heigh
     return "".join(lines), dropped
 
 
-def _encode(image: Image.Image, source: Image.Image, suffix: str) -> bytes:
-    """Encode a cropped image in the source's format, keeping its ICC profile and EXIF (minus orientation)."""
-    image_format = Image.registered_extensions().get(suffix.lower(), "PNG")
-    params: dict = {}
-    if image_format in ("JPEG", "WEBP"):
-        params["quality"] = 95
-    if image_format == "JPEG" and image.mode not in ("RGB", "L", "CMYK"):
-        image = image.convert("RGB")
-    if source.info.get("icc_profile"):
-        params["icc_profile"] = source.info["icc_profile"]
-    exif = source.getexif()
-    if exif and image_format in ("JPEG", "WEBP", "PNG", "TIFF"):
-        exif.pop(ORIENTATION, None)
-        params["exif"] = exif.tobytes()
-    output = io.BytesIO()
-    image.save(output, image_format, **params)
-    return output.getvalue()
-
-
-def crop_image(path: Path, crop: dict) -> dict | None:
-    """Crop one image: {"data": bytes or None (the box is the whole image: copy unchanged), "box", "size"}.
+def crop_image(path: Path, crop: dict | None, fit: dict | None = None) -> dict | None:
+    """Crop one image (crop None: the whole image), then resize it to fit (`fit`: resize.resize_options):
+    {"data": bytes or None (neither changes it: copy unchanged), "box" (None: not cropped), "size", "resized"}.
 
     None when the region misses the image or the image cannot be read.
     """
     try:
         with Image.open(path) as source:
-            upright = ImageOps.exif_transpose(source)
-            width, height = upright.size
-            box = crop_box(width, height, crop)
+            width, height = imaging.upright_size(source)
+            box = crop_box(width, height, crop) if crop else (0, 0, width, height)
             if box is None:
                 return None
-            if box == (0, 0, width, height):
-                return {"data": None, "box": box, "size": (width, height)}
-            return {"data": _encode(upright.crop(box), source, path.suffix), "box": box, "size": (width, height)}
-    except (OSError, UnidentifiedImageError, ValueError):
+            cropped = box != (0, 0, width, height)
+            target = resize.fit_size(box[2] - box[0], box[3] - box[1], fit) if fit else None
+            if not cropped and target is None:
+                return {"data": None, "box": None, "size": (width, height), "resized": False}
+            image = ImageOps.exif_transpose(source)
+            image = image.crop(box) if cropped else image
+            image = resize.scaled(image, target) if target else image
+            return {"data": imaging.encode(image, source, path.suffix), "box": box if cropped else None, "size": (width, height), "resized": target is not None}
+    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
         return None
 
 
@@ -1024,12 +1010,13 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
     chosen = options.get("folders") or {}
     folders = {split: dataset.resolve_folder(split, chosen.get(split)) for split in {item["target"] for item in items}}
     crop = crop_options(options.get("crop"))
+    fit = resize.resize_options(options.get("resize"))
     mapping = _resolve_mapping(dataset, scanned, options.get("mapping"))
     label_mapping = {int(key): value for key, value in mapping.items()} if scanned["format"] == "yolo" and dataset.category != "classification" and scanned["names_source"] else None
     # the dataset's image sizes as it knows them: no stat per image
     fingerprints = _Fingerprints((record.path, record.image_size) for record in list(dataset.images.values())) if options.get("skip_duplicates", True) else None
     planned: set[Path] = set()
-    stats = {"imported": 0, "labels": 0, "duplicates": 0, "dropped": 0, "renamed": 0, "cropped": 0, "crop_skipped": 0, "objects_cropped_out": 0, "objects_skipped": 0, "by_split": {}}
+    stats = {"imported": 0, "labels": 0, "duplicates": 0, "dropped": 0, "renamed": 0, "cropped": 0, "crop_skipped": 0, "resized": 0, "unreadable": 0, "objects_cropped_out": 0, "objects_skipped": 0, "by_split": {}}
     rescan: dict = {}
     if job:
         job.progress(0, len(items), "Copying files…")
@@ -1037,7 +1024,7 @@ def run_import(dataset: Dataset, source: Path, options: dict, job: Job | None = 
         for index, item in enumerate(items):
             if job:
                 job.progress(index, len(items))
-            _copy_item(dataset, item, mapping, label_mapping, fingerprints, planned, stats, folders, crop)
+            _copy_item(dataset, item, mapping, label_mapping, fingerprints, planned, stats, folders, crop, fit)
     finally:
         # also after a cancel: whatever was copied is part of the dataset now
         if job and not job.cancel_requested:
@@ -1065,7 +1052,7 @@ def _target_paths(dataset: Dataset, directory: Path, name: str, planned: set[Pat
         candidate = base.with_name(f"{base.stem}_{counter}{base.suffix}")
 
 
-def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict | None, fingerprints: _Fingerprints | None, planned: set[Path], stats: dict, folders: dict[str, Path], crop: dict | None = None) -> None:
+def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict | None, fingerprints: _Fingerprints | None, planned: set[Path], stats: dict, folders: dict[str, Path], crop: dict | None = None, fit: dict | None = None) -> None:
     if dataset.category == "classification":
         class_id = mapping.get(item["class"])
         if class_id is None:
@@ -1074,12 +1061,13 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
         directory = folders[item["target"]] / dataset.names[class_id]
     else:
         directory = folders[item["target"]]
-    cropped = crop_image(item["image"], crop) if crop else None
-    if crop and cropped is None:
-        stats["crop_skipped"] += 1
+    cropped = crop_image(item["image"], crop, fit) if crop or fit else None
+    if cropped is None and (crop or fit):
+        # a region that misses the image (or one that cannot be read: a resize must read every image)
+        stats["crop_skipped" if crop else "unreadable"] += 1
         return
     data = cropped["data"] if cropped else None
-    # a cropped image is compared by the bytes it will have, so re-importing with the same crop is still caught
+    # a cropped or resized image is compared by the bytes it will have, so re-importing with the same options is still caught
     if fingerprints is not None and fingerprints.seen(item["image"], data, item.get("size")):
         stats["duplicates"] += 1
         return
@@ -1090,7 +1078,8 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
     target.parent.mkdir(parents=True, exist_ok=True)
     if data is not None:
         target.write_bytes(data)
-        stats["cropped"] += 1
+        stats["cropped"] += cropped["box"] is not None
+        stats["resized"] += cropped["resized"]
     else:
         shutil.copy2(item["image"], target)
     if label_target is not None and (item["label"] is not None or item["coco"] is not None):
@@ -1101,7 +1090,7 @@ def _copy_item(dataset: Dataset, item: dict, mapping: dict, label_mapping: dict 
             text = item["label"].read_text(encoding="utf-8")
             if label_mapping is not None:
                 text = classes.remap_label_text(text, label_mapping)
-        if data is not None:
+        if data is not None and cropped["box"] is not None:  # a resize alone keeps the relative coordinates
             text, removed = crop_label_text(text, cropped["box"], *cropped["size"])
             stats["objects_cropped_out"] += removed
         planned.add(label_target)
@@ -1116,7 +1105,7 @@ def _log(dataset: Dataset, source: Path, options: dict, mapping: dict, stats: di
     entry = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": "browser upload" if options.get("staging_id") else str(source),
-        "options": {key: value for key, value in options.items() if key in {"split_mode", "split", "ratios", "seed", "skip_duplicates", "folders", "crop"}},
+        "options": {key: value for key, value in options.items() if key in {"split_mode", "split", "ratios", "seed", "skip_duplicates", "folders", "crop", "resize"}},
         "mapping": mapping,
         **stats,
     }

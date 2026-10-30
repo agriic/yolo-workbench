@@ -20,13 +20,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from . import augment_preview, classes, download, identity, importer, rfdetr_augment, storage
+from . import augment_preview, classes, download, identity, importer, resize, rfdetr_augment, storage
 from .auth import Auth, AuthError, AuthMiddleware, current_user
 from .dataset import Dataset, DatasetError, SchemaChanged, WriteConflict
 from .fsutil import InsufficientSpace, ensure_free_space, replace
 from .imaging import upright_rgb
 from .importer import UploadTooLarge
-from .jobs import JobManager
+from .jobs import IMAGE_JOBS, JobManager
 from .lifecycle import Lifecycle, LifecycleOptions
 from .media_cache import PALETTE_VERSION, MediaCache
 from .models import Annotation, ImageRecord
@@ -200,6 +200,20 @@ class ImportCropPayload(BaseModel):
     height: float = Field(0, ge=0)
 
 
+class ResizePayload(BaseModel):
+    mode: Literal["none", "fit"] = "none"  # fit: within width×height, keeping the aspect ratio
+    width: int = Field(0, ge=0)
+    height: int = Field(0, ge=0)
+    enlarge: bool = False  # also scale smaller images up to fit
+
+
+class ImageResizePayload(BaseModel):
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    enlarge: bool = False
+    split: Literal["all", "train", "val", "test"] = "all"
+
+
 class ImportCommitPayload(ImportSourcePayload):
     split_mode: Literal["fixed", "auto", "source"] = "fixed"
     split: Literal["train", "val", "test"] = "train"
@@ -209,6 +223,7 @@ class ImportCommitPayload(ImportSourcePayload):
     folders: dict[str, str] | None = None  # split -> target folder (as listed by GET /folders)
     skip_duplicates: bool = True
     crop: ImportCropPayload | None = None
+    resize: ResizePayload | None = None  # after the crop
 
 
 class ProjectCreatePayload(BaseModel):
@@ -622,6 +637,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         dataset.check_writable()
         source = importer.resolve_source(dataset, payload.path, payload.staging_id)
         importer.crop_options(payload.crop.model_dump() if payload.crop else None)  # reject a bad crop before the job starts
+        resize.resize_options(payload.resize.model_dump() if payload.resize else None)
         if jobs.running(session.slug, "import"):
             raise DatasetError("Another import is still running")
         options = payload.model_dump()
@@ -634,6 +650,25 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
                     importer.discard_staging(dataset, payload.staging_id)
 
         return jobs.start("import", session.slug, f"Import into {session.project.get('name', dataset.root.name)}", work)
+
+    # ---------- resizing the dataset's images ----------
+
+    @router.get("/resize")
+    def resize_summary(width: int = Query(gt=0), height: int = Query(gt=0), enlarge: bool = False, split: Literal["all", "train", "val", "test"] = "all", session: DatasetSession = current):
+        """How many images a resize would change, by the sizes the dataset knows."""
+        options = resize.resize_options({"mode": "fit", "width": width, "height": height, "enlarge": enlarge})
+        return resize.summary(session.dataset, options, split)
+
+    @router.post("/resize")
+    def resize_start(payload: ImageResizePayload, session: DatasetSession = current):
+        """Resize the images that do not fit within width×height (a job; one undoable change)."""
+        dataset = session.dataset
+        dataset.check_writable()
+        options = resize.resize_options({"mode": "fit", **payload.model_dump(exclude={"split"})})
+        busy = jobs.running(session.slug, tuple(IMAGE_JOBS))
+        if busy:
+            raise DatasetError(f"Try again once it is done: {IMAGE_JOBS[busy[0]['kind']]}")
+        return jobs.start("resize", session.slug, f"Resize images of {session.project.get('name', dataset.root.name)}", lambda job: resize.resize_images(dataset, options, payload.split, job))
 
     # ---------- model-assisted labeling ----------
 

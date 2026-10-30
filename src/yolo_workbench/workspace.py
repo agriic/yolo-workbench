@@ -36,7 +36,7 @@ from PIL import Image
 from .dataset import WORKBENCH_DIR, Dataset, DatasetError, WriteConflict
 from .fsutil import replace
 from .imaging import upright_rgb
-from .jobs import JobManager
+from .jobs import IMAGE_JOBS, JobManager
 from .session import DatasetSession
 from .training import TrainingManager, TrainingTarget
 
@@ -385,8 +385,9 @@ class Workspace:
         return list(self.sessions.values())
 
     def busy_reason(self, session: DatasetSession) -> str | None:
-        if self.jobs.running(session.slug, "import"):
-            return "an import is running"
+        busy = self.jobs.running(session.slug, tuple(IMAGE_JOBS))
+        if busy:
+            return IMAGE_JOBS[busy[0]["kind"]]
         return session.busy_reason()
 
     def session(self, slug: str) -> DatasetSession:

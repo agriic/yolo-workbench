@@ -1029,6 +1029,12 @@ body:not(.image-ops) #image-move-split, body:not(.image-ops) #image-move, body:n
 .crop-input { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); white-space: nowrap; }
 .crop-input input { width: 64px; border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; background: var(--surface); }
 .crop-input input:disabled, #import-crop select:disabled { opacity: .5; }
+.crop-input select { border: 1px solid var(--line); border-radius: 5px; background: var(--surface); padding: 2px 6px; }
+.crop-check { display: inline-flex; align-items: center; gap: 5px; color: var(--text-2); white-space: nowrap; cursor: pointer; }
+.crop-check input { accent-color: var(--accent); margin: 0; }
+.crop-check input:disabled + span { opacity: .5; }
+.resize-form .crop-fields { font-size: 13px; }
+.resize-form .panel-note { margin: 8px 0 10px; }
 .crop-preview-wrap { display: grid; gap: 6px; justify-items: center; padding-top: 8px; }
 .crop-preview { position: relative; overflow: hidden; border-radius: var(--radius); line-height: 0; background: var(--line); min-width: 120px; min-height: 80px; }
 .crop-preview img { display: block; max-width: 100%; max-height: 320px; }

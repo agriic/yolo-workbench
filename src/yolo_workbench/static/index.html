@@ -292,6 +292,25 @@
             <div class="panel-head"><h2>Splits</h2></div>
             <div id="split-overview"></div>
           </article>
+          <article class="stats-panel manage-panel" id="resize-panel">
+            <div class="panel-head"><h2>Resize images</h2></div>
+            <p class="panel-note">Scale the images that do not fit within a size, keeping their aspect ratio. Labels stay as they are: their coordinates are relative to the image. The originals go to the dataset trash; Ctrl+Z undoes.</p>
+            <form id="resize-form" class="resize-form">
+              <span class="crop-fields">
+                <label class="crop-input">Fit within <input id="resize-width" type="number" min="1" max="16384" step="1" value="1280" aria-label="Width"></label>
+                <label class="crop-input">× <input id="resize-height" type="number" min="1" max="16384" step="1" value="1280" aria-label="Height"> px</label>
+                <label class="crop-input">in <select id="resize-split" aria-label="Split"><option value="all">all splits</option></select></label>
+                <label class="crop-check"><input id="resize-enlarge" type="checkbox"><span>also enlarge smaller images</span></label>
+              </span>
+              <p id="resize-summary" class="panel-note"></p>
+              <button id="resize-start" type="submit" class="secondary" disabled>Resize…</button>
+            </form>
+            <div id="resize-progress" class="import-progress" hidden>
+              <div class="import-progress-text"><span id="resize-progress-label"></span><span id="resize-progress-count" class="muted"></span></div>
+              <progress id="resize-progress-bar" max="1" value="0"></progress>
+              <button id="resize-cancel" class="secondary" type="button">Cancel</button>
+            </div>
+          </article>
           <article class="stats-panel manage-panel" id="download-panel">
             <div class="panel-head"><h2>Download</h2><span class="row-actions"><button id="download-labels" class="secondary mini" type="button" title="Download the label files and data.yaml as a .zip">Labels only</button><button id="download-full" class="secondary mini" type="button" title="Download the images, label files and data.yaml as a .zip">Images &amp; labels</button></span></div>
             <p class="panel-note" id="download-note"></p>

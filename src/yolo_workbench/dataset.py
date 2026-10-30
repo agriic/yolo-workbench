@@ -136,6 +136,20 @@ class FileMoveEntry:
 
 
 @dataclass
+class ImageFileEntry:
+    """History entry swapping an image file for another version of it (resized); the version not in place waits in
+    the trash. Labels stay as they are: their coordinates are relative to the image. The sizes are (width, height,
+    bytes), so nothing is probed again and replay can tell the file in place is still the expected version."""
+
+    image_id: str
+    path: Path
+    before: Path  # where the original waits while the new version is in place
+    after: Path  # where the new version waits while the original is in place
+    before_size: tuple[int, int, int]
+    after_size: tuple[int, int, int]
+
+
+@dataclass
 class DirEntry:
     """History entry creating (created=True) or removing an empty directory."""
 
@@ -1971,11 +1985,15 @@ class Dataset:
                 self._rebuild_orphan_issues()
             if self._reviews_dirty:
                 self._save_reviews()
+            images_only = bool(ordered) and all(isinstance(entry, ImageFileEntry) for entry in ordered)
+            if any(isinstance(entry, ImageFileEntry) for entry in ordered):
+                self._statistics_cache = None  # object sizes in pixels changed
+                self._save_size_index()
             image_ids = list(touched)
             if image_ids or schema is not None:
                 self.annotation_generation += 1
             if image_ids or schema is not None or resort:
-                self._record_change(image_ids + removed, structure=resort or schema is not None, schema=schema is not None and not schema.layout_only)
+                self._record_change(image_ids + removed, structure=resort or schema is not None, schema=schema is not None and not schema.layout_only, kind="images" if images_only else "labels")
         if schema is not None and not schema.layout_only:
             self._notify_schema(schema.mapping if direction == "redo" else schema.inverse())
         return image_ids, schema is not None
@@ -1986,6 +2004,26 @@ class Dataset:
         if direction == "undo":
             return (entry.after, entry.after_exists), (entry.before, entry.before_exists)
         return (entry.before, entry.before_exists), (entry.after, entry.after_exists)
+
+    @staticmethod
+    def _swap(entry: ImageFileEntry, direction: str) -> tuple[Path, Path, tuple[int, int, int], tuple[int, int, int]]:
+        """An image swap in `direction`: (where the version in place goes, where the incoming one waits, the size
+        of the version in place, the size of the incoming one)."""
+        if direction == "undo":
+            return entry.after, entry.before, entry.after_size, entry.before_size
+        return entry.before, entry.after, entry.before_size, entry.after_size
+
+    def _check_swap(self, entry: ImageFileEntry, direction: str) -> None:
+        park, incoming, current, _ = self._swap(entry, direction)
+        record = self.images.get(entry.image_id)
+        stamp = self._file_stat(entry.path)
+        # a move keeps a file's bytes: another size means the image was replaced outside the app
+        if record is None or record.path != entry.path or stamp is None or stamp[1] != current[2]:
+            raise WriteConflict(f"{entry.path.name} changed outside this application; cannot {direction}")
+        if not incoming.is_file():
+            raise WriteConflict(f"The other version of {entry.path.name} is no longer in the trash; cannot {direction}")
+        if park.exists():
+            raise WriteConflict(f"Cannot {direction}: {park.name} already exists in the trash")
 
     def _check_entry(self, entry, direction: str, records_by_label: dict, exact: bool = True, current: dict | None = None) -> None:
         """Can `entry` be applied in `direction`? exact: also compare label files with the content the entry
@@ -2046,6 +2084,8 @@ class Dataset:
                 raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
             if dst.exists():
                 raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
+        elif isinstance(entry, ImageFileEntry):
+            self._check_swap(entry, direction)
         elif isinstance(entry, DirMoveEntry):
             src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
             if not src.is_dir():
@@ -2102,6 +2142,18 @@ class Dataset:
             src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
             self._move_file(src, dst)
             return True  # orphan labels are re-found
+        if isinstance(entry, ImageFileEntry):
+            park, incoming, _, size = self._swap(entry, direction)
+            record = self.images[entry.image_id]
+            self._move_file(entry.path, park)
+            self._move_file(incoming, entry.path)
+            record.width, record.height = size[0], size[1]
+            record.probe_error = None
+            stamp = self._file_stat(entry.path)
+            if stamp is not None:
+                record.image_mtime, record.image_size = stamp
+            touched[record.id] = record
+            return False
         if isinstance(entry, DirEntry):
             create = entry.created != (direction == "undo")
             if create:
@@ -2150,10 +2202,11 @@ class Dataset:
         self._read_records(list(self.images.values()), known)
         self._statistics_cache = None
 
-    def _trash_path(self, path: Path) -> Path:
+    def _trash_path(self, path: Path, taken: set[Path] | frozenset = frozenset()) -> Path:
+        """A free place for `path` in this session's trash (also not one of `taken`, planned already)."""
         target = self.root / WORKBENCH_DIR / "trash" / self.session_id / self._root_relative(path)
         counter = 1
-        while target.exists():
+        while target.exists() or target in taken:
             target = target.with_name(f"{path.stem}.{counter}{path.suffix}")
             counter += 1
         return target
@@ -2200,6 +2253,24 @@ class Dataset:
             if entries:
                 self._execute(entries)
             return {"moved": len(entries), "skipped": skipped, **self.history_state()}
+
+    def replace_images(self, versions: list[dict]) -> dict:
+        """Put new versions of image files in place (resized) as one undoable transaction; the originals go to the
+        trash. Each version: {"image_id", "path" (the image file it was made from), "file" (the new version, kept
+        in the trash), "before", "after" (width, height, bytes)}. A version whose image was moved or removed since
+        is left out (its file stays: the caller removes it); one replaced on disk since refuses the whole batch."""
+        with self._lock:
+            entries, taken = [], set()
+            for version in versions:
+                record = self.images.get(version["image_id"])
+                if record is None or record.path != version["path"]:
+                    continue
+                park = self._trash_path(record.path, taken)
+                taken.add(park)
+                entries.append(ImageFileEntry(record.id, record.path, park, version["file"], tuple(version["before"]), tuple(version["after"])))
+            if entries:
+                self._execute(entries)
+            return {"replaced": [entry.image_id for entry in entries], **self.history_state()}
 
     def issues(self) -> list[dict]:
         with self._lock:

@@ -21,6 +21,10 @@ let importScan = null;
 let importJob = null;
 let uploadAbort = null;
 let cropSample = null;    // crop preview: { index, file, width, height, url, controller }
+let resizeJob = null;
+let resizePlan = null;    // the latest GET /resize answer for the form's values
+let resizeTimer = null;
+const MAX_SIDE = 16384;   // resize.MAX_SIDE
 
 export function bindManage() {
   $("class-add-form").onsubmit = e => { e.preventDefault(); addClasses(); };
@@ -111,6 +115,7 @@ export function bindManage() {
   $("import-review").addEventListener("change", async e => {
     if (e.target.name === "split-mode" || e.target.closest(".ratio-input")) updateImportSummary();
     if (e.target.name === "crop-mode" || e.target.closest("[data-crop]")) updateCropPreview();
+    if (e.target.name === "resize-mode" || e.target.closest("[data-resize]")) { updateImportResize(); updateCropPreview(); }
     const folderSelect = e.target.closest("[data-folder-split]");
     if (folderSelect && folderSelect.value === NEW_FOLDER) {
       const path = await addFolder(folderSelect.dataset.folderSplit);
@@ -119,8 +124,13 @@ export function bindManage() {
   });
   $("import-review").addEventListener("input", e => {
     if (e.target.closest(".ratio-input")) updateImportSummary();
-    if (e.target.closest("[data-crop]")) updateCropPreview();
+    if (e.target.closest("[data-crop]") || e.target.closest("[data-resize]")) updateCropPreview();
   });
+
+  $("resize-form").onsubmit = e => { e.preventDefault(); startResize(); };
+  $("resize-form").addEventListener("input", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(loadResizePlan, 300); });
+  $("resize-form").addEventListener("change", e => { if (e.target.matches("select, [type=checkbox]")) loadResizePlan(); });
+  $("resize-cancel").onclick = cancelResize;
 }
 
 /* ---------- dataset tab ---------- */
@@ -137,8 +147,9 @@ export function renderManageMeta() {
     ? "Classes are the folders inside each split; ids follow the folder names alphabetically."
     : "Removing or reordering renumbers class ids in every label file. Ctrl+Z undoes any class change.";
   renderDownload();
+  renderResizeSplits();
   loadFolders();
-  if (!importJob) resumeImportJob();
+  resumeJobs();
 }
 
 function renderDownload() {
@@ -563,6 +574,7 @@ function renderImportReview() {
     </fieldset>
     <fieldset class="import-fieldset" id="import-folders"><legend>Destination folders</legend><div class="folder-targets"></div></fieldset>
     ${cropFieldset(classification)}
+    ${resizeFieldset()}
     ${scan.classes.length ? `<fieldset class="import-fieldset"><legend>Classes</legend><table class="stats-table import-mapping">
       <thead><tr><th>Source</th><th>${classification ? "Images" : "Annotations"}</th><th>Becomes</th></tr></thead>
       <tbody>${scan.classes.map(item => `<tr>
@@ -575,6 +587,7 @@ function renderImportReview() {
     <div class="modal-actions"><button id="import-discard" class="secondary" type="button">Cancel</button><button id="import-commit" type="button" class="primary-btn">Import</button></div>`;
   renderFolderSelects();
   updateImportSummary();
+  updateImportResize();
   updateCropPreview();
 }
 
@@ -612,6 +625,54 @@ function cropFieldset(classification) {
       <p class="panel-note">${classification ? "" : "Labels are clipped to the crop; objects keeping less than 10% of their area are dropped. "}Images already within the crop are copied unchanged; images the region misses are skipped. Cropped images are re-encoded upright (EXIF orientation applied).</p>
     </div>
   </fieldset>`;
+}
+
+function resizeFieldset() {
+  const fit = lastFit();
+  return `<fieldset class="import-fieldset" id="import-resize"><legend>Resize</legend>
+    <label class="radio-row"><input type="radio" name="resize-mode" value="none" checked><span>Keep the image size</span></label>
+    <label class="radio-row"><input type="radio" name="resize-mode" value="fit"><span>Fit within <span class="muted">— keeping the aspect ratio, after the crop</span>
+      <span class="crop-fields">${resizeNumber("width", fit.width)}${resizeNumber("height", fit.height)}<span class="muted">px</span>
+        <label class="crop-check"><input type="checkbox" data-resize="enlarge" ${fit.enlarge ? "checked" : ""}><span>also enlarge smaller images</span></label></span></span></label>
+    <p class="panel-note">Labels need no change: their coordinates are relative to the image. Resized images are re-encoded upright (EXIF orientation applied); images that fit already are copied unchanged.</p>
+  </fieldset>`;
+}
+
+const resizeNumber = (key, value) => `<label class="crop-input">${key} <input type="number" min="1" max="${MAX_SIDE}" step="1" data-resize="${key}" value="${value}"></label>`;
+
+function readResize() {
+  const review = $("import-review");
+  const mode = review.querySelector('[name="resize-mode"]:checked')?.value || "none";
+  if (mode === "none") return { mode };
+  const value = key => Math.max(0, Math.trunc(+review.querySelector(`[data-resize="${key}"]`).value || 0));
+  return { mode, width: value("width"), height: value("height"), enlarge: review.querySelector('[data-resize="enlarge"]').checked };
+}
+
+function updateImportResize() {
+  const fit = readResize();
+  $("import-review").querySelectorAll("[data-resize]").forEach(input => input.disabled = fit.mode === "none");
+}
+
+// Mirrors resize.fit_size: the size a width×height image gets to fit within fit.width×fit.height, or null when it stays as it is.
+function fitSize(width, height, fit) {
+  if (width <= 0 || height <= 0) return null;
+  const scale = Math.min(fit.width / width, fit.height / height);
+  if (scale >= 1 && !fit.enlarge) return null;
+  const size = [Math.max(1, Math.floor(width * scale + 0.5)), Math.max(1, Math.floor(height * scale + 0.5))];
+  return size[0] === width && size[1] === height ? null : size;
+}
+
+// The size last resized to (import or Dataset tab), offered again; kept per browser.
+function lastFit() {
+  try {
+    const fit = JSON.parse(localStorage.getItem("resizeFit"));
+    if (fit?.width > 0 && fit?.height > 0) return { width: fit.width, height: fit.height, enlarge: !!fit.enlarge };
+  } catch { /* storage may be unavailable */ }
+  return { width: 1280, height: 1280, enlarge: false };
+}
+
+function rememberFit(fit) {
+  try { localStorage.setItem("resizeFit", JSON.stringify({ width: fit.width, height: fit.height, enlarge: fit.enlarge })); } catch { /* best effort */ }
 }
 
 function readCrop() {
@@ -662,7 +723,10 @@ function updateCropPreview() {
   }
   Object.assign(rect.style, { left: `${box[0] / width * 100}%`, top: `${box[1] / height * 100}%`, width: `${(box[2] - box[0]) / width * 100}%`, height: `${(box[3] - box[1]) / height * 100}%` });
   const whole = box[0] === 0 && box[1] === 0 && box[2] === width && box[3] === height;
-  caption.innerHTML = `${position} · ${width}×${height} → ${whole ? "unchanged" : `${box[2] - box[0]}×${box[3] - box[1]}`}`;
+  const fit = readResize();
+  const fitted = fit.mode === "fit" && fit.width && fit.height ? fitSize(box[2] - box[0], box[3] - box[1], fit) : null;
+  const steps = [whole ? null : `${box[2] - box[0]}×${box[3] - box[1]}`, fitted && `${fitted[0]}×${fitted[1]}`].filter(Boolean);
+  caption.innerHTML = `${position} · ${width}×${height} → ${steps.length ? steps.join(" → ") : "unchanged"}`;
 }
 
 async function loadCropSample(index) {
@@ -738,7 +802,9 @@ async function commitImport() {
     folders: Object.fromEntries([...review.querySelectorAll("[data-folder-split]")].map(select => [select.dataset.folderSplit, select.value])),
     skip_duplicates: $("import-skip-duplicates").checked,
     crop: readCrop(),
+    resize: readResize(),
   };
+  if (body.resize.mode === "fit") rememberFit(body.resize);
   try {
     const job = await api("/import/commit", { method: "POST", body: JSON.stringify(body) });
     importSource = null;
@@ -761,7 +827,9 @@ function trackJob(job, schema) {
   const result = job.result;
   if (job.state === "done" && result) {
     const extra = [
-      result.cropped && `${result.cropped} cropped`, result.duplicates && `${result.duplicates} duplicates skipped`, result.renamed && `${result.renamed} renamed`,
+      result.cropped && `${result.cropped} cropped`, result.resized && `${result.resized} resized`,
+      result.duplicates && `${result.duplicates} duplicates skipped`, result.renamed && `${result.renamed} renamed`,
+      result.unreadable && `${plural(result.unreadable, "unreadable image")} skipped`,
       result.dropped && `${result.dropped} skipped`, result.crop_skipped && `${result.crop_skipped} outside the crop region`,
       result.objects_cropped_out && `${plural(result.objects_cropped_out, "object")} cropped out`,
       result.objects_skipped && `${plural(result.objects_skipped, "object")} without a usable shape left out`,
@@ -775,12 +843,14 @@ function trackJob(job, schema) {
   deps.datasetChanged({ schema });
 }
 
-async function resumeImportJob() {
-  if (!state.project) return;
+// An import or resize started earlier (another tab, a reload) shows its progress here too.
+async function resumeJobs() {
+  if (!state.project || (importJob && resizeJob)) return;
   try {
     const { items } = await api(`/api/v1/jobs?project=${encodeURIComponent(state.project)}`);
-    const running = items.find(job => job.kind === "import" && job.state === "running");
-    if (running && !importJob) trackJob(running, true);
+    const running = kind => items.find(job => job.kind === kind && job.state === "running");
+    if (running("import") && !importJob) trackJob(running("import"), true);
+    if (running("resize") && !resizeJob) trackResize(running("resize"));
   } catch { /* job listing is best effort */ }
 }
 
@@ -800,4 +870,117 @@ function resetImport(discard = true) {
   $("import-review").innerHTML = "";
   $("import-progress").hidden = true;
   $("import-start").hidden = false;
+}
+
+/* ---------- resizing the dataset's images ---------- */
+
+function renderResizeSplits() {
+  const select = $("resize-split");
+  const previous = select.value || "all";
+  const splits = SPLITS.filter(split => state.meta.split_counts[split]);
+  select.innerHTML = `<option value="all">all splits</option>${splits.map(split => `<option value="${esc(split)}">${esc(split)}</option>`).join("")}`;
+  select.value = splits.includes(previous) ? previous : "all";
+  if (!$("resize-form").dataset.ready) {  // the form starts from the size last used
+    const fit = lastFit();
+    $("resize-width").value = fit.width;
+    $("resize-height").value = fit.height;
+    $("resize-enlarge").checked = fit.enlarge;
+    $("resize-form").dataset.ready = "1";
+  }
+  loadResizePlan();
+}
+
+function readResizeForm() {
+  const value = id => Math.trunc(+$(id).value || 0);
+  return { width: value("resize-width"), height: value("resize-height"), enlarge: $("resize-enlarge").checked, split: $("resize-split").value };
+}
+
+const validFit = fit => fit.width >= 1 && fit.height >= 1 && fit.width <= MAX_SIDE && fit.height <= MAX_SIDE;
+
+async function loadResizePlan() {
+  if (resizeJob) return;
+  const fit = readResizeForm();
+  resizePlan = null;
+  $("resize-start").disabled = true;
+  if (!validFit(fit)) return renderResizePlan(fit, null, `Width and height must be between 1 and ${MAX_SIDE.toLocaleString()} px.`);
+  try {
+    const plan = await api(`/resize?${new URLSearchParams({ width: fit.width, height: fit.height, enlarge: fit.enlarge, split: fit.split })}`);
+    const now = readResizeForm();
+    if (Object.keys(fit).some(key => fit[key] !== now[key])) return;  // the form changed meanwhile: its own request answers
+    resizePlan = { ...plan, fit };
+    renderResizePlan(fit, plan);
+  } catch (error) { renderResizePlan(fit, null, error.message); }
+}
+
+function renderResizePlan(fit, plan, problem = "") {
+  const note = $("resize-summary");
+  note.classList.toggle("warn-text", !!problem);
+  if (problem) { note.textContent = problem; return; }
+  const where = fit.split === "all" ? "" : ` in ${fit.split}`;
+  const how = fit.enlarge ? "would be scaled to fit" : "are larger and would be scaled down";
+  const unknown = plan.unknown ? ` ${plural(plan.unknown, "image")} not measured yet would be checked too.` : "";
+  note.textContent = !plan.images ? `No images${where}.`
+    : plan.resize ? `${plan.resize.toLocaleString()} of ${plural(plan.images, "image")}${where} ${how} (${formatBytes(plan.bytes)} now).${unknown}`
+    : plan.unknown ? `${plural(plan.unknown, "image")}${where} not measured yet would be checked; the others fit already.`
+    : `Every image${where} fits within ${fit.width}×${fit.height} already.`;
+  $("resize-start").disabled = !plan.resize && !plan.unknown;
+}
+
+async function startResize() {
+  const plan = resizePlan;
+  if (!plan) return;
+  const { fit } = plan;
+  const count = plan.resize ? plural(plan.resize, "image") : "the images that do not fit";
+  if (!confirm(`Resize ${count}${fit.split === "all" ? "" : ` in ${fit.split}`} to fit within ${fit.width}×${fit.height} px, keeping the aspect ratio? Labels stay as they are. The originals go to the dataset trash; Ctrl+Z undoes.`)) return;
+  rememberFit(fit);
+  try {
+    trackResize(await api("/resize", { method: "POST", body: JSON.stringify(fit) }));
+  } catch (error) { deps.toast(error.message, "error"); }
+}
+
+function resizeProgress(job) {
+  $("resize-form").hidden = !!job;
+  $("resize-progress").hidden = !job;
+  if (!job) return;
+  $("resize-progress-label").textContent = `${job.message || "Resizing…"}${startedBy(job.started_by)}`;
+  $("resize-progress-count").textContent = job.total ? `${job.done.toLocaleString()} / ${job.total.toLocaleString()}` : "";
+  $("resize-progress-bar").max = Math.max(1, job.total);
+  $("resize-progress-bar").value = job.done;
+  $("resize-cancel").disabled = job.cancel_requested;
+}
+
+function trackResize(job) {
+  resizeJob = job;
+  resizeProgress(job);
+  if (job.state === "running") {
+    setTimeout(async () => {
+      try { trackResize(await api(`/api/v1/jobs/${job.id}`)); }
+      catch (error) { resizeJob = null; resizeProgress(null); deps.toast(error.message, "error"); }
+    }, 600);
+    return;
+  }
+  resizeJob = null;
+  resizeProgress(null);
+  const result = job.result;
+  if (result) {  // a cancel that came too late (while the images were swapped in) still finished
+    const extra = [
+      result.bytes_before && `${formatBytes(result.bytes_before)} → ${formatBytes(result.bytes_after)}`,
+      result.failed && `${plural(result.failed, "image")} could not be read`,
+      result.skipped && `${result.skipped} moved or deleted meanwhile`,
+    ].filter(Boolean);
+    deps.toast(`Resized ${plural(result.resized, "image")}${extra.length ? ` · ${extra.join(", ")}` : ""}${result.resized ? " — Ctrl+Z undoes" : ""}`, result.failed ? "error" : "info");
+    if (result.errors?.length) console.warn("Images that could not be resized:", result.errors);
+  } else if (job.state === "cancelled") {
+    deps.toast("Resize cancelled — no image was changed", "error");
+  } else if (job.state === "failed") {
+    deps.toast(`Resize failed: ${job.error}`, "error");
+  }
+  deps.datasetChanged();
+  loadStorage();
+}
+
+async function cancelResize() {
+  if (!resizeJob) return;
+  try { resizeProgress(await api(`/api/v1/jobs/${resizeJob.id}/cancel`, { method: "POST" })); }
+  catch (error) { deps.toast(error.message, "error"); }
 }
