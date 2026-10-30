@@ -436,7 +436,7 @@ _RF_FIELDS: dict[str, tuple[str, object, str]] = {
     "eval_batch_size": ("int?", None, "Validation batch size (default: batch_size)"),
     "eval_max_dets": ("int", 500, "Detections per image kept for evaluation"),
     "eval_backend": ("choice:vernier|hotcoco|faster_coco_eval|ufcoco", "vernier", "COCO evaluation backend"),
-    "eval_masks_head_resolution": ("bool", False, "Evaluate masks at the mask head's resolution (faster, less exact)"),
+    "eval_masks_head_resolution": ("bool", False, "Validate masks at the mask head's resolution, not the image's: much less GPU memory, coarser mask mAP (the final evaluation stays full resolution)"),
     "log_per_class_metrics": ("bool", False, "Log AP per class every epoch (the final evaluation always does)"),
     "compute_val_loss": ("choice:auto|true|false", "auto", "Compute the validation loss (auto: when something uses it)"),
     "compute_test_loss": ("bool", True, "Compute the test loss in the test evaluation"),

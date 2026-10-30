@@ -125,6 +125,7 @@ const FIELDS = [
   { fw: "rfdetr", group: "advanced", key: "multi_scale", label: "Multi-scale", type: "select", options: [["per-batch", "Per batch"], ["per-sample", "Per sample"], ["off", "Off"]] },
   { fw: "rfdetr", group: "advanced", key: "expanded_scales", label: "Wider scale range", type: "bool" },
   { fw: "rfdetr", group: "advanced", key: "eval_max_dets", label: "Detections per image (eval)", type: "int", min: 1 },
+  { fw: "rfdetr", group: "advanced", key: "eval_masks_head_resolution", label: "Validate masks at mask-head resolution", type: "bool", cats: ["segmentation"] },
 ];
 
 let options = null;   // GET /training/options
