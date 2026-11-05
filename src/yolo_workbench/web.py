@@ -64,6 +64,12 @@ class AnnotationListPayload(StrictPayload):
     schema_generation: int | None = None  # the class list the class ids were chosen from (409 when it changed)
 
 
+class PropagatePayload(StrictPayload):
+    image_ids: list[str] = Field(max_length=1000)  # the images after the editor's, in the gallery's order
+    annotations: list[AnnotationPayload] = Field(min_length=1)  # classification: the one class, no points
+    schema_generation: int | None = None
+
+
 class BulkFixPayload(BaseModel):
     kind: str
     split: str | None = None
@@ -483,6 +489,14 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
             )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    @router.post("/images/propagate")
+    def propagate_annotations(payload: PropagatePayload, session: DatasetSession = current):
+        return session.dataset.propagate_annotations(
+            payload.image_ids,
+            [{"class_id": annotation.class_id, "points": annotation.points} for annotation in payload.annotations],
+            payload.schema_generation,
+        )
 
     # ---------- several people in one project ----------
 

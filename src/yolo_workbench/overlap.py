@@ -69,3 +69,21 @@ def find_overlaps(category: str, annotations, threshold: float = OVERLAP_IOU) ->
             if iou >= threshold:
                 pairs.append((first, second, iou))
     return sorted(pairs, key=lambda pair: (pair[1], pair[0]))
+
+
+def same_place(category: str, a: list[float], b: list[float], threshold: float = OVERLAP_IOU) -> bool:
+    """Whether two shapes cover the same place: equal, or at or above `threshold` IoU as find_overlaps measures it."""
+    if a == b:
+        return True
+    ax0, ay0, ax1, ay1 = _bounds(category, a)
+    bx0, by0, bx1, by1 = _bounds(category, b)
+    width, height = min(ax1, bx1) - max(ax0, bx0), min(ay1, by1) - max(ay0, by0)
+    if width <= 0 or height <= 0:
+        return False
+    intersection = width * height
+    if category == "detection":
+        return intersection / ((ax1 - ax0) * (ay1 - ay0) + (bx1 - bx0) * (by1 - by0) - intersection) >= threshold
+    a_area, b_area = _polygon_area(a), _polygon_area(b)
+    if not a_area or not b_area or min(intersection, a_area, b_area) / max(a_area, b_area) < threshold:
+        return False
+    return _polygon_iou(a, b, (min(ax0, bx0), min(ay0, by0), max(ax1, bx1), max(ay1, by1))) >= threshold

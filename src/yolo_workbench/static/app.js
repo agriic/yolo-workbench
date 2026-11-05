@@ -7,8 +7,8 @@ import { VirtualGallery } from "./grid.js";
 import {
   applyHistory, bounds, cancelDrawing, closeEditorSession, configureCanvas, deleteSelected,
   editorRequest, finishPolygon, fit, navigate, openEditor, pointerDown, pointerLeave, pointerMove,
-  pointerUp, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
-  savedRevisionByImage, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
+  pointerUp, propagate, removeAnnotation, render, renderList, resizeCanvas, save, saveQueue,
+  savedRevisionByImage, setupPropagate, shapePath, toScreen, updateHistoryButtons, zoomCentered, updateNavButtons,
   updateReviewButtons, updateStatus, zoomAt, zoomTo,
 } from "./canvas.js";
 import {
@@ -297,6 +297,7 @@ function renderShortcuts() {
       ["← →", "Previous / next image"],
       ["D / W", "Review: done / needs work, then next"],
       ["U", "Next unreviewed image"],
+      ["C", "Propagate the class to the next images"],
       ["F", "Fit image"],
       ["Esc", "Close"],
     ].map(([key, hint]) => `<dt><kbd>${key}</kbd></dt><dd>${hint}</dd>`).join("");
@@ -319,6 +320,7 @@ function renderShortcuts() {
     ["← →", "Previous / next image"],
     ["D / W", "Review: done / needs work, then next"],
     ["U", "Next unreviewed image"],
+    ["C", "Propagate: copy to the next images"],
     ["P", "Predict with the loaded model"],
     ["A / R", "Predictions: accept all ≥ min confidence / reject all"],
     ["S", "Smart annotation (SAM): click the object"],
@@ -551,6 +553,7 @@ function bind() {
   $("review-work").onclick = e => { e.currentTarget.blur(); reviewCurrent("needs_work", state.detail?.review !== "needs_work"); };
   $("review-next").onclick = e => { e.currentTarget.blur(); openNextUnreviewed(); };
   $("edit-label-text").onclick = () => state.detail && openLabelText(state.detail.id);
+  setupPropagate();
   $("label-warning").addEventListener("click", e => {
     if (e.target.closest("[data-edit-label]") && state.detail) openLabelText(state.detail.id);
   });
@@ -663,6 +666,7 @@ function keyDown(e) {
     if (key.toLowerCase() === "d") return reviewCurrent("done", true);
     if (key.toLowerCase() === "w") return reviewCurrent("needs_work", true);
     if (key.toLowerCase() === "u") return openNextUnreviewed();
+    if (key.toLowerCase() === "c") { if (!e.repeat) propagate(); return; }
     // the Predictions panel's Accept all ≥ / Reject all (a held key does not repeat them)
     if (key.toLowerCase() === "a" || key.toLowerCase() === "r") {
       const button = $(key.toLowerCase() === "a" ? "accept-all-preds" : "reject-all-preds");

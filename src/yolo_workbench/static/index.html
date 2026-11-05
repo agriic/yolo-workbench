@@ -476,6 +476,24 @@
           <div id="label-warning" class="label-warning" hidden></div>
           <div id="annotation-list"></div>
         </div>
+        <div class="inspector-section" id="propagate-section">
+          <h2>Propagate</h2>
+          <div class="propagate-row">
+            <span>Copy</span>
+            <select id="propagate-what" title="What to copy to the next images">
+              <option value="selected">the selected annotation</option>
+              <option value="all">all annotations</option>
+            </select>
+            <span id="propagate-class" hidden></span>
+          </div>
+          <div class="propagate-row">
+            <label for="propagate-count">to the next</label>
+            <input id="propagate-count" class="points-limit" type="number" min="1" max="1000" step="1" value="1" inputmode="numeric">
+            <span id="propagate-unit">images</span>
+            <button id="propagate" class="secondary" title="Copy to the next images of the list, in the gallery's order (C). An image that already has a shape of the same class in the same place does not get it again. Ctrl+Z undoes.">Propagate</button>
+          </div>
+          <p id="propagate-note" class="propagate-note" hidden></p>
+        </div>
         <div class="inspector-section" id="prediction-section" hidden>
           <h2>Predictions <span id="prediction-count"></span></h2>
           <label class="field-label pred-threshold">Min confidence <span id="pred-conf-value">0%</span></label>

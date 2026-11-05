@@ -844,6 +844,14 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; font-size: 12px;
   background: var(--ed-control); border: 1px solid var(--ed-control-line); color: var(--ed-text);
 }
+.propagate-row { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ed-text-2); }
+.propagate-row + .propagate-row { margin-top: 6px; }
+.propagate-row > span, .propagate-row > label { white-space: nowrap; }
+.propagate-row select { flex: 1; height: 28px; font-size: 12px; }
+#propagate-class { color: var(--ed-text); overflow: hidden; text-overflow: ellipsis; }
+#editor #propagate-count { width: 56px; }
+#editor #propagate { margin-left: auto; height: 28px; padding: 0 10px; font-size: 12px; }
+.propagate-note { margin: 6px 0 0; font-size: 12px; color: var(--ed-text-2); }
 .pred-actions { display: flex; gap: 6px; margin: 6px 0; }
 .pred-actions button { flex: 1; font-size: 12px; }
 .pred-row { border-style: dashed; }
@@ -1108,7 +1116,7 @@ body.on-training .lock-banner { display: none; }
 body.training-locked #image-move-split, body.training-locked #image-move, body.training-locked #image-delete, body.training-locked #object-bulk, body.training-locked #embed-delete, body.training-locked .issue-actions,
 body.training-locked .fix-all, body.training-locked #class-add-form, body.training-locked #class-table,
 body.training-locked #import-panel, body.training-locked #split-overview .link-btn,
-body.training-locked .pred-actions, body.training-locked #prediction-list, body.training-locked #confirm-all-pending, body.training-locked #delete-image { opacity: .45; pointer-events: none; }
+body.training-locked .pred-actions, body.training-locked #prediction-list, body.training-locked #confirm-all-pending, body.training-locked #delete-image, body.training-locked #propagate { opacity: .45; pointer-events: none; }
 body.training-locked .editor-status::before { content: "Read-only while training"; color: var(--warn); font-weight: 600; }
 
 .training-layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 16px; align-items: start; }

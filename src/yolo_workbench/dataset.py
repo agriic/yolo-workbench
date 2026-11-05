@@ -22,7 +22,7 @@ from .activity import ActivityLog
 from .fsutil import occupied, replace
 from .imaging import upright_size
 from .models import Annotation, Category, ImageRecord
-from .overlap import find_overlaps
+from .overlap import find_overlaps, same_place
 from .review import STATUSES as REVIEW_STATUSES, ReviewStore
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -1613,6 +1613,50 @@ class Dataset:
                 self._commit_many(changes)
             return {"image_ids": added, "skipped": skipped}
 
+    def propagate_annotations(self, image_ids: list[str], raw_annotations: list[dict], schema_generation: int | None = None) -> dict:
+        """The editor's Propagate: copy annotations to other images in one transaction. An image that already has a
+        shape of the same class in the same place (an exact copy or an overlap, see overlap.same_place) does not get
+        that one again; `unchanged` lists the images that got none. Classification sets the images' class instead."""
+        with self._lock, identity.action("propagate annotations"):
+            self.check_schema(schema_generation)
+            targets = list(dict.fromkeys(image_ids))
+            if self.category == "classification":
+                if len(raw_annotations) != 1 or raw_annotations[0].get("points"):
+                    raise DatasetError("Classification images have exactly one class and no geometry")
+                class_id = int(raw_annotations[0]["class_id"])
+                if class_id not in self.names:
+                    raise DatasetError(f"Unknown class {class_id}")
+                moves, unchanged, skipped = [], [], []
+                for image_id in targets:
+                    record = self.images.get(image_id)
+                    if record is None:
+                        skipped.append({"image_id": image_id, "image_name": None, "reason": "Image not found"})
+                    elif self._class_name_for(record) == self.names[class_id]:
+                        unchanged.append(image_id)
+                    else:
+                        moves.append((record, class_id))
+                if moves:
+                    self._commit_moves(moves)
+                return {"image_ids": [record.id for record, _ in moves], "added": len(moves), "unchanged": unchanged, "skipped": skipped}
+            if not raw_annotations:
+                raise DatasetError("Nothing to propagate")
+            shapes = [self._parsed(raw, f"propagate:{index}") for index, raw in enumerate(raw_annotations)]
+            additions, unchanged = {}, []
+            for image_id in targets:
+                record = self.images.get(image_id)
+                existing = record.annotations if record else []
+                new = [
+                    {"class_id": shape.class_id, "points": shape.points} for shape in shapes
+                    if not any(a.class_id == shape.class_id and same_place(self.category, a.points, shape.points) for a in existing)
+                ]
+                if new:
+                    additions[image_id] = new  # an image not found is reported by add_annotations
+                else:
+                    unchanged.append(image_id)
+            result = self.add_annotations(additions)
+            added = sum(len(additions[image_id]) for image_id in result["image_ids"])
+            return {**result, "added": added, "unchanged": unchanged}
+
     def _commit_moves(self, moves: list[tuple[ImageRecord, int]], history: bool = True, expected_revision: int | None = None) -> None:
         """Reassign classification classes by moving files; all targets are checked before any move."""
         with self._lock:
@@ -1654,18 +1698,20 @@ class Dataset:
         """Validate raw annotations and capture the label state this change is based on."""
         if any(issue["kind"] == "malformed_label" for issue in record.issues):
             raise DatasetError("This label file has malformed lines: repair them with “Edit label file” or remove them in the Validation tab")
-        annotations = []
-        for index, raw in enumerate(raw_annotations):
-            class_id = int(raw["class_id"])
-            points = [float(value) for value in raw["points"]]
-            if class_id not in self.names:
-                raise DatasetError(f"Unknown class {class_id}")
-            valid_count = len(points) == 4 if self.category == "detection" else len(points) >= 6 and len(points) % 2 == 0
-            if not valid_count or not all(math.isfinite(value) and 0 <= value <= 1 for value in points):
-                raise DatasetError("Invalid annotation geometry")
-            annotations.append(Annotation(raw.get("id") or f"{record.id}:new:{index}", class_id, points))
+        annotations = [self._parsed(raw, raw.get("id") or f"{record.id}:new:{index}") for index, raw in enumerate(raw_annotations)]
         content = "".join(f"{a.class_id} {' '.join(self._number(v) for v in a.points)}\n" for a in annotations)
         return self._prepare_text(record, content, expected_revision)
+
+    def _parsed(self, raw: dict, annotation_id: str) -> Annotation:
+        """One annotation from the API, checked against the class list and the category's geometry."""
+        class_id = int(raw["class_id"])
+        points = [float(value) for value in raw["points"]]
+        if class_id not in self.names:
+            raise DatasetError(f"Unknown class {class_id}")
+        valid_count = len(points) == 4 if self.category == "detection" else len(points) >= 6 and len(points) % 2 == 0
+        if not valid_count or not all(math.isfinite(value) and 0 <= value <= 1 for value in points):
+            raise DatasetError("Invalid annotation geometry")
+        return Annotation(annotation_id, class_id, points)
 
     def _prepare_text(self, record: ImageRecord, content: str, expected_revision: int | None = None) -> PreparedChange:
         """Capture the label state a change to `content` (written as is) is based on."""

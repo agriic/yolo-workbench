@@ -129,6 +129,7 @@ export function updateNavButtons() {
   position.textContent = position.hidden ? "" : `${state.editorDetached ? "–" : (index + 1).toLocaleString()} / ${total.toLocaleString()}`;
   $("editor-subtitle").textContent = `${state.detail.split} · ${state.detail.width}×${state.detail.height}px${state.editorDetached ? " · no longer matches filters" : ""}`;
   updateReviewButtons();
+  renderPropagate();
 }
 
 export function updateReviewButtons() {
@@ -819,12 +820,119 @@ export async function applyHistory(direction) {
   }
 }
 
+/* ---------- propagate: copy annotations to the next images of the list ---------- */
+
+const PROPAGATE_COUNT_KEY = "propagateCount";
+const PROPAGATE_WHAT_KEY = "propagateWhat";
+const PROPAGATE_MAX = 1000;  // PropagatePayload.image_ids
+let propagating = false;
+
+// The first image after the open one in the list: a detached image left its successor at its index.
+const propagateStart = () => state.editorGridIndex + (state.editorDetached ? 0 : 1);
+
+export function setupPropagate() {
+  try {
+    const count = Number(localStorage.getItem(PROPAGATE_COUNT_KEY));
+    if (Number.isInteger(count) && count >= 1) $("propagate-count").value = Math.min(count, PROPAGATE_MAX);
+    if (localStorage.getItem(PROPAGATE_WHAT_KEY) === "all") $("propagate-what").value = "all";
+  } catch { /* the defaults */ }
+  $("propagate-what").onchange = () => {
+    try { localStorage.setItem(PROPAGATE_WHAT_KEY, $("propagate-what").value); } catch { /* not kept */ }
+    renderPropagate();
+  };
+  $("propagate-count").onchange = () => { propagateCount(); renderPropagate(); };
+  // ⏎ in the count propagates; both hand the keyboard back to the editor (blurred, so ⏎ and Space don't press it again)
+  $("propagate-count").addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); propagate(); }
+  });
+  $("propagate").onclick = e => { e.currentTarget.blur(); propagate(); };
+}
+
+function propagateCount() {
+  const count = clamp(Math.round(Number($("propagate-count").value)) || 1, 1, PROPAGATE_MAX);
+  $("propagate-count").value = count;
+  try { localStorage.setItem(PROPAGATE_COUNT_KEY, String(count)); } catch { /* not kept */ }
+  return count;
+}
+
+export function renderPropagate() {
+  if (!state.detail) return;
+  const classification = state.meta.category === "classification";
+  const annotations = state.detail.annotations;
+  $("propagate-what").hidden = classification;
+  $("propagate-what").options[1].textContent = `all annotations${annotations.length ? ` (${annotations.length})` : ""}`;
+  $("propagate-class").hidden = !classification;
+  if (classification) {
+    $("propagate-class").textContent = `the class ${state.meta.names[annotations[0]?.class_id] ?? "—"}`;
+    $("propagate").title = "Set the next images of the list, in the gallery's order, to this class (C). Ctrl+Z undoes.";
+  }
+  const total = deps.imageGallery()?.total;
+  const all = $("propagate-what").value === "all";
+  const note = state.editorGridIndex == null || total == null ? "Open the image from the image list to copy to the images after it."
+    : propagateStart() >= total ? "No images after this one in the list."
+    : classification ? (annotations.length ? "" : "This image has no class.")
+    : all ? (annotations.length ? "" : "No annotations to copy.")
+    : selectedAnnotation() ? "" : "Select an annotation, or copy all of them.";
+  $("propagate").disabled = propagating || !!note;
+  $("propagate-note").hidden = !note;
+  $("propagate-note").textContent = note;
+}
+
+export async function propagate() {
+  if (!state.detail || $("propagate").disabled) return;
+  const count = propagateCount();
+  const request = editorRequest, imageId = state.detail.id;
+  propagating = true;
+  renderPropagate();
+  try {
+    await saveQueue;  // the open image's edits first: what is copied is what was saved (and the selection it left)
+    if (request !== editorRequest || state.detail?.id !== imageId) return;
+    const classification = state.meta.category === "classification";
+    const sources = classification || $("propagate-what").value === "all" ? state.detail.annotations : [selectedAnnotation()].filter(Boolean);
+    const annotations = sources.map(a => ({ class_id: a.class_id, points: classification ? [] : [...a.points] }));
+    const gallery = deps.imageGallery();
+    const start = propagateStart();
+    if (!annotations.length || !gallery?.total || start >= gallery.total) return;
+    const items = await gallery.ensureRange(start, Math.min(start + count, gallery.total));
+    const imageIds = items.map(item => item.id).filter(id => id !== imageId);
+    if (!imageIds.length) return;
+    const result = await api("/images/propagate", {
+      method: "POST",
+      body: JSON.stringify({ image_ids: imageIds, annotations, schema_generation: state.meta.schema_generation }),
+    });
+    if (result.image_ids.length) {
+      state.canUndo = true;
+      state.canRedo = false;
+      updateHistoryButtons();
+      deps.statisticsChanged();
+      deps.loadImages();
+      deps.loadObjects();
+      deps.loadIssues();
+    }
+    const images = n => `${n.toLocaleString()} image${n === 1 ? "" : "s"}`;
+    const notes = !result.image_ids.length ? []
+      : classification ? [`${images(result.image_ids.length)} set to ${state.meta.names[annotations[0].class_id]}`]
+      : [`${result.added.toLocaleString()} annotation${result.added === 1 ? "" : "s"} added to ${images(result.image_ids.length)}`];
+    if (result.unchanged.length)
+      notes.push(`${images(result.unchanged.length)} already had ${classification ? "that class" : annotations.length === 1 ? "it" : "them"}`);
+    if (result.skipped.length) notes.push(`${images(result.skipped.length)} skipped (${result.skipped[0].reason})`);
+    deps.toast(notes.join(" · "), result.skipped.length ? "error" : "info");
+  } catch (error) {
+    deps.toast(error.name === "AbortError" ? "The image list changed meanwhile; propagate again" : error.message, "error");
+    if (error.status === 409 && error.body?.schema_generation != null) await deps.classesChanged();
+  } finally {
+    propagating = false;
+    renderPropagate();
+  }
+}
+
 /* ---------- annotation list (inspector) ---------- */
 
 export function renderList() {
   if (!state.detail) return;
   const annotations = state.detail.annotations;
   renderLabelWarning();
+  renderPropagate();
   deps.renderAttribution();
   if (state.meta.category === "classification") {
     $("annotation-count").textContent = "";
