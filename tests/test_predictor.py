@@ -608,6 +608,11 @@ def test_discover_lists_trained_runs_by_name(tmp_path):
     baseline = found[(runs / "exp-1" / "weights" / "best.pt").resolve().as_posix()]
     assert baseline["name"] == "Baseline · best.pt" and baseline["source"] == "run" and baseline["trained"]
     assert found[(runs / "detect" / "train2" / "weights" / "best.pt").resolve().as_posix()]["name"] == "train2 · best.pt"
+    # the loaded model carries the picker's name (the toolbar chip shows it rather than "best.pt")
+    assert manager.load(str(runs / "exp-1" / "weights" / "best.pt"))["model"]["label"] == "Baseline · best.pt"
+    manager.unload_if_idle(0)
+    assert manager.payload()["model"]["label"] == "Baseline · best.pt"  # parked: still named
+    assert manager.load(str(tmp_path / "model.pt"))["model"]["label"] is None
 
 
 def test_recent_models_skip_deleted_files(tmp_path):

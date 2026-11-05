@@ -35,7 +35,7 @@ export const state = {
   canRedo: false,
   pred: {
     status: "unavailable", error: null, names: {}, mapping: {}, pending: {},
-    modelPath: null, unloaded: null, job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
+    modelPath: null, modelLabel: null, unloaded: null, job: { state: "idle", done: 0, total: 0 }, items: [], minConf: 0, maxPoints: null, poll: null, models: [],
     hovered: null, hoverSource: null,  // the prediction under the mouse, and where: "list" (its row) or "canvas" (its ghost)
   },
   sam: {

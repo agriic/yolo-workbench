@@ -57,6 +57,7 @@ export function applyPredictorState(data) {
   pred.job = data.job;
   pred.maxPoints = data.max_points ?? null;
   pred.modelPath = data.model.path;
+  pred.modelLabel = data.model.label ?? null;  // a run's weights: named as in the picker
   pred.unloaded = data.unloaded ?? null;  // a training run took the GPU: load it again by hand
   pred.parked = data.parked ?? null;  // unloaded because nobody used it: the next prediction loads it again
   $("pred-points-wrap").hidden = state.meta.category !== "segmentation";
@@ -164,8 +165,8 @@ function renderModelChip(status = state.pred.status) {
   const text = {
     loading: "Loading model…",
     error: "Model failed to load",
-    ready: `${modelLabel(pred.modelPath)}${running ? ` · predicting ${pred.job.done}/${pred.job.total}` : ""}`,
-    parked: `${modelLabel(pred.modelPath)} · unloaded`,
+    ready: `${pred.modelLabel || modelLabel(pred.modelPath)}${running ? ` · predicting ${pred.job.done}/${pred.job.total}` : ""}`,
+    parked: `${pred.modelLabel || modelLabel(pred.modelPath)} · unloaded`,
   }[status] || "";
   chip.hidden = !text;
   chip.className = `model-chip ${status === "loading" || status === "error" ? status : ""}`;
@@ -173,10 +174,11 @@ function renderModelChip(status = state.pred.status) {
   chip.title = status === "ready" || status === "parked" ? `Prediction model: ${pred.modelPath}\n${$("predictor-status").textContent}` : $("predictor-status").textContent;
 }
 
-// trained weights are all best.pt: name them after their run folder
+// weights of a run the server does not know (another dataset's): name them after their run folder, as the picker does
 const modelLabel = path => {
   const parts = (path || "").split(/[\\/]/);
   const name = parts.at(-1);
+  if (name === "checkpoint_best_total.pth" && parts.length > 1) return `${parts.at(-2)} · best (RF-DETR)`;
   return parts.at(-2) === "weights" && parts.length > 2 ? `${parts.at(-3)} · ${name}` : name;
 };
 

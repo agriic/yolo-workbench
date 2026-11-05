@@ -273,6 +273,7 @@ class PredictorManager:
         self.error: str | None = None
         self.backend = None
         self.model_path: str | None = None
+        self.model_label: str | None = None  # a run's best weights: their name in the picker ("<run> · best.pt")
         self.unloaded: str | None = None  # why the model was dropped when it must be loaded again by hand (a training run)
         # status "parked": dropped because nobody used it; the next prediction loads it again (reload())
         self.parked: str | None = None
@@ -340,7 +341,7 @@ class PredictorManager:
             return {
                 "status": self.status,
                 "error": self.error,
-                "model": {"path": self.model_path, "names": self.model_names if self.status in ("ready", "parked") else {}, "framework": self.model_framework if self.status in ("ready", "parked") else None},
+                "model": {"path": self.model_path, "label": self.model_label if self.status in ("ready", "parked") else None, "names": self.model_names if self.status in ("ready", "parked") else {}, "framework": self.model_framework if self.status in ("ready", "parked") else None},
                 "conf": self.conf,
                 "iou": self.iou,
                 "max_points": self.max_points,
@@ -384,6 +385,7 @@ class PredictorManager:
                 self.status = "error"
                 self.error = str(exc)
             raise DatasetError(f"Failed to load model: {exc}") from exc
+        label = self._trained_models().get(model_path.resolve())
         with self._lock:
             if generation != self._generation:
                 raise DatasetError(self.unloaded or "The model was unloaded while loading")
@@ -394,6 +396,7 @@ class PredictorManager:
             self.model_framework = getattr(backend, "framework", None)
             self.loaded_by = identity.who()
             self.model_path = model_path.as_posix()
+            self.model_label = label
             if conf is not None:
                 self.conf = conf
             if iou is not None:
