@@ -233,13 +233,19 @@ export function render() {
   if (!state.img || !state.detail) { updateStatus(); return; }
   ctx.imageSmoothingEnabled = state.view.scale < 3;
   ctx.drawImage(state.img, state.view.x, state.view.y, state.img.width * state.view.scale, state.img.height * state.view.scale);
-  if (state.meta.category !== "classification") {
+  const shapes = state.meta.category !== "classification";
+  const selected = shapes ? selectedAnnotation() : null;
+  if (shapes) {
     for (const annotation of state.detail.annotations)
       if (annotation.id !== state.selected) drawShape(ctx, annotation, false);
-    const selected = selectedAnnotation();
     if (selected) drawShape(ctx, selected, true);
   }
   deps.drawPredictions(ctx);
+  if (shapes) {
+    // labels go over every shape, so a shape covered by others can still be picked by its label
+    for (const annotation of labelOrder()) drawLabel(ctx, annotation);
+    if (selected) drawHandles(ctx, selected);
+  }
   drawPreview(ctx);
   drawFocusHint(ctx);
   deps.drawSam(ctx);
@@ -271,8 +277,11 @@ export function drawShape(ctx, annotation, selected) {
   ctx.strokeStyle = color;
   ctx.lineWidth = selected || hovered ? 2.5 : 1.6;
   ctx.stroke(path);
-  drawLabel(ctx, annotation, color);
-  if (!selected) return;
+}
+
+// The selected shape's box handles or polygon vertices: over the labels, as presses reach them first.
+function drawHandles(ctx, annotation) {
+  const color = classColor(annotation.class_id);
   if (state.meta.category === "detection") {
     for (const [hx, hy] of boxHandles(annotation)) {
       const [sx, sy] = toScreen(hx, hy);
@@ -313,20 +322,39 @@ export function drawShape(ctx, annotation, selected) {
   }
 }
 
-export function drawLabel(ctx, annotation, color) {
+// Labels from bottom to top: the hovered one, then the selected one, over the rest.
+function labelOrder() {
+  const rank = a => a.id == null ? 0 : a.id === state.selected ? 2 : a.id === state.hovered ? 1 : 0;
+  return [...state.detail.annotations].sort((a, b) => rank(a) - rank(b));
+}
+
+// Where a shape's class label sits on screen: above its top-left corner, or just inside it at the top of the
+// view; none on a shape too narrow to carry one.
+function labelBox(ctx, annotation) {
   const [l, t, r] = bounds(annotation);
-  if ((r - l) * state.img.width * state.view.scale < 26) return;
+  if ((r - l) * state.img.width * state.view.scale < 26) return null;
   const [sx, sy] = toScreen(l, t);
   const name = state.meta.names[annotation.class_id] ?? `class ${annotation.class_id}`;
   ctx.font = "600 11px Inter, system-ui, sans-serif";
   const width = ctx.measureText(name).width + 10, height = 17;
-  const y = sy - height - 1 < 2 ? sy + 1 : sy - height - 1;
-  ctx.fillStyle = color;
+  return { name, x: sx, y: sy - height - 1 < 2 ? sy + 1 : sy - height - 1, width, height };
+}
+
+export function drawLabel(ctx, annotation) {
+  const box = labelBox(ctx, annotation);
+  if (!box) return;
+  ctx.fillStyle = classColor(annotation.class_id);
   ctx.beginPath();
-  ctx.roundRect(sx, y, width, height, 3);
+  ctx.roundRect(box.x, box.y, box.width, box.height, 3);
   ctx.fill();
+  if (annotation.id === state.hovered || annotation.id === state.selected) {
+    // sets it apart from the labels it covers
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
   ctx.fillStyle = "#fff";
-  ctx.fillText(name, sx + 5, y + 12);
+  ctx.fillText(box.name, box.x + 5, box.y + 12);
 }
 
 export function drawPreview(ctx) {
@@ -442,16 +470,27 @@ export function hitEdge(screen) {
   return best;
 }
 
-export function hitShape([x, y]) {
-  for (const annotation of [...state.detail.annotations].reverse()) {
-    if (state.meta.category === "detection") {
-      const [l, t, r, b] = bounds(annotation);
-      if (x >= l && x <= r && y >= t && y <= b) return annotation;
-    } else if (pointInPolygon(x, y, annotation.points)) {
-      return annotation;
-    }
+// The shape whose label is under the cursor: labels are drawn over every shape, the topmost one wins.
+export function hitLabel([x, y]) {
+  const ctx = $("canvas").getContext("2d");
+  for (const annotation of labelOrder().reverse()) {
+    const box = labelBox(ctx, annotation);
+    if (box && x >= box.x && x <= box.x + box.width && y >= box.y && y <= box.y + box.height) return annotation;
   }
   return null;
+}
+
+// The selected shape is drawn over the others, so it is hit first: it can be dragged where others overlap it.
+export function hitShape(point) {
+  const selected = selectedAnnotation();
+  if (selected && inShape(point, selected)) return selected;
+  return [...state.detail.annotations].reverse().find(annotation => inShape(point, annotation)) ?? null;
+}
+
+function inShape([x, y], annotation) {
+  if (state.meta.category !== "detection") return pointInPolygon(x, y, annotation.points);
+  const [l, t, r, b] = bounds(annotation);
+  return x >= l && x <= r && y >= t && y <= b;
 }
 
 export function pointerDown(e) {
@@ -494,7 +533,8 @@ export function pointerDown(e) {
     return;
   }
   vertexPress = null;
-  const edge = hitEdge(screen);
+  const labeled = hitLabel(screen);
+  const edge = labeled ? null : hitEdge(screen);
   if (edge) {
     // a press on an edge inserts a vertex there and drags it; the release saves it
     const original = [...edge.a.points];
@@ -502,7 +542,7 @@ export function pointerDown(e) {
     state.drag = { mode: "vertex", a: edge.a, index: edge.index, start: norm, original };
     return render();
   }
-  const found = hitShape(norm);
+  const found = labeled ?? hitShape(norm);
   if (found) {
     state.selected = found.id;
     state.drag = { mode: "move", a: found, start: norm, original: [...found.points] };
@@ -545,7 +585,7 @@ export function pointerMove(e) {
     return render();
   }
   // hover feedback
-  let cursor = "crosshair", hovered = null, prediction = null, polyHover = null, edge;
+  let cursor = "crosshair", hovered = null, prediction = null, polyHover = null, edge, labeled;
   if (state.meta.category === "classification") {
     cursor = "grab";
   } else if (state.spaceDown) {
@@ -555,6 +595,9 @@ export function pointerMove(e) {
     if (handle) {
       cursor = handle.mode === "resize" ? HANDLE_CURSORS[handle.index] : "move";
       if (handle.mode === "vertex") polyHover = { a: handle.a, vertex: handle.index, remove: e.altKey };
+    } else if ((labeled = hitLabel(screen))) {
+      cursor = labeled.id === state.selected ? "move" : "pointer";
+      hovered = labeled.id;
     } else if ((edge = hitEdge(screen))) {
       cursor = "copy";
       polyHover = { a: edge.a, edge: edge.index, point: edge.point };

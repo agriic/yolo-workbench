@@ -310,6 +310,7 @@ function renderShortcuts() {
       ["Click an edge", "Add a vertex (drag to place it)"],
       ["Double-click / Alt+Click", "Remove a vertex"],
     ]),
+    ["Click a label", `Select its ${detection ? "box" : "polygon"}, even under others`],
     ["Scroll", "Zoom at cursor"],
     ["Space+Drag", "Pan the image"],
     ["1–9", "Set class of selection"],
