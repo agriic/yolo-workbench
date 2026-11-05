@@ -309,7 +309,7 @@ function renderShortcuts() {
     ["Scroll", "Zoom at cursor"],
     ["Space+Drag", "Pan the image"],
     ["1–9", "Set class of selection"],
-    ["⌫", "Delete selection"],
+    ["⌫", "Delete the selected annotation"],
     ["Ctrl+Z / Ctrl+⇧+Z", "Undo / redo"],
     ["← →", "Previous / next image"],
     ["D / W", "Review: done / needs work, then next"],
@@ -538,7 +538,7 @@ function bind() {
   $("next-image").onclick = () => navigate(1);
   $("undo").onclick = () => applyHistory("undo");
   $("redo").onclick = () => applyHistory("redo");
-  $("delete").onclick = deleteSelected;
+  $("delete-image").onclick = e => { e.currentTarget.blur(); deleteCurrentImage(); };
   $("predict-image").onclick = predictImage;
   // a click on the active status unmarks it; otherwise mark and move on, like D / W
   $("review-done").onclick = e => { e.currentTarget.blur(); reviewCurrent("done", state.detail?.review !== "done"); };
@@ -996,6 +996,32 @@ async function runImageBulk(action) {
   } catch (error) {
     toast(error.message, "error");
   }
+}
+
+// Editor: move the open image to the dataset trash and go on with the image that takes its place in the list
+// (the previous one when it was the last); the editor closes when none is left or it was opened from outside the list.
+async function deleteCurrentImage() {
+  if (!state.detail) return;
+  const { id, name } = state.detail;
+  if (!confirm(`Delete ${name}? It is moved to the dataset trash with its label; Ctrl+Z undoes.`)) return;
+  cancelDrawing();
+  await saveQueue;  // an edit of this image still being saved goes first
+  if (state.detail?.id !== id) return;
+  try {
+    const result = await api("/images/delete", { method: "POST", body: JSON.stringify({ image_ids: [id] }) });
+    state.canUndo = result.can_undo;
+    state.canRedo = result.can_redo;
+    toast(`Deleted ${name} — Ctrl+Z undoes`);
+    if (state.detail?.id === id && state.editorGridIndex != null) state.editorDetached = true;  // its successor now sits at its index
+    if (state.imageSelection.delete(id)) renderImageBulkBar();
+    await datasetChanged({ keepSelection: true });
+  } catch (error) {
+    return toast(error.message, "error");
+  }
+  if (state.detail?.id !== id) return;  // another image was opened meanwhile
+  const total = imageGallery.total;
+  if (state.editorGridIndex == null || !total) return $("editor").close();
+  await navigate(state.editorGridIndex < total ? 1 : -1);
 }
 
 /* ---------- exploration ---------- */
