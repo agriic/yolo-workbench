@@ -19,6 +19,7 @@ const KINDS = {
 const qa = { status: null, kind: null, items: [], total: 0, counts: {}, request: 0, poll: null, wasRunning: false };
 
 export function bindLabelQA() {
+  $("qa-model").onchange = renderSetup;  // another model than the loaded one: Load shows, Analyze waits for it
   $("qa-load").onclick = loadQAModel;
   $("qa-run").onclick = runQA;
   $("qa-cancel").onclick = () => qaAction("/qa/cancel", "POST");
