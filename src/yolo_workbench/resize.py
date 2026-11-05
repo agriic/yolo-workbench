@@ -106,7 +106,7 @@ def _stage(path: Path, target: Path, options: dict) -> dict | str | None:
 def resize_images(dataset: Dataset, options: dict, split: str = "all", job: Job | None = None) -> dict:
     """Resize the images of `split` that do not fit, as one undoable change (see the module doc). Cancelled, it
     changes nothing."""
-    dataset.check_writable()
+    dataset.check_writable(structure=True)
     total, pending = _candidates(dataset, options, split)
     ensure_free_space(dataset.root, sum(record.image_size or 0 for record in pending), "resizing the images")
     # this run's own folder: an undone resize's versions wait in the trash for a redo, and must stay as they are

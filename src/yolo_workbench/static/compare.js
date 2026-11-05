@@ -133,7 +133,8 @@ function resultsTable(category) {
     if (!info) return `<span class="muted">not recorded</span>`;
     const counts = ["train", "val", "test"].map(split => info.splits?.[split] ?? 0).join("/");
     const differs = reference && info.fingerprint !== reference.fingerprint;
-    return `<span class="${differs ? "warn-text" : ""}" title="Dataset fingerprint ${esc(info.fingerprint)} (train/val/test images)${differs ? " — differs from the first run" : ""}">${esc(counts)}${differs ? " · changed" : ""}</span>`;
+    const snapshot = info.snapshot ? ` · ${esc(info.snapshot.name)}` : "";
+    return `<span class="${differs ? "warn-text" : ""}" title="Dataset fingerprint ${esc(info.fingerprint)} (train/val/test images)${info.snapshot ? `, snapshot “${esc(info.snapshot.name)}”${info.snapshot.proposed ? " (a proposed split)" : ""}` : ""}${differs ? " — differs from the first run" : ""}">${esc(counts)}${snapshot}${differs ? " · changed" : ""}</span>`;
   };
   return `<table class="stats-table compare-table"><thead><tr><th>Run</th><th>Model</th><th>Epochs</th><th>Best epoch</th><th>Best ${esc(label)} (val)</th><th>Final val ${esc(label)}</th><th>Test ${esc(label)}</th><th>Data (train/val/test)</th></tr></thead><tbody>
     ${loaded.map(({ run, rows, slot }) => {

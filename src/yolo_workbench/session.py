@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import secrets
 import threading
 import time
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from .labelqa import LabelQAManager
 from .predictor import UNLOAD_WAIT, PredictorManager
 
 PRESENCE_TTL = 30.0  # seconds a browser counts as still having an image open after its last heartbeat
+MAX_SUBSETS = 20  # image lists kept for the gallery's subset filter (newest)
 
 
 @dataclass
@@ -27,6 +29,9 @@ class DatasetSession:
     # who has which image open in the editor: browser tab -> {who, image_id, seen}; signed-in users only
     presence: dict = field(default_factory=dict)
     _presence_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # image lists the gallery can filter by (`subset=`): a snapshot comparison's added/moved/changed images, the
+    # images a rebalance plan moves; token -> {label, ids}
+    subsets: dict = field(default_factory=dict)
 
     @classmethod
     def open(cls, dataset: Dataset, predictor: PredictorManager | None = None, slug: str | None = None, project: dict | None = None) -> "DatasetSession":
@@ -44,6 +49,19 @@ class DatasetSession:
 
     def touch(self) -> None:
         self.last_used = time.monotonic()
+
+    def remember_subset(self, label: str, image_ids) -> str:
+        """Keep a list of images for the gallery's subset filter; returns its token."""
+        token = secrets.token_hex(6)
+        with self._presence_lock:
+            self.subsets[token] = {"label": label, "ids": set(image_ids)}
+            while len(self.subsets) > MAX_SUBSETS:
+                self.subsets.pop(next(iter(self.subsets)))
+        return token
+
+    def subset(self, token: str) -> dict | None:
+        with self._presence_lock:
+            return self.subsets.get(token)
 
     def set_presence(self, image_id: str | None) -> None:
         """The requesting browser tab has `image_id` open in the editor (None: closed it)."""

@@ -484,13 +484,13 @@ def test_session_rotation_keeps_trash_undo_needs_and_retention_purges_the_rest(t
         os.utime(path, (old, old))
     RUNTIME.trash_retention_days = RUNTIME.backup_retention_days = 30
     purged = storage.apply_retention(dataset.root, dataset)
-    assert purged == {"trash": [], "backups": [first]}  # the trash is still needed by undo
+    assert purged == {"trash": [], "backups": [first], "snapshots": []}  # the trash is still needed by undo
     dataset.history("undo")  # the image is back; nothing points into the trash any more
     dataset._redo.clear()
     for path in (dataset.root / ".yolo-workbench" / "trash").rglob("*"):
         os.utime(path, (old, old))  # the (now empty) folders changed when the files moved back
     assert storage.apply_retention(dataset.root, dataset)["trash"] == [first]
-    assert storage.apply_retention(dataset.root, None) == {"trash": [], "backups": []}
+    assert storage.apply_retention(dataset.root, None) == {"trash": [], "backups": [], "snapshots": []}
 
 
 def test_maintenance_cleans_staging_rotates_sessions_and_expires_project_trash(tmp_path):

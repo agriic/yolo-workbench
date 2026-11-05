@@ -37,6 +37,9 @@ min_free_disk_gb = 5.0
 # history can still put back are kept regardless.
 trash_retention_days = 30
 backup_retention_days = 30
+# Snapshots taken automatically (before a rebalance or a restore) are deleted after this many days unless
+# kept or used by a training run (0 = keep). Snapshots taken by hand are never deleted automatically.
+auto_snapshot_retention_days = 30
 # Deleted projects (<projects>/.trash/) are deleted for good after this many days (0 = keep).
 project_trash_retention_days = 30
 # A new backup/trash session starts this often (hours) while a project stays open, so older ones can expire.

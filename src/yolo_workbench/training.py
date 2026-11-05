@@ -43,7 +43,7 @@ from typing import Callable
 
 import yaml
 
-from . import frameworks, identity
+from . import frameworks, identity, snapshots
 from .dataset import Dataset, DatasetError, DatasetLocked  # noqa: F401  (DatasetLocked is part of this module's API)
 from .frameworks import (  # noqa: F401  (re-exported: the Ultralytics argument helpers used to live here)
     MANAGED_KEYS,
@@ -293,6 +293,7 @@ class TrainingManager:
         self._lock = threading.RLock()
         self._handle = None  # process handle of a run this server launched (None after a restart)
         self._locked: dict[Path, dict] = {}  # dataset yaml -> lock info; replaced whole, read without the lock
+        self._preparing: dict[str, str] = {}  # queue key -> the job taking the snapshot that run trains on
         self._file_cache: dict[tuple, object] = {}
         self._devices: tuple[float, list] | None = None
         self._stop = threading.Event()
@@ -395,7 +396,7 @@ class TrainingManager:
     def _refresh_lock(self) -> None:
         active = self._queue["active"]
         locked = {}
-        if active is not None:
+        if active is not None and not active.get("snapshot"):  # a run on a snapshot leaves the dataset writable
             try:
                 target, run_dir = self._entry_dir(active)
                 meta = _read_json(run_dir / META_DIR / "run.json") or {}
@@ -442,12 +443,70 @@ class TrainingManager:
                     self._queue["queue"].pop(0)  # the run folder was deleted by hand
                     self._save_queue()
                     continue
-                busy = self.jobs.running(entry.get("project"), tuple(IMAGE_JOBS))
+                own = self._preparing.get(self._key(entry))
+                busy = [job for job in self.jobs.running(entry.get("project"), tuple(IMAGE_JOBS)) if job["id"] != own]
                 if busy:
                     self._write_state(run_dir, status="queued", waiting=f"{IMAGE_JOBS[busy[0]['kind']]} in this dataset")
                     break
-                self._launch(entry, target, run_dir)
+                ready = self._snapshot_ready(entry, target, run_dir)
+                if ready == "wait":
+                    break
+                if ready == "ready":
+                    self._launch(entry, target, run_dir)
             self._refresh_lock()
+
+    def _snapshot_ready(self, entry: dict, target: TrainingTarget, run_dir: Path) -> str:
+        """For the run at the front of the queue that trains on a snapshot taken at launch: reuse a snapshot of the
+        data as it is now, or take one (a job; the run waits for it). "ready" (launch it), "wait", or "failed" (it
+        left the queue). Caller holds the lock."""
+        workdir = run_dir / META_DIR
+        spec = _read_json(workdir / "spec.json") or {}
+        if spec.get("snapshot") != "launch":
+            return "ready"
+        key = self._key(entry)
+        name = (_read_json(workdir / "run.json") or {}).get("name", run_dir.name)
+        job_id = self._preparing.get(key)
+        job = None
+        if job_id is not None:
+            try:
+                job = self.jobs.get(job_id)
+            except KeyError:
+                self._preparing.pop(key, None)  # forgotten (a restart): taken again below
+        if job is None:
+            try:
+                dataset = target.dataset()
+                current = snapshots.fingerprint(dataset)
+                reuse = next((item for item in snapshots.list_snapshots(dataset.root) if item.get("fingerprint") == current and item.get("category") == target.category), None)
+            except (DatasetError, OSError) as exc:
+                return self._fail_preparing(entry, run_dir, f"Could not read the dataset: {exc}")
+            if reuse is not None:
+                self._assign_snapshot(spec, workdir, run_dir, dataset.root, reuse["id"])
+                return "ready"
+            job = self.jobs.start("snapshot", entry.get("project"), f"Snapshot for training run '{name}'", lambda job: snapshots.take(dataset, f"Run '{name}'", kind="run", job=job))
+            self._preparing[key] = job["id"]
+        if job["state"] == "running":
+            self._write_state(run_dir, status="queued", waiting="the snapshot of the dataset it trains on is being taken")
+            return "wait"
+        self._preparing.pop(key, None)
+        if job["state"] == "done" and job.get("result"):
+            dataset = target.dataset()
+            self._assign_snapshot(spec, workdir, run_dir, dataset.root, job["result"]["id"])
+            return "ready"
+        return self._fail_preparing(entry, run_dir, f"Could not take the snapshot of the dataset: {job.get('error') or 'cancelled'}")
+
+    def _assign_snapshot(self, spec: dict, workdir: Path, run_dir: Path, root: Path, snapshot_id: str) -> None:
+        spec["snapshot"] = snapshot_id
+        spec["snapshot_root"] = str(root)
+        _write_json(workdir / "spec.json", spec)
+        snapshots.use(root, snapshot_id, run_dir.name)
+
+    def _fail_preparing(self, entry: dict, run_dir: Path, error: str) -> str:
+        if self._queue["queue"] and self._queue["queue"][0] is entry:
+            self._queue["queue"].pop(0)
+        self._write_state(run_dir, status="failed", phase="failed", error=error, finished=time.time(), waiting=None)
+        self._save_queue()
+        log.warning("training: run '%s' did not start: %s", run_dir.name, error)
+        return "failed"
 
     def _active_alive(self, active: dict) -> bool:
         if self._handle is not None:
@@ -528,8 +587,15 @@ class TrainingManager:
         workdir = run_dir / META_DIR
         spec = _read_json(workdir / "spec.json") or {}
         framework = frameworks.get(spec.get("framework"))
+        snapshot = None
         try:
             dataset = target.dataset()
+            if spec.get("snapshot"):
+                try:
+                    snapshot = snapshots.get(dataset.root, spec["snapshot"])
+                except KeyError:
+                    raise DatasetError("The snapshot this run trains on was deleted") from None
+                dataset = snapshots.open_dataset(dataset.root, snapshot["id"], target.category)
             with dataset._lock:  # in-flight writes finish before the guard flips
                 plan = self._data_plan(target, dataset, framework, spec.get("folders"))
                 if plan["errors"]:
@@ -547,11 +613,16 @@ class TrainingManager:
                 _write_json(workdir / "spec.json", spec)
                 meta = _read_json(workdir / "run.json") or {}
                 meta["dataset"] = {"fingerprint": plan["fingerprint"], "splits": plan["counts"], "names": plan["names"], "folders": plan["folders"], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                if snapshot is not None:
+                    meta["dataset"]["snapshot"] = {"id": snapshot["id"], "name": snapshot["name"], "created": snapshot["created"], "proposed": bool(snapshot.get("rebalance"))}
                 _write_json(workdir / "run.json", meta)
                 (workdir / "control.json").unlink(missing_ok=True)
                 (workdir / "process.json").unlink(missing_ok=True)
                 self._write_state(run_dir, replace=True, status="starting", phase="starting", resumed=bool(spec.get("resume")), queued_at=None)
                 self._queue["queue"].pop(0)
+                entry.pop("snapshot", None)
+                if snapshot is not None:
+                    entry["snapshot"] = snapshot["id"]  # the dataset stays writable (see _refresh_lock)
                 self._queue["active"] = entry
                 self._refresh_lock()
             ensure_free_space(run_dir, what=f"training run '{meta.get('name', run_dir.name)}'")
@@ -850,6 +921,7 @@ class TrainingManager:
             "onnx": self._onnx_info(run_dir, weights.get("best")),
             "dataset": meta.get("dataset"),
             "folders": spec.get("folders"),  # the split folders it trains on; None = the whole dataset
+            "snapshot": spec.get("snapshot"),  # None: the dataset itself; "launch": taken when it starts; an id
         }
 
     @staticmethod
@@ -1085,11 +1157,36 @@ class TrainingManager:
                 replace(run_dir, doomed)
             except OSError as exc:
                 raise DatasetError(f"Could not delete the run folder ({exc.strerror or exc}); is one of its files open in another program?") from exc
+        self._release_snapshot(doomed, run_dir.name)
         try:
             shutil.rmtree(doomed)
         except OSError as exc:
             raise DatasetError(f"The run is gone from the list, but some of its files could not be deleted: {doomed.as_posix()} ({exc.strerror or exc})") from exc
         return {"deleted": run_id, "bytes": size}
+
+    @staticmethod
+    def _release_snapshot(run_dir: Path, name: str) -> None:
+        """The run (folder `name`, now at `run_dir`) is going: the snapshot it trained on no longer serves it."""
+        spec = _read_json(run_dir / META_DIR / "spec.json") or {}
+        if spec.get("snapshot") and spec.get("snapshot") != "launch" and spec.get("snapshot_root"):
+            try:
+                snapshots.release(Path(spec["snapshot_root"]), spec["snapshot"], name)
+            except (DatasetError, OSError) as exc:
+                log.warning("training: could not release snapshot %s of run '%s': %s", spec["snapshot"], name, exc)
+
+    def snapshot_users(self, project: str | None, snapshot_id: str) -> list[str]:
+        """Runs that still need the snapshot: active, queued, or resumable runs that train on it."""
+        target = self.resolve(project)
+        with self._lock:
+            users = []
+            for run_dir in self._scan(target):
+                spec = _read_json(run_dir / META_DIR / "spec.json") or {}
+                if spec.get("snapshot") != snapshot_id:
+                    continue
+                summary = self._summary(target, run_dir)
+                if summary["active"] or summary["queue_position"] is not None or summary["resumable"]:
+                    users.append(summary["name"])
+            return users
 
     def started_from(self, path: Path) -> str | None:
         """The name of the active or a queued run whose weights argument names `path` (a run folder or a model file)."""
@@ -1117,7 +1214,7 @@ class TrainingManager:
         spec = _read_json(run_dir / META_DIR / "spec.json") or {}
         args = self._run_args(framework, run_dir, spec)
         ordered = framework.copy_args(args, target.category)
-        return {"args": ordered, "framework": framework.id, "yaml": args_to_yaml(ordered), "folders": spec.get("folders"), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
+        return {"args": ordered, "framework": framework.id, "yaml": args_to_yaml(ordered), "folders": spec.get("folders"), "snapshot": spec.get("snapshot"), "name": _next_name(self._summary(target, run_dir)["name"], {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set())}
 
     # ---------- options and validation ----------
 
@@ -1152,6 +1249,9 @@ class TrainingManager:
             "devices": self.devices(),
             # the split folders a run can be limited to (classification trains on every folder)
             "folders": [] if target.category == "classification" else dataset.folders()["items"],
+            # what a run can train on besides the dataset itself (see enqueue)
+            "snapshots": [{key: item.get(key) for key in ("id", "name", "kind", "created", "images", "splits", "folders")} | {"proposed": bool(item.get("rebalance")), "folder_counts": snapshots.folder_counts(dataset.root, item)} for item in snapshots.list_snapshots(dataset.root) if item.get("category") == target.category],
+            "snapshot_link": snapshots.link_check(dataset)["mode"] if dataset.images else "none",
             "weights_dir": self.weights_dir.as_posix(),
             "next_name": _next_name(None, {path.name for path in target.runs_root.iterdir()} if target.runs_root.is_dir() else set()),
         }
@@ -1178,9 +1278,14 @@ class TrainingManager:
         result["yaml"] = args_to_yaml(result["args"]) if not result["errors"] else text
         return result
 
-    def preflight(self, project: str | None, dataset: Dataset, args: dict | None = None, folders: dict[str, list[str]] | None = None) -> dict:
+    def preflight(self, project: str | None, dataset: Dataset, args: dict | None = None, folders: dict[str, list[str]] | None = None, snapshot: str | None = None) -> dict:
         target = self.resolve(project)
         framework = frameworks.for_args(args or {})
+        if snapshot and snapshot != "launch":
+            try:
+                dataset = snapshots.open_dataset(dataset.root, snapshot, target.category)
+            except KeyError:
+                raise DatasetError("That snapshot no longer exists") from None
         with dataset._lock:
             plan = self._data_plan(target, dataset, framework, folders)
         warnings = list(plan["warnings"])
@@ -1198,13 +1303,15 @@ class TrainingManager:
 
     # ---------- queue operations ----------
 
-    def enqueue(self, project: str | None, dataset: Dataset, name: str, notes: str, text: str, confirm: bool = False, folders: dict[str, list[str]] | None = None) -> dict:
+    def enqueue(self, project: str | None, dataset: Dataset, name: str, notes: str, text: str, confirm: bool = False, folders: dict[str, list[str]] | None = None, snapshot: str | None = None) -> dict:
+        """Queue a run. `snapshot`: None trains on the dataset (read-only while it trains), "launch" on a snapshot
+        taken when the run starts (or an equal one reused), an id on that snapshot."""
         target = self.resolve(project)
         parsed = frameworks.validate(target.category, text)
         framework = frameworks.get(parsed["framework"])
         if parsed["errors"]:
             raise DatasetError("; ".join(f"line {error['line']}: {error['message']}" if error.get("line") else error["message"] for error in parsed["errors"]))
-        check = self.preflight(project, dataset, parsed["args"], folders)
+        check = self.preflight(project, dataset, parsed["args"], folders, snapshot)
         if check["errors"]:
             raise DatasetError("; ".join(check["errors"]))
         if check["warnings"] and not confirm:
@@ -1223,6 +1330,11 @@ class TrainingManager:
             spec = {"version": 1, "framework": framework.id, "args": parsed["args"], "resume": False}
             if folders is not None:
                 spec["folders"] = folders
+            if snapshot:
+                spec["snapshot"] = snapshot
+                if snapshot != "launch":
+                    spec["snapshot_root"] = str(dataset.root)
+                    snapshots.use(dataset.root, snapshot, directory)
             _write_json(workdir / "spec.json", spec)
             self._write_state(run_dir, replace=True, status="queued", phase="queued", queued_at=time.time())
             self._queue["queue"].append({"project": project, "dir": directory})
@@ -1401,7 +1513,9 @@ class TrainingManager:
                 spec["resume"] = False
                 _write_json(run_dir / META_DIR / "spec.json", spec)
             elif [child.name for child in run_dir.iterdir()] == [META_DIR]:
+                self._release_snapshot(run_dir, run_dir.name)
                 shutil.rmtree(run_dir)
+            self._preparing.pop(self._key({"project": project, "dir": run_dir.name}), None)
             return {"cancelled": run_id}
 
     def queue(self) -> dict:

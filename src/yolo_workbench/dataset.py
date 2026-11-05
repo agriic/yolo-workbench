@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -179,6 +180,11 @@ class SchemaEntry:
         return {new: old for old, new in self.mapping.items() if new is not None}
 
 
+# entries that move or replace image files: refused while a structure hold is on (a snapshot links the images)
+STRUCTURE_ENTRIES = (RecordMoveEntry, MoveEntry, ImageFileEntry, DirMoveEntry)
+MOVE_LISTING_THRESHOLD = 32  # moves in one transaction from which its checks use folder listings
+
+
 class Transaction(list):
     """One undoable unit: the entries applied together, who made it, and its place in the history's order.
 
@@ -231,15 +237,21 @@ class PreparedChange:
 
 
 class Dataset:
-    def __init__(self, yaml_path: Path, category: Category, background_probe: bool = False, allow_empty: bool = False):
+    def __init__(self, yaml_path: Path, category: Category, background_probe: bool = False, allow_empty: bool = False, read_only: bool = False):
         self.yaml_path = yaml_path.resolve()
         self.category = category
         self.root = self.yaml_path.parent
         # managed projects start with no images and no classes; external datasets must have both
         self.allow_empty = allow_empty
         self.background_probe = background_probe
+        # a snapshot opened to train on or compare: every write is refused, and image sizes are not probed
+        # (they come from its index; nothing is written into it)
+        self.read_only = read_only
         # returns why the dataset is read-only right now (a training run), or None; see check_writable()
         self.write_guard = None
+        # why image files must stay where they are right now (a snapshot links them), by hold token
+        self._structure_holds: dict[int, str] = {}
+        self._hold_tokens = itertools.count(1)
         # training runs live in <dataset dir>/runs/; never index their plots or treat files there as labels
         self._excluded_roots = {(self.yaml_path if self.yaml_path.is_dir() else self.yaml_path.parent) / "runs"}
         self.names: dict[int, str] = {}
@@ -295,7 +307,7 @@ class Dataset:
         self._reviews_timer: threading.Timer | None = None
         self.indexing: dict[str, int] = {"done": 0, "total": 0}
         self._load()
-        pending = [record for record in self.images.values() if record.width == 0 and record.probe_error is None]
+        pending = [] if read_only else [record for record in self.images.values() if record.width == 0 and record.probe_error is None]
         self.indexing = {"done": len(self.images) - len(pending), "total": len(self.images)}
         self._start_probe(pending)
 
@@ -462,27 +474,44 @@ class Dataset:
 
     def add_folder(self, split: str, path: str) -> dict:
         """Create a new image folder and list it under `split` in the YAML (one undoable step)."""
-        from .yamledit import write_key
+        with self._lock:
+            folder = self.folder_path(path)
+            self._execute(self._folder_entries([(split, folder)]))
+            return {"split": split, "path": self.folder_label(folder), **self.folders(), **self.history_state()}
 
-        if split not in ("train", "val", "test"):
-            raise DatasetError("Split must be train, val, or test")
-        if not self.yaml_path.is_file():
-            raise DatasetError("This dataset has no YAML file to record the new folder in")
+    def folder_path(self, path: str) -> Path:
+        """A new split folder's path from its label (relative to the root, inside it, not hidden)."""
         raw = str(path).strip().replace("\\", "/").strip("/")
         parts = [part for part in raw.split("/") if part not in ("", ".")]
         if not parts or any(part == ".." or part.startswith(".") for part in parts):
             raise DatasetError("Use a folder path inside the dataset, without '..' or hidden folders")
-        with self._lock:
-            folder = self.root.joinpath(*parts).resolve()
-            if not folder.is_relative_to(self.root) or folder == self.root:
-                raise DatasetError("The folder must be inside the dataset root")
-            for existing in self._all_folders():
+        folder = self.root.joinpath(*parts).resolve()
+        if not folder.is_relative_to(self.root) or folder == self.root:
+            raise DatasetError("The folder must be inside the dataset root")
+        return folder
+
+    def _folder_entries(self, new: list[tuple[str, Path]]) -> list:
+        """History entries creating split folders (and their labels/ twins) and listing them in the YAML: one
+        YAML entry for all of them, then a layout-only schema entry. Caller holds the lock."""
+        from .yamledit import write_key
+
+        if not self.yaml_path.is_file():
+            raise DatasetError("This dataset has no YAML file to record the new folder in")
+        entries: list = []
+        created: list[Path] = []
+        taken = list(self._all_folders())
+        config = self._read_config()
+        before = text = self.yaml_path.read_text(encoding="utf-8")
+        added: dict[str, list[str]] = {}
+        for split, folder in new:
+            if split not in ("train", "val", "test"):
+                raise DatasetError("Split must be train, val, or test")
+            for existing in taken:
                 if folder == existing or folder.is_relative_to(existing) or existing.is_relative_to(folder):
-                    raise DatasetError(f"{self.folder_label(folder)} overlaps the existing split folder {self.folder_label(existing)}")
+                    raise DatasetError(f"{self.folder_label(folder)} overlaps the split folder {self.folder_label(existing)}")
             if folder.exists() and any(folder.iterdir()):
                 raise DatasetError(f"{self.folder_label(folder)} already exists and is not empty; add it to data.yaml by hand or rescan")
-            entries: list = []
-            created = []
+            taken.append(folder)
             for directory in [folder] + ([] if self.category == "classification" else [self._label_root_for(folder)]):
                 if directory != folder and directory.exists():
                     continue
@@ -495,17 +524,17 @@ class Dataset:
                     if item not in created:
                         entries.append(DirEntry(item, True))
                         created.append(item)
-            config = self._read_config()
+            added.setdefault(split, []).append(folder.relative_to(self.root).as_posix())
+        for split, labels in added.items():
             current_value = config.get(split)
             listed = current_value if isinstance(current_value, list) else [current_value] if current_value else []
             if self.category == "classification" and not listed and split in self._split_folders:
                 listed = [self.folder_label(self._split_folders[split][0])]
-            new_value = listed + ["/".join(parts)]
-            before = self.yaml_path.read_text(encoding="utf-8")
-            entries.append(FileEntry(self.yaml_path, before, write_key(before, split, new_value[0] if len(new_value) == 1 else new_value), True, True))
-            entries.append(SchemaEntry({class_id: class_id for class_id in self.names}, layout_only=True))
-            self._execute(entries)
-            return {"split": split, "path": self.folder_label(folder), **self.folders(), **self.history_state()}
+            new_value = listed + labels
+            text = write_key(text, split, new_value[0] if len(new_value) == 1 else new_value)
+        entries.append(FileEntry(self.yaml_path, before, text, True, True))
+        entries.append(SchemaEntry({class_id: class_id for class_id in self.names}, layout_only=True))
+        return entries
 
     def _make_record(self, split: str, image_path: Path, record_id: str | None = None) -> ImageRecord:
         record_id = record_id or hashlib.sha1(f"{split}:{image_path}".encode()).hexdigest()[:16]
@@ -1613,8 +1642,13 @@ class Dataset:
 
     @staticmethod
     def _move_file(src: Path, dst: Path) -> None:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        replace(src, dst)
+        try:
+            replace(src, dst)
+        except FileNotFoundError:  # the first file into a new folder (asked only then: each call is a round trip)
+            if not src.exists():
+                raise
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            replace(src, dst)
 
     def _prepare(self, record: ImageRecord, raw_annotations: list[dict], expected_revision: int | None = None) -> PreparedChange:
         """Validate raw annotations and capture the label state this change is based on."""
@@ -1703,11 +1737,28 @@ class Dataset:
     def _number(self, value: float) -> str:
         return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
 
-    def check_writable(self) -> None:
-        """Raise DatasetLocked while the dataset is read-only (callers hold no partial writes yet)."""
+    def check_writable(self, structure: bool = False) -> None:
+        """Raise DatasetLocked while the dataset is read-only (callers hold no partial writes yet). structure: the
+        write moves, deletes or replaces image files, which a structure hold (a snapshot being taken) refuses too."""
+        if self.read_only:
+            raise DatasetLocked("A snapshot is read-only")
         reason = self.write_guard() if self.write_guard is not None else None
         if reason:
             raise DatasetLocked(f"The dataset is read-only while {reason}")
+        if structure and self._structure_holds:
+            raise DatasetLocked(f"Images cannot be moved, deleted or replaced while {next(iter(self._structure_holds.values()))}; label edits go on")
+
+    def hold_structure(self, reason: str) -> int:
+        """Refuse image moves, deletes and swaps until release_structure(token) (`reason` says why: "a snapshot is
+        being taken"). Label edits go on. Returns the hold's token."""
+        with self._lock:
+            token = next(self._hold_tokens)
+            self._structure_holds[token] = reason
+            return token
+
+    def release_structure(self, token: int) -> None:
+        with self._lock:
+            self._structure_holds.pop(token, None)
 
     def _commit_many(self, changes: list[PreparedChange], history=True) -> None:
         """Write all changes as one transaction: every file is checked before any is touched."""
@@ -1870,6 +1921,13 @@ class Dataset:
         what = "the class list" if any(other.schema for other in others) else "the same images"
         return WriteConflict(f"Cannot {direction} your last change ({transaction.action}): {' and '.join(names[:3])}{' and others' if len(names) > 3 else ''} changed {what} since")
 
+    def clear_history(self) -> None:
+        """Forget every undo and redo step: the files changed outside the history (a snapshot restored in place)."""
+        with self._lock:
+            self._undo.clear()
+            self._redo.clear()
+            self._history_bytes.clear()
+
     def history_state(self) -> dict:
         """Whether the requesting user has something to undo or redo."""
         with self._lock:
@@ -1945,7 +2003,7 @@ class Dataset:
         inside the same transaction is in place before labels are interpreted.
         """
         with self._lock:
-            self.check_writable()
+            self.check_writable(structure=any(isinstance(entry, STRUCTURE_ENTRIES) for entry in entries))
             names = getattr(entries, "names", None)
             if names is not None and any(self.names.get(class_id) != name for class_id, name in names.items()):
                 raise WriteConflict(f"Cannot {direction}: the class list changed since this change was made")
@@ -1953,11 +2011,14 @@ class Dataset:
             records_by_label = {record.label_path: record for record in self.images.values()}
             # a new transaction's label entries hold what its builder has just read; history is read again
             current = {} if fresh else self._read_texts([entry.label_path for entry in ordered if isinstance(entry, HistoryEntry)])
+            # a big move (a rebalance, its undo) lists the folders once instead of asking about every file
+            listing = fsscan.Listing(stat=False) if sum(isinstance(entry, RecordMoveEntry) for entry in ordered) >= MOVE_LISTING_THRESHOLD else None
             for entry in ordered:
-                self._check_entry(entry, direction, records_by_label, exact=not fresh, current=current)
+                self._check_entry(entry, direction, records_by_label, exact=not fresh, current=current, listing=listing)
             # images this leaves out of the dataset (deleted, or a restore undone): other browsers must hear of them
             removed = [entry.image_id for entry in ordered if isinstance(entry, RecordMoveEntry) and (entry.split_after if direction == "redo" else entry.split_before) is None]
             touched: dict[str, ImageRecord] = {}
+            moved: set[str] = set()  # records only moved to another split: their labels are as they were
             written: dict[Path, tuple] = {}  # label files as written, parsed from memory afterwards
             schema: SchemaEntry | None = None
             resort = False
@@ -1972,13 +2033,19 @@ class Dataset:
                 if isinstance(entry, SchemaEntry):
                     schema = entry
                 elif entry is not None:
-                    resort |= self._apply_entry(entry, direction, records_by_label, touched)
-            if schema is not None:
-                self._reload_schema(classes_changed=not schema.layout_only, known=written)
-                if not schema.layout_only:
-                    self._schema_log.append((self.schema_generation, schema.mapping if direction == "redo" else schema.inverse(), identity.who()))
+                    resort |= self._apply_entry(entry, direction, records_by_label, touched, moved)
+            if schema is not None and not schema.layout_only:
+                self._reload_schema(known=written)
+                self._schema_log.append((self.schema_generation, schema.mapping if direction == "redo" else schema.inverse(), identity.who()))
             else:
-                self._read_records([record for record in touched.values() if record.id in self.images], known=written)
+                if schema is not None:  # split folders only: every label reads as it did
+                    self._read_layout()
+                    self._statistics_cache = None
+                present = [record for record in touched.values() if record.id in self.images]
+                for record in present:
+                    if record.id in moved and record.label_path not in written:
+                        self._moved_record(record)
+                self._read_records([record for record in present if record.id not in moved or record.label_path in written], known=written)
             if resort:
                 self._resort()
                 self._find_orphans()
@@ -2025,9 +2092,11 @@ class Dataset:
         if park.exists():
             raise WriteConflict(f"Cannot {direction}: {park.name} already exists in the trash")
 
-    def _check_entry(self, entry, direction: str, records_by_label: dict, exact: bool = True, current: dict | None = None) -> None:
+    def _check_entry(self, entry, direction: str, records_by_label: dict, exact: bool = True, current: dict | None = None, listing: fsscan.Listing | None = None) -> None:
         """Can `entry` be applied in `direction`? exact: also compare label files with the content the entry
-        expects (replaying history; a new transaction has just read them). current: label files read already."""
+        expects (replaying history; a new transaction has just read them). current: label files read already.
+        listing: the folders of a transaction moving many files, listed once (a move asks it, not the disk)."""
+        exists = listing.exists if listing is not None else os.path.exists
         if isinstance(entry, HistoryEntry):
             record = records_by_label.get(entry.label_path)
             if record is None:
@@ -2069,14 +2138,14 @@ class Dataset:
                 if record is None or record.path != pairs[0][0]:
                     raise WriteConflict(f"{pairs[0][0].name} changed outside this application; cannot {direction}")
                 # a label made after the move (it had none then) would stay behind as an orphan
-                if record.label_path != record.path and record.label_path.exists() and record.label_path not in {src for src, _ in pairs}:
+                if record.label_path != record.path and record.label_path not in {src for src, _ in pairs} and exists(record.label_path):
                     raise WriteConflict(f"{record.label_path.name} was created since; cannot {direction}")
             elif entry.image_id in self.images:
                 raise WriteConflict(f"{pairs[0][1].name} is already part of the dataset; cannot {direction}")
             for src, dst in pairs:
-                if not src.exists():
+                if not exists(src):
                     raise WriteConflict(f"{src.name} changed outside this application; cannot {direction}")
-                if dst.exists():
+                if exists(dst):
                     raise WriteConflict(f"Cannot {direction}: {dst.name} already exists in {dst.parent.name}/")
         elif isinstance(entry, FileMoveEntry):
             src, dst = (entry.dst, entry.src) if direction == "undo" else (entry.src, entry.dst)
@@ -2104,8 +2173,15 @@ class Dataset:
             touched[record.id] = record
             written[path] = (after if after_exists else None, mtime, None)
 
-    def _apply_entry(self, entry, direction: str, records_by_label: dict, touched: dict) -> bool:
-        """Apply one checked entry other than a label entry; returns True when record membership or order changed."""
+    def _moved_record(self, record: ImageRecord) -> None:
+        """A record moved to another split with its label: its annotations stand, what names its split follows."""
+        for issue in record.issues:
+            issue["split"] = record.split
+        self._refresh_record_indexes(record)
+
+    def _apply_entry(self, entry, direction: str, records_by_label: dict, touched: dict, moved: set | None = None) -> bool:
+        """Apply one checked entry other than a label entry; returns True when record membership or order changed.
+        `moved` gets the ids of records moved between splits (their labels came along unchanged)."""
         if isinstance(entry, FileEntry):
             (before, before_exists), (after, after_exists) = self._states(entry, direction)
             if before_exists:
@@ -2133,9 +2209,12 @@ class Dataset:
                 self._add_record(record, read=False)
             else:
                 record = self.images[entry.image_id]
-                label_path = image_path if self.category == "classification" else self._label_for(image_path)
+                # the label moved along (the second pair); one with no label gets the place a label would have
+                label_path = image_path if self.category == "classification" else pairs[1][1] if len(pairs) > 1 else self._label_for(image_path)
                 self._relocate(record, image_path, label_path)
                 self._set_split(record, split_to)
+                if moved is not None:
+                    moved.add(record.id)
             touched[record.id] = record
             return True
         if isinstance(entry, FileMoveEntry):
@@ -2187,10 +2266,9 @@ class Dataset:
         record.name_cf = image_path.name.casefold()
         if old_label != label_path:
             self._revisions[label_path] = self._revisions.pop(old_label, 0)
-            self._mtimes.pop(old_label, None)
+            # a rename keeps the file's time: no stat per moved image (each is a round trip on a network drive)
+            self._mtimes[label_path] = self._mtimes.pop(old_label, None)
             self._digests[label_path] = self._digests.pop(old_label, None)
-        stat = self._safe_stat(label_path)
-        self._mtimes[label_path] = stat.st_mtime_ns if stat else None
 
     def _reload_schema(self, classes_changed: bool = True, known: dict | None = None) -> None:
         """Re-read class names and split folders from disk and re-interpret every record against them.
@@ -2230,29 +2308,54 @@ class Dataset:
         """Move images (and their labels) to a split folder as one undoable transaction."""
         with self._lock, identity.action(f"move images to {split}"):
             target_root = self.resolve_folder(split, folder)
-            entries, skipped, targets = [], 0, set()
-            for image_id in dict.fromkeys(image_ids):
+            return self.relocate_images([(image_id, split, target_root) for image_id in dict.fromkeys(image_ids)])
+
+    def move_targets(self, record: ImageRecord, target_root: Path, label_roots: dict | None = None) -> tuple[Path, Path | None]:
+        """Where a record's image (and label, when it has one) go in another split folder: the path below its split
+        folder is kept. `label_roots` caches each target folder's label folder. Caller holds the lock."""
+        source_root = self._folder_of(record)
+        relative = record.path.relative_to(source_root) if source_root else Path(record.path.name)
+        image_path = target_root / relative
+        if self.category == "classification" or record.label_path == record.path or self._mtimes.get(record.label_path) is None:
+            return image_path, None
+        roots = label_roots if label_roots is not None else {}
+        label_root = roots.get(target_root)
+        if label_root is None:
+            label_root = roots[target_root] = self._label_root_for(target_root)
+        return image_path, (label_root / relative).with_suffix(".txt") if label_root != target_root else image_path.with_suffix(".txt")
+
+    def relocate_images(self, moves: list[tuple[str, str, Path]], create: list[tuple[str, Path]] = ()) -> dict:
+        """Move images (and their labels) to other splits, each to its own split folder, as one undoable
+        transaction; `create` ((split, folder)) are new split folders made (and listed in the YAML) first. Targets
+        are checked against folder listings (no call per image; labels known from memory): a taken name refuses
+        the whole move."""
+        with self._lock:
+            self.check_writable(structure=True)
+            entries = self._folder_entries(list(create)) if create else []
+            listing = fsscan.Listing(stat=False)
+            label_roots: dict[Path, Path] = {}
+            skipped, targets = 0, set()
+            moved = []
+            for image_id, split, target_root in moves:
                 record = self.require_image(image_id)
-                source_root = self._folder_of(record)
-                if record.split == split and source_root == target_root:
+                if record.split == split and self._folder_of(record) == target_root:
                     skipped += 1
                     continue
-                relative = record.path.relative_to(source_root) if source_root else Path(record.path.name)
-                image_path = target_root / relative
+                image_path, label_path = self.move_targets(record, target_root, label_roots)
                 where = f"{split} ({self.folder_label(target_root)})"
-                if image_path.exists() or image_path in targets:
+                if image_path in targets or listing.exists(image_path):
                     raise DatasetError(f"Cannot move {record.path.name}: {where} already has a file with that name")
                 targets.add(image_path)
                 files = [(record.path, image_path)]
-                if record.label_path != record.path and record.label_path.exists():
-                    label_path = self._label_for(image_path)
-                    if label_path.exists():
+                if label_path is not None:
+                    if label_path in targets or listing.exists(label_path):
                         raise DatasetError(f"Cannot move {record.path.name}: {label_path.name} already exists in {where}")
+                    targets.add(label_path)
                     files.append((record.label_path, label_path))
-                entries.append(RecordMoveEntry(record.id, record.split, split, files))
-            if entries:
-                self._execute(entries)
-            return {"moved": len(entries), "skipped": skipped, **self.history_state()}
+                moved.append(RecordMoveEntry(record.id, record.split, split, files))
+            if moved:
+                self._execute(entries + moved)
+            return {"moved": len(moved), "skipped": skipped, "created": [self.folder_label(folder) for _, folder in create] if moved else [], **self.history_state()}
 
     def replace_images(self, versions: list[dict]) -> dict:
         """Put new versions of image files in place (resized) as one undoable transaction; the originals go to the

@@ -139,6 +139,12 @@ export function showTraining(runId = null) {
   loadRuns();
 }
 
+// The rebalance dialog's "Train with this split": the Training tab with a new run on that snapshot.
+export function newRunOn(snapshotId) {
+  deps.showTab("training");
+  openForm({ snapshot: snapshotId });
+}
+
 export function hideTraining() {
   clearTimeout(listTimer);
   clearTimeout(liveTimer);
@@ -582,6 +588,7 @@ function renderDetailSkeleton() {
         <p class="section-subtitle">${facts.map(esc).join(" · ")}</p>
         <p class="section-subtitle"><code title="Run folder">${esc(run.path)}</code></p>
         ${run.folders ? `<p class="section-subtitle" title="The run trains only on these split folders">Folders: ${foldersText(run.folders)}</p>` : ""}
+        ${run.dataset?.snapshot ? `<p class="section-subtitle" title="The run trains on this snapshot (Dataset tab → Snapshots); the dataset stayed editable">Snapshot: ${esc(run.dataset.snapshot.name)}${run.dataset.snapshot.proposed ? " (proposed split)" : ""}</p>` : run.snapshot === "launch" ? `<p class="section-subtitle">Trains on a snapshot taken when it starts</p>` : ""}
       </div>
       <div class="run-actions" id="run-actions"></div>
     </div>

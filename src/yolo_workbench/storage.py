@@ -143,12 +143,16 @@ def purge_expired(root: Path, kind: str, days: float, protected: set[str] = froz
 
 
 def apply_retention(root: Path, dataset: Dataset | None = None) -> dict:
-    """The server's retention for one dataset (open or not): expired trash and backup sessions go."""
+    """The server's retention for one dataset (open or not): expired trash and backup sessions go, and so do
+    expired automatic snapshots."""
+    from . import snapshots
+
     current: set[str] = {dataset.session_id} if dataset is not None else set()
     in_undo = dataset.referenced_trash_sessions() if dataset is not None else set()
     return {
         "trash": purge_expired(root, "trash", RUNTIME.trash_retention_days, current | in_undo),
         "backups": purge_expired(root, "backups", RUNTIME.backup_retention_days, current),
+        "snapshots": snapshots.purge_expired(root),
     }
 
 

@@ -283,6 +283,33 @@ class Workspace:
             })
             return self.info(slug)
 
+    def create_from_snapshot(self, slug: str, snapshot_id: str, name: str) -> dict:
+        """A new project holding a snapshot of project `slug`: its images hardlinked (copied where that fails), its
+        labels, classes and splits as they were."""
+        from . import snapshots
+
+        name = str(name).strip()
+        if not name:
+            raise DatasetError("Project name cannot be empty")
+        with self._lock:
+            source = self.project_dir(slug)
+            data = self._read_project(source)
+            meta = snapshots.get(source, snapshot_id)
+            if meta.get("rebalance"):
+                raise DatasetError("This snapshot is a proposed split; take a snapshot of the dataset to start a project from it")
+            new_slug = self._slug_for(name)
+            directory = self.root / new_slug
+            directory.mkdir()
+            try:
+                snapshots.copy_into(source, snapshot_id, directory)
+                info = self.adopt(new_slug, data["category"], name)
+                self.update(new_slug, description=f"From snapshot '{meta['name']}' ({meta['created'][:10]}) of {data.get('name', slug)}")
+            except Exception:
+                shutil.rmtree(directory, ignore_errors=True)
+                raise
+            log.info("workspace: project %s created from snapshot %s of %s", new_slug, snapshot_id, slug)
+            return self.info(new_slug) if info else info
+
     # ---------- trash ----------
 
     def trash(self, slug: str) -> dict:

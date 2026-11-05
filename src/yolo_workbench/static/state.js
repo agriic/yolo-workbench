@@ -18,6 +18,7 @@ export const state = {
   editorDetached: false,  // editor image dropped out of the filtered grid; editorGridIndex is where it was
   issues: [],
   issueFilter: null,
+  imageSubset: null,   // {token, label}: the gallery shows only a list of images the server keeps (subset=)
   statistics: null,
   detail: null,        // image detail currently in the editor
   img: null,           // loaded HTMLImageElement

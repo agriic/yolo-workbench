@@ -133,6 +133,9 @@ let args = {};        // the run's arguments (non-default values + model)
 let mode = "gui";     // "gui" | "raw"
 let modelSource = "pretrained";
 let folders = null;   // {split: [folder]} the run trains on; null = the whole dataset
+// what the run trains on: "launch" (a snapshot taken when it starts), null (the dataset itself, read-only while it
+// trains), or a snapshot id
+let dataSource = "launch";
 let check = { errors: [], warnings: [], notes: [], splits: null, argErrors: [] };
 let checkToken = 0;
 let queueAhead = 0;
@@ -184,7 +187,8 @@ export function argsToYaml(values) {
 // ---------- open ----------
 
 /**
- * @param {{from?: "duplicate"|"finetune", runId?: string}} source  prefill from a run, else the last-used args
+ * @param {{from?: "duplicate"|"finetune", runId?: string, snapshot?: string}} source  prefill from a run, else the
+ *   last-used args; `snapshot` trains on that snapshot (a proposed split from the rebalance dialog)
  */
 export async function openRunForm(source = {}) {
   const container = $("run-detail");
@@ -196,9 +200,12 @@ export async function openRunForm(source = {}) {
     let notes = "";
     Object.keys(argsByFramework).forEach(key => delete argsByFramework[key]);
     folders = null;
+    dataSource = source.snapshot && snapshotOf(source.snapshot) ? source.snapshot : defaultSource();
     if (source.runId) {
       const copied = await api(`/training/runs/${encodeURIComponent(source.runId)}/args`);
       args = { ...copied.args };
+      // a duplicate trains on the same snapshot while it exists (the same data, other arguments)
+      if (copied.snapshot && (copied.snapshot === "launch" || snapshotOf(copied.snapshot))) dataSource = copied.snapshot;
       folders = fitFolders(copied.folders);
       name = copied.name;
       if (source.from === "finetune") {
@@ -312,10 +319,20 @@ const rawHelp = () => framework() === "rfdetr"
   ? "One <code>key: value</code> per line: RF-DETR's training arguments, plus <code>model</code> (the variant), <code>pretrain_weights</code>, <code>resolution</code> and <code>device</code>. <code>dataset_dir</code> and <code>output_dir</code> are set by the workbench."
   : "One <code>key: value</code> per line, as in <code>args.yaml</code>. <code>data</code>, <code>project</code> and <code>name</code> are set by the workbench.";
 
-// ---------- training data: the split folders the run trains on ----------
+// ---------- training data: what the run trains on, and the split folders ----------
 
 const SPLITS = ["train", "val", "test"];
-const folderItems = () => (options.folders ?? []).filter(item => SPLITS.includes(item.split));
+const snapshotOf = id => options.snapshots?.find(item => item.id === id);
+// a snapshot at launch where it costs no space (hardlinks); else the dataset itself, as before snapshots
+const defaultSource = () => options.snapshot_link === "link" || options.snapshot_link === "none" ? "launch" : null;
+// the folders of what the run trains on, with their image counts: a snapshot's as they were when it was taken;
+// a proposed split lists its images instead and has none to choose
+const folderItems = () => {
+  const snapshot = dataSource && dataSource !== "launch" ? snapshotOf(dataSource) : null;
+  if (snapshot?.proposed) return [];
+  if (snapshot) return Object.entries(snapshot.folders ?? {}).flatMap(([split, paths]) => paths.map(path => ({ split, path, images: snapshot.folder_counts?.[split]?.[path] ?? null }))).filter(item => SPLITS.includes(item.split));
+  return (options.folders ?? []).filter(item => SPLITS.includes(item.split));
+};
 const folderChosen = item => folders === null || (folders[item.split] ?? []).includes(item.path);
 const foldersSummary = () => folders === null
   ? "All folders"
@@ -329,23 +346,43 @@ function fitFolders(selection) {
   return folderItems().every(item => (kept[item.split] ?? []).includes(item.path)) ? null : kept;
 }
 
+const sourceNote = () => {
+  if (dataSource === "launch") {
+    const copy = options.snapshot_link === "copy" || options.snapshot_link === "mixed" ? " This drive has no hardlinks, so the snapshot copies the images." : "";
+    return `A snapshot of the dataset is taken when the run starts (an identical earlier one is reused). The dataset stays editable while it trains, and a resume trains on the same data.${copy}`;
+  }
+  if (!dataSource) return "The dataset is read-only while the run trains.";
+  const snapshot = snapshotOf(dataSource);
+  if (!snapshot) return "That snapshot no longer exists.";
+  const splits = SPLITS.filter(split => snapshot.splits?.[split]).map(split => `${snapshot.splits[split].toLocaleString()} ${split}`).join(" · ");
+  return `${snapshot.proposed ? "A proposed split from the rebalance dialog: nothing moved in the dataset. " : ""}${new Date(snapshot.created).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })} · ${splits}. The dataset stays editable while it trains.`;
+};
+
 function renderFolders() {
   const el = $("form-data");
   const items = folderItems();
   // with one folder per split there is nothing to choose (unless a copied run used a subset)
-  el.hidden = folders === null && !SPLITS.some(split => items.filter(item => item.split === split).length > 1);
-  if (el.hidden) { el.innerHTML = ""; return; }
+  const choose = folders !== null || SPLITS.some(split => items.filter(item => item.split === split).length > 1);
+  if (!items.length) folders = null;
+  const snapshots = options.snapshots ?? [];
+  el.hidden = false;
   el.innerHTML = `
-    <div class="panel-head"><h2>Training data</h2><span class="muted" id="folders-summary">${foldersSummary()}</span></div>
-    <div class="train-folders">
+    <div class="panel-head"><h2>Training data</h2>${choose && items.length ? `<span class="muted" id="folders-summary">${foldersSummary()}</span>` : ""}</div>
+    <label class="field train-source">Train on<select id="train-source">
+      <option value="launch" ${dataSource === "launch" ? "selected" : ""}>A snapshot taken when the run starts</option>
+      <option value="" ${!dataSource ? "selected" : ""}>The dataset itself (read-only while it trains)</option>
+      ${snapshots.length ? `<optgroup label="Snapshots">${snapshots.map(item => `<option value="${esc(item.id)}" ${dataSource === item.id ? "selected" : ""}>${esc(item.name)}${item.proposed && !item.name.startsWith("Proposed split") ? " (proposed split)" : ""}</option>`).join("")}</optgroup>` : ""}
+    </select></label>
+    <p class="panel-note">${esc(sourceNote())}</p>
+    ${choose && items.length ? `<div class="train-folders">
       ${SPLITS.filter(split => items.some(item => item.split === split)).map(split => `
         <div class="train-folder-split"><span class="split-badge">${split}</span>
           ${items.filter(item => item.split === split).map(item => `<label class="toggle train-folder" title="${esc(item.path)}">
             <input type="checkbox" data-train-split="${esc(split)}" data-train-folder="${esc(item.path)}" ${folderChosen(item) ? "checked" : ""}>
-            <code>${esc(item.path)}</code><span class="muted">${item.images.toLocaleString()}</span></label>`).join("")}
+            <code>${esc(item.path)}</code>${item.images != null ? `<span class="muted">${item.images.toLocaleString()}</span>` : ""}</label>`).join("")}
         </div>`).join("")}
     </div>
-    <p class="panel-note">The run trains, validates and tests only on the images in the ticked folders.</p>`;
+    <p class="panel-note">The run trains, validates and tests only on the images in the ticked folders.</p>` : ""}`;
 }
 
 function readFolders() {
@@ -564,6 +601,12 @@ async function onChange(e) {
     $("folders-summary").innerHTML = foldersSummary();
     return scheduleCheck();
   }
+  if (target.id === "train-source") {
+    dataSource = target.value || null;
+    folders = fitFolders(folders);
+    renderFolders();
+    return scheduleCheck(0);
+  }
   if (target.name === "form-mode") return switchMode(target.value, target);
   if (target.name === "framework") return switchFramework(target.value);
   if (target.name === "model-source" && framework() === "rfdetr") {
@@ -688,7 +731,7 @@ const runCheck = async () => {
   try {
     const [validation, preflight] = await Promise.all([
       api("/training/args/validate", { method: "POST", body: JSON.stringify({ yaml }) }),
-      api("/training/preflight", { method: "POST", body: JSON.stringify({ yaml, folders }) }),
+      api("/training/preflight", { method: "POST", body: JSON.stringify({ yaml, folders, snapshot: dataSource }) }),
     ]);
     if (token !== checkToken || !$("run-form")) return;
     check = { ...preflight, argErrors: validation.errors.concat(validation.warnings.map(item => ({ ...item, warning: true }))) };
@@ -748,7 +791,7 @@ async function submit() {
   try {
     const result = await api("/training/runs", {
       method: "POST",
-      body: JSON.stringify({ name, notes: $("run-notes").value.trim(), yaml: currentYaml(), confirm: check.warnings.length > 0, folders }),
+      body: JSON.stringify({ name, notes: $("run-notes").value.trim(), yaml: currentYaml(), confirm: check.warnings.length > 0, folders, snapshot: dataSource }),
     });
     if (!result.queued) {
       // new warnings since the last check (e.g. the dataset changed): show them and let the user confirm

@@ -18,8 +18,15 @@ from . import identity
 log = logging.getLogger(__name__)
 
 MAX_FINISHED = 50
-# jobs that write a dataset's image files: a queued training run and closing the project wait for them
-IMAGE_JOBS = {"import": "an import is running", "resize": "images are being resized"}
+# jobs that write a dataset's image files or need them to stay where they are: a queued training run and closing
+# the project wait for them, and another of them is refused meanwhile
+IMAGE_JOBS = {
+    "import": "an import is running",
+    "resize": "images are being resized",
+    "snapshot": "a snapshot is being taken",
+    "rebalance": "images are being moved to other splits",
+    "restore": "a snapshot is being restored",
+}
 
 
 class JobCancelled(Exception):

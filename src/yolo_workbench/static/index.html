@@ -99,6 +99,7 @@
               </section>
             </div>
           </div>
+          <span id="image-subset" class="subset-chip" hidden><span id="image-subset-label"></span><button id="image-subset-clear" type="button" class="link-btn" title="Show all images again" aria-label="Clear this list">×</button></span>
           <input id="image-search" class="toolbar-search" type="search" placeholder="Search filenames…" aria-label="Filter by filename">
           <label class="toggle" id="overlay-toggle" title="Draw annotations on thumbnails"><input type="checkbox" id="show-overlays" checked><span>Overlays</span></label>
           <button id="start-review" class="secondary" type="button" title="Open the first unreviewed image of this list in the editor (then D = done, W = needs work)">Review</button>
@@ -289,8 +290,26 @@
             <div id="import-review" hidden></div>
           </article>
           <article class="stats-panel manage-panel" id="splits-panel">
-            <div class="panel-head"><h2>Splits</h2></div>
+            <div class="panel-head"><h2>Splits</h2><button id="rebalance-open" class="secondary mini" type="button" title="Reassign images to train/val/test by rules, with a preview before anything moves">Rebalance…</button></div>
             <div id="split-overview"></div>
+            <p id="split-leakage" class="panel-note warn-text" hidden></p>
+          </article>
+          <article class="stats-panel manage-panel" id="snapshots-panel">
+            <div class="panel-head"><h2>Snapshots <span id="snapshots-total" class="muted"></span></h2><button id="refresh-snapshots" class="secondary mini" type="button">Refresh</button></div>
+            <p class="panel-note">A frozen copy of the images, labels, classes and splits, to train on, compare with, download or restore. Images are hardlinked, so a snapshot takes almost no space while the dataset keeps them.</p>
+            <form id="snapshot-form" class="snapshot-form">
+              <input id="snapshot-name" type="text" placeholder="Name, e.g. Before cleanup" maxlength="120" autocomplete="off" aria-label="Snapshot name">
+              <input id="snapshot-note" type="text" placeholder="Note (optional)" maxlength="2000" autocomplete="off" aria-label="Snapshot note">
+              <button type="submit" class="secondary">Take snapshot</button>
+            </form>
+            <p id="snapshot-link-note" class="panel-note" hidden></p>
+            <div id="snapshot-progress" class="import-progress" hidden>
+              <div class="import-progress-text"><span id="snapshot-progress-label"></span><span id="snapshot-progress-count" class="muted"></span></div>
+              <progress id="snapshot-progress-bar" max="1" value="0"></progress>
+              <button id="snapshot-cancel" class="secondary" type="button">Cancel</button>
+            </div>
+            <div id="snapshot-list"></div>
+            <div id="snapshot-compare" class="snapshot-compare" hidden></div>
           </article>
           <article class="stats-panel manage-panel" id="resize-panel">
             <div class="panel-head"><h2>Resize images</h2></div>
@@ -381,6 +400,14 @@
       <span><a id="plot-dialog-open" class="button-link" target="_blank" rel="noopener">Open in new tab</a> <button type="button" class="icon-btn" data-close title="Close" aria-label="Close"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></span>
     </div>
     <img id="plot-dialog-image" alt="">
+  </dialog>
+
+  <dialog id="rebalance-dialog" class="modal rebalance-dialog">
+    <form method="dialog" id="rebalance-form">
+      <div><h2>Rebalance splits</h2><p class="modal-text muted">Reassign images to train, val and test by these rules. The preview shows what would move; nothing moves until you apply it, and a snapshot of the splits before is taken first.</p></div>
+      <div class="rebalance-body"><div id="rb-rules" class="rb-rules"></div><div id="rb-preview" class="rb-preview" aria-live="polite"></div></div>
+      <div class="modal-actions"><button value="cancel" class="secondary" formnovalidate>Cancel</button><button id="rb-train" class="secondary" type="button" disabled>Train with this split</button><button id="rb-apply" class="primary-btn" type="button" disabled>Apply…</button></div>
+    </form>
   </dialog>
 
   <dialog id="class-remove-dialog" class="modal">

@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from . import augment_preview, classes, download, identity, importer, resize, rfdetr_augment, storage
+from . import augment_preview, classes, download, identity, imagekeys, importer, rebalance, resize, rfdetr_augment, snapshots, splitstats, storage
 from .auth import Auth, AuthError, AuthMiddleware, current_user
 from .dataset import Dataset, DatasetError, SchemaChanged, WriteConflict
 from .fsutil import InsufficientSpace, ensure_free_space, replace
@@ -215,7 +215,7 @@ class ImageResizePayload(BaseModel):
 
 
 class ImportCommitPayload(ImportSourcePayload):
-    split_mode: Literal["fixed", "auto", "source"] = "fixed"
+    split_mode: Literal["fixed", "auto", "source", "rules"] = "fixed"  # rules: placed by the rebalance rules afterwards
     split: Literal["train", "val", "test"] = "train"
     ratios: dict[str, float] = Field(default_factory=lambda: {"train": 0.8, "val": 0.2, "test": 0.0})
     seed: int = 0
@@ -251,8 +251,13 @@ class TrainingArgsPayload(BaseModel):
 TrainingFolders = dict[Literal["train", "val", "test"], list[str]] | None
 
 
+# what a run trains on: None the dataset itself, "launch" a snapshot taken when it starts, or a snapshot id
+TrainingSnapshot = str | None
+
+
 class TrainingPreflightPayload(TrainingArgsPayload):
     folders: TrainingFolders = None
+    snapshot: TrainingSnapshot = None
 
 
 class TrainingStartPayload(BaseModel):
@@ -261,6 +266,27 @@ class TrainingStartPayload(BaseModel):
     yaml: str
     confirm: bool = False  # start despite preflight warnings
     folders: TrainingFolders = None
+    snapshot: TrainingSnapshot = None
+
+
+class SnapshotPayload(BaseModel):
+    name: str = ""
+    note: str = ""
+
+
+class SnapshotUpdatePayload(BaseModel):
+    name: str | None = None
+    note: str | None = None
+    keep: bool | None = None
+
+
+class SnapshotProjectPayload(BaseModel):
+    name: str
+
+
+class RebalancePayload(BaseModel):
+    rules: dict | None = None
+    digest: str | None = None
 
 
 class TrainingRunUpdatePayload(BaseModel):
@@ -369,9 +395,15 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def statistics(session: DatasetSession = current):
         return session.dataset.statistics()
 
-    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, session: DatasetSession = current) -> dict:
-        """The gallery filters, shared by the image list and "next unreviewed"."""
+    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, subset: str | None = None, session: DatasetSession = current) -> dict:
+        """The gallery filters, shared by the image list and "next unreviewed". subset: a list of images kept by a
+        snapshot comparison or a rebalance preview (session.remember_subset)."""
         prediction_ids = session.predictor.pending_image_ids() if has_predictions else None
+        if subset:
+            chosen = session.subset(subset)
+            if chosen is None:
+                raise HTTPException(410, "This list of images is no longer available; compare or preview again")
+            prediction_ids = chosen["ids"] if prediction_ids is None else set(prediction_ids) & chosen["ids"]
         return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None, "reviewer": reviewer or None, "folder": folder or None}
 
     @router.get("/images")
@@ -593,6 +625,139 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def storage_purge(kind: str, session_id: str, session: DatasetSession = current):
         return found(lambda: storage.purge(session.dataset, kind, session_id))
 
+    # ---------- snapshots ----------
+
+    def image_job_free(session: DatasetSession) -> None:
+        busy = jobs.running(session.slug, tuple(IMAGE_JOBS))
+        if busy:
+            raise DatasetError(f"Try again once it is done: {IMAGE_JOBS[busy[0]['kind']]}")
+
+    def project_name(session: DatasetSession) -> str:
+        return session.project.get("name", session.dataset.root.name)
+
+    @router.get("/snapshots")
+    def snapshot_list(session: DatasetSession = current):
+        return snapshots.summary(session.dataset)
+
+    @router.get("/snapshots/link-check")
+    def snapshot_link_check(session: DatasetSession = current):
+        """Whether a snapshot would hardlink the images (no space) or copy them, and what copying would take."""
+        return snapshots.link_check(session.dataset)
+
+    @router.post("/snapshots")
+    def snapshot_take(payload: SnapshotPayload, session: DatasetSession = current):
+        dataset = session.dataset
+        image_job_free(session)
+        return jobs.start("snapshot", session.slug, f"Snapshot of {project_name(session)}", lambda job: snapshots.take(dataset, payload.name, payload.note, job=job))
+
+    @router.get("/snapshots/{snapshot_id}")
+    def snapshot_detail(snapshot_id: str, session: DatasetSession = current):
+        return found(lambda: snapshots.get(session.dataset.root, snapshot_id))
+
+    @router.patch("/snapshots/{snapshot_id}")
+    def snapshot_update(snapshot_id: str, payload: SnapshotUpdatePayload, session: DatasetSession = current):
+        return found(lambda: snapshots.update(session.dataset.root, snapshot_id, payload.name, payload.note, payload.keep))
+
+    @router.delete("/snapshots/{snapshot_id}")
+    def snapshot_delete(snapshot_id: str, session: DatasetSession = current):
+        found(lambda: snapshots.get(session.dataset.root, snapshot_id))
+        users = training.snapshot_users(session.slug, snapshot_id)
+        if users:
+            raise DatasetError(f"Training run{'s' if len(users) > 1 else ''} {', '.join(repr(name) for name in users[:5])} train{'' if len(users) > 1 else 's'} on this snapshot (queued, running, or resumable); delete or finish {'them' if len(users) > 1 else 'it'} first")
+        return found(lambda: snapshots.delete(session.dataset.root, snapshot_id)) | snapshots.summary(session.dataset)
+
+    @router.post("/snapshots/{snapshot_id}/recount")
+    def snapshot_recount(snapshot_id: str, session: DatasetSession = current):
+        root = session.dataset.root
+        meta = found(lambda: snapshots.get(root, snapshot_id))
+        return jobs.start("snapshot-size", session.slug, f"Size of snapshot '{meta['name']}'", lambda job: snapshots.recount(root, snapshot_id, job))
+
+    @router.get("/snapshots/{snapshot_id}/download")
+    def snapshot_download(snapshot_id: str, kind: download.Kind = "full", session: DatasetSession = current):
+        meta = found(lambda: snapshots.get(session.dataset.root, snapshot_id))
+        entries = snapshots.download_entries(session.dataset.root, snapshot_id, kind)
+        filename = download.archive_name(f"{session.slug or session.dataset.root.name or 'dataset'}-{meta['id']}", kind)
+        return StreamingResponse(download.stream(entries), media_type="application/zip", headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "Cache-Control": "no-store",
+        })
+
+    @router.post("/snapshots/{snapshot_id}/restore")
+    def snapshot_restore(snapshot_id: str, session: DatasetSession = current):
+        """Make the dataset as it was in the snapshot (a job; the state before becomes a snapshot first)."""
+        dataset = session.dataset
+        meta = found(lambda: snapshots.get(dataset.root, snapshot_id))
+        dataset.check_writable(structure=True)
+        image_job_free(session)
+        return jobs.start("restore", session.slug, f"Restore '{meta['name']}' in {project_name(session)}", lambda job: snapshots.restore(dataset, snapshot_id, job))
+
+    @router.get("/snapshots/{snapshot_id}/diff")
+    def snapshot_diff(snapshot_id: str, session: DatasetSession = current):
+        """What changed from the snapshot to the dataset now; the image lists are kept for the gallery's filter."""
+        root = session.dataset.root
+        meta = found(lambda: snapshots.get(root, snapshot_id))
+        result = splitstats.diff(session.dataset, meta, snapshots.manifest(root, snapshot_id))
+        result["subsets"] = {kind: session.remember_subset(f"Snapshot '{meta['name']}': {kind}", result[kind]) for kind in ("added", "moved", "changed") if result[kind]}
+        return result
+
+    # ---------- rebalance ----------
+
+    @router.get("/rebalance")
+    def rebalance_state(session: DatasetSession = current):
+        """The rules last applied (else the defaults), the splits and folders, and how many images are scanned for
+        the near-duplicate and burst rules."""
+        dataset = session.dataset
+        saved = rebalance.saved_rules(dataset)
+        try:
+            rules = rebalance.parse_rules(dataset, saved)
+        except DatasetError:
+            rules, saved = rebalance.default_rules(dataset), None
+        return {"rules": rules, "saved": saved is not None, "defaults": rebalance.default_rules(dataset), "scan": imagekeys.status(dataset), "capabilities": dataset.capabilities()}
+
+    @router.post("/rebalance/preview")
+    def rebalance_preview(payload: RebalancePayload, session: DatasetSession = current):
+        result = rebalance.plan(session.dataset, payload.rules)
+        moves = result.pop("moves")
+        result["subset"] = session.remember_subset(f"Moved by the rebalance ({len(moves)})", [move["id"] for move in moves]) if moves else None
+        result["sample"] = moves[:20]
+        return result
+
+    @router.post("/rebalance/apply")
+    def rebalance_apply(payload: RebalancePayload, session: DatasetSession = current):
+        """Apply the previewed plan (a job: a snapshot first, then one undoable move)."""
+        dataset = session.dataset
+        if not payload.digest:
+            raise DatasetError("Preview the rebalance first")
+        dataset.check_writable(structure=True)
+        image_job_free(session)
+        return jobs.start("rebalance", session.slug, f"Rebalance {project_name(session)}", lambda job: rebalance.apply(dataset, payload.rules, payload.digest, job))
+
+    @router.post("/rebalance/snapshot")
+    def rebalance_snapshot(payload: RebalancePayload, session: DatasetSession = current):
+        """A snapshot laid out by the previewed plan, to train on; nothing in the dataset moves."""
+        dataset = session.dataset
+        if not payload.digest:
+            raise DatasetError("Preview the rebalance first")
+        image_job_free(session)
+        return jobs.start("snapshot", session.slug, f"Proposed split of {project_name(session)}", lambda job: rebalance.proposed_snapshot(dataset, payload.rules, payload.digest, job))
+
+    @router.post("/rebalance/scan")
+    def rebalance_scan(session: DatasetSession = current):
+        """Fingerprint the images for the near-duplicate and burst rules (a job; only new or changed images)."""
+        dataset = session.dataset
+        if jobs.running(session.slug, "imagekeys"):
+            raise DatasetError("The images are being scanned already")
+        return jobs.start("imagekeys", session.slug, f"Scan the images of {project_name(session)}", lambda job: imagekeys.scan(dataset, job))
+
+    @router.get("/rebalance/leakage")
+    def rebalance_leakage(session: DatasetSession = current):
+        """Groups (by the saved keep-together rules) whose images are in more than one split."""
+        dataset = session.dataset
+        result = rebalance.leakage(dataset, rebalance.saved_rules(dataset))
+        images = result.pop("images")
+        result["subset"] = session.remember_subset(f"Groups in more than one split ({result['groups']})", images) if images else None
+        return result
+
     # ---------- import ----------
 
     def require_import(session: DatasetSession) -> None:
@@ -643,11 +808,23 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         options = payload.model_dump()
 
         def work(job):
+            with dataset._lock:
+                before = set(dataset.images) if payload.split_mode == "rules" else None
             try:
-                return importer.run_import(dataset, source, options, job)
+                result = importer.run_import(dataset, source, options, job)
             finally:
                 if payload.staging_id:
                     importer.discard_staging(dataset, payload.staging_id)
+            if before is not None:
+                with dataset._lock:
+                    new_ids = set(dataset.images) - before
+                if new_ids:
+                    job.progress(message="Placing the new images by the rebalance rules…")
+                    try:
+                        result["placed"] = rebalance.place_new(dataset, rebalance.saved_rules(dataset), new_ids)
+                    except (DatasetError, WriteConflict) as exc:  # imported all the same; they stay in train
+                        result["placed"] = {"moved": 0, "error": str(exc)}
+            return result
 
         return jobs.start("import", session.slug, f"Import into {session.project.get('name', dataset.root.name)}", work)
 
@@ -883,7 +1060,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/training/preflight")
     def training_preflight(payload: TrainingPreflightPayload, session: DatasetSession = current):
-        return training.preflight(session.slug, session.dataset, training.validate(session.slug, payload.yaml)["args"], payload.folders)
+        return training.preflight(session.slug, session.dataset, training.validate(session.slug, payload.yaml)["args"], payload.folders, payload.snapshot)
 
     @router.get("/training/augment/original")
     def augment_original(sample: int = Query(0, ge=0), imgsz: int = Query(640, ge=32, le=4096), size: int = Query(256, ge=64, le=1024), labels: bool = True, session: DatasetSession = current):
@@ -920,7 +1097,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
 
     @router.post("/training/runs")
     def training_start(payload: TrainingStartPayload, session: DatasetSession = current):
-        return training.enqueue(session.slug, session.dataset, payload.name, payload.notes, payload.yaml, payload.confirm, payload.folders)
+        return training.enqueue(session.slug, session.dataset, payload.name, payload.notes, payload.yaml, payload.confirm, payload.folders, payload.snapshot)
 
     @router.get("/training/runs/{run_id}")
     def training_run(run_id: str, session: DatasetSession = current):
@@ -1293,6 +1470,11 @@ def create_workspace_app(workspace: Workspace, media_cache: MediaCache | None = 
     @app.post("/api/v1/projects/{slug}/adopt")
     def project_adopt(slug: str, payload: ProjectAdoptPayload):
         return not_found(lambda: workspace.adopt(slug, payload.category, payload.name))
+
+    @app.post("/api/v1/projects/{slug}/snapshots/{snapshot_id}/project")
+    def project_from_snapshot(slug: str, snapshot_id: str, payload: SnapshotProjectPayload):
+        """A new project with the snapshot's images, labels, classes and splits."""
+        return not_found(lambda: workspace.create_from_snapshot(slug, snapshot_id, payload.name))
 
     @app.get("/api/v1/projects/{slug}/cover")
     def project_cover(slug: str):

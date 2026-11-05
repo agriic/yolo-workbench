@@ -156,6 +156,7 @@ variable is `WORKBENCH_` plus the name in the first column (`WORKBENCH_PORT=9000
 | `media_cache_mb` | `[storage]` | `512` | thumbnail cache size |
 | `min_free_disk_gb` | `[storage]` | `5` | refuse writes below this; warn on every page |
 | `trash_retention_days`, `backup_retention_days` | `[storage]` | `30`, `30` | dataset trash / label backups of earlier sessions (0 = keep) |
+| `auto_snapshot_retention_days` | `[storage]` | `30` | automatic snapshots (before a rebalance or restore) no run uses (0 = keep) |
 | `project_trash_retention_days` | `[storage]` | `30` | deleted projects (0 = keep) |
 | `session_rotate_hours` | `[storage]` | `24` | new backup/trash session while a project stays open |
 | `staging_max_age_hours` | `[storage]` | `24` | abandoned uploads |
@@ -256,7 +257,11 @@ Deleted images and the original of every edited label file are kept per *session
 `<project>/.yolo-workbench/trash|backups/<session>/`. A new session starts daily while a project stays open;
 earlier sessions are deleted after `trash_retention_days` / `backup_retention_days`, except trash the undo
 history can still put back. Deleted projects stay in `<projects>/.trash/` for `project_trash_retention_days`.
-Training runs and models are never deleted automatically.
+Snapshots (`<project>/.yolo-workbench/snapshots/`) taken by hand are kept until deleted; automatic ones (before
+a rebalance or a restore, proposed splits) go after `auto_snapshot_retention_days` unless kept or used by a
+training run, and a run's own snapshot goes with the last run that uses it. A snapshot hardlinks the images, so
+it costs only its label copies while the project keeps the same images; images deleted from the project stay on
+disk while a snapshot links them. Training runs and models are never deleted automatically.
 
 ### Users and sign-in
 
@@ -324,6 +329,9 @@ Back up **the whole projects folder** — images, labels, `data.yaml`, `project.
 and `runs/`, plus the hidden `.training/` (queue), `.trash/` and `.workbench/` (accounts) — and
 `/etc/yolo-workbench/`. The cache folder and
 `<project>/.yolo-workbench/staging/` can be skipped.
+
+Snapshots hardlink the project's images: use a copy that keeps hardlinks (`rsync -aH`, `cp -a`, `tar`), or
+every image is stored once per snapshot in the backup.
 
 For a consistent copy, take it from a filesystem snapshot (LVM, ZFS, btrfs), or stop the service while
 copying (`systemctl stop` pauses training first): a copy taken while a class rename rewrites thousands of

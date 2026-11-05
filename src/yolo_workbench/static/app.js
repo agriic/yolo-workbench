@@ -30,6 +30,8 @@ import { bindManage, configureManage, loadClasses, loadModels, loadStorage, rend
 import { bindRepair, configureRepair, openLabelText, renderUnknownClasses } from "./repair.js";
 import { bindLabelQA, configureLabelQA, labelsChangedForQA, showLabelQA } from "./labelqa.js";
 import { bindTraining, configureTraining, hideTraining, showTraining } from "./training.js";
+import { bindSnapshots, configureSnapshots, loadSnapshots } from "./snapshots.js";
+import { bindRebalance, configureRebalance, loadLeakage, openWithRules } from "./rebalance.js";
 
 export let imageGallery = null;
 let objectGallery = null;
@@ -86,6 +88,8 @@ async function init() {
   setupVirtualGalleries();
   bind();
   bindManage();
+  bindSnapshots();
+  bindRebalance();
   bindRepair();
   bindLabelQA();
   bindTraining();
@@ -211,7 +215,7 @@ export async function datasetChanged({ schema = false, keepEditor = false, keepS
   statisticsChanged();
   updateHistoryButtons();
   const tasks = [loadImages({ reset: schema }), loadObjects({ reset: schema }), loadIssues(), refreshPredictor()];
-  if ($("dataset").classList.contains("active")) tasks.push(loadClasses(), loadStorage());
+  if ($("dataset").classList.contains("active")) tasks.push(loadClasses(), loadStorage(), loadSnapshots(), loadLeakage());
   if ($("embeddings").classList.contains("active")) tasks.push(refreshEmbeddings());
   labelsChangedForQA();  // findings are recomputed from the labels (undo of a Label QA fix, imports, …)
   await Promise.all(tasks.map(task => Promise.resolve(task).catch(error => toast(error.message, "error"))));
@@ -238,7 +242,7 @@ function showTab(tab, runId = null) {
   if (tab === "embeddings") refreshEmbeddings();
   if (tab === "statistics") loadStatistics();
   if (tab === "quality") showLabelQA();
-  if (tab === "dataset") { loadClasses(); loadModels(); loadStorage(); loadActivity(); }
+  if (tab === "dataset") { loadClasses(); loadModels(); loadStorage(); loadSnapshots(); loadLeakage(); loadActivity(); }
 }
 
 // Other people's label or review changes (collab.js): refresh what lists the images.
@@ -341,8 +345,9 @@ function bind() {
     for (const [id, value] of [["image-split", "all"], ["image-folder", ""], ["image-class", ""], ["image-review", ""], ["image-reviewer", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
     renderFolderFilter();
     $("filter-predictions").checked = false;
-    loadImages({ reset: true });
+    showImageSubset(null);
   };
+  $("image-subset-clear").onclick = () => showImageSubset(null);
   // the filters and the prediction controls share one popup; the model chip opens it too
   $("image-options-toggle").onclick = () => showImageOptions($("image-options").hidden);
   $("model-chip").onclick = () => showImageOptions(true);
@@ -728,6 +733,7 @@ function setupVirtualGalleries() {
 // The Annotation tab's filters as query parameters (the image list and "next unreviewed" share them).
 function imageFilterParams() {
   const params = new URLSearchParams({ split: $("image-split").value, search: $("image-search").value });
+  if (state.imageSubset) params.set("subset", state.imageSubset.token);
   if ($("image-folder").value) params.set("folder", $("image-folder").value);
   if ($("image-class").value !== "") params.set("class_id", $("image-class").value);
   if ($("filter-predictions").checked) params.set("has_predictions", "true");
@@ -752,6 +758,7 @@ function showImageOptions(open) {
 function renderFilterCount() {
   const params = imageFilterParams();
   params.delete("search");
+  params.delete("subset");  // its own chip shows it
   if (params.get("split") === "all") params.delete("split");
   const count = new Set([...params.keys()].map(key => key.endsWith("_labels") ? "labels" : key)).size;
   $("image-filter-count").textContent = count || "";
@@ -761,7 +768,20 @@ function fetchImagePage(offset, limit, signal) {
   const params = imageFilterParams();
   params.set("limit", String(limit));
   params.set("offset", String(offset));
-  return api(`/images?${params}`, { signal });
+  return api(`/images?${params}`, { signal }).catch(error => {
+    // the list was forgotten (the project was reopened, or newer lists replaced it)
+    if (error.status === 410 && state.imageSubset) setTimeout(() => showImageSubset(null), 0);
+    throw error;
+  });
+}
+
+// Show only a list of images the server keeps (a snapshot comparison's, a rebalance plan's), or all again (null).
+export function showImageSubset(token, label = "") {
+  state.imageSubset = token ? { token, label } : null;
+  $("image-subset").hidden = !token;
+  $("image-subset-label").textContent = label;
+  if (token) showTab("annotation");
+  loadImages({ reset: true });
 }
 
 // The Exploration tab's size filters (width, height and aspect ranges) and sort as query parameters.
@@ -1395,6 +1415,8 @@ configureManage({
     refreshPredictor();
   },
 });
+configureSnapshots({ datasetChanged, toast, showImages: showImageSubset, applySplit: openWithRules });
+configureRebalance({ datasetChanged, toast, showImages: showImageSubset, showTab, loadSnapshots });
 configureTraining({
   toast,
   showTab,

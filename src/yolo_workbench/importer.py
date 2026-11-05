@@ -33,8 +33,8 @@ from .dataset import IMAGE_EXTENSIONS, READ_WORKERS, WORKBENCH_DIR, Dataset, Dat
 from .fsutil import ensure_free_space, replace
 from .jobs import Job
 from .runtime import RUNTIME
+from .splitstats import SPLIT_ALIASES
 
-SPLIT_ALIASES = {"train": "train", "training": "train", "val": "val", "valid": "val", "validation": "val", "test": "test", "testing": "test"}
 UPLOAD_EXTENSIONS = IMAGE_EXTENSIONS | {".txt", ".yaml", ".yml", ".json"}
 STAGING_PATTERN = re.compile(r"^[a-f0-9]{16}$")
 UNASSIGNED = ""  # classification images that are not inside a class folder
@@ -910,8 +910,11 @@ def _assign_splits(items: list[dict], options: dict, allowed: list[str]) -> None
     elif mode == "fixed":
         for item in items:
             item["target"] = fallback
+    elif mode == "rules":  # into train; the rebalance rules place them afterwards (web: rebalance.place_new)
+        for item in items:
+            item["target"] = "train" if "train" in allowed else fallback
     else:
-        raise DatasetError("Split mode must be fixed, auto, or source")
+        raise DatasetError("Split mode must be fixed, auto, source, or rules")
     used = {item["target"] for item in items}
     if not used <= set(allowed):
         raise DatasetError(f"Split {', '.join(sorted(used - set(allowed)))} is not available in this dataset")

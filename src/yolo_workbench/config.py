@@ -53,6 +53,7 @@ class ServerConfig:
     min_free_disk_gb: float = _setting(5.0, "storage", "float")
     trash_retention_days: int = _setting(30, "storage", "int")  # 0 keeps forever
     backup_retention_days: int = _setting(30, "storage", "int")
+    auto_snapshot_retention_days: int = _setting(30, "storage", "int")  # automatic snapshots; 0 keeps them
     project_trash_retention_days: int = _setting(30, "storage", "int")
     session_rotate_hours: float = _setting(24.0, "storage", "float")  # 0: one session per opening
     staging_max_age_hours: float = _setting(24.0, "storage", "float", minimum=0.1)

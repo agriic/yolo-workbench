@@ -28,6 +28,7 @@ class Runtime:
     embeddings_enabled: bool = True
     trash_retention_days: float = 0  # dataset trash of earlier sessions deleted after this many days; 0 = keep
     backup_retention_days: float = 0
+    auto_snapshot_retention_days: float = 30  # snapshots taken before a rebalance or restore; 0 = keep
 
 
 RUNTIME = Runtime()
@@ -49,4 +50,5 @@ def configure(config) -> Runtime:
     RUNTIME.embeddings_enabled = config.embeddings_enabled
     RUNTIME.trash_retention_days = config.trash_retention_days
     RUNTIME.backup_retention_days = config.backup_retention_days
+    RUNTIME.auto_snapshot_retention_days = config.auto_snapshot_retention_days
     return RUNTIME

@@ -571,6 +571,7 @@ function renderImportReview() {
         ${targetSplits.map(split => `<label class="ratio-input">${esc(split)} <input type="number" min="0" max="100" step="5" data-ratio="${esc(split)}" value="${{ train: 80, val: 20, test: 0 }[split] ?? 0}">%</label>`).join("")}
         <label class="ratio-input">seed <input type="number" id="import-seed" value="0" step="1"></label></span></label>
       ${splitCounts.length ? `<label class="radio-row"><input type="radio" name="split-mode" value="source" checked><span>Keep the source splits (${splitCounts.map(([split, count]) => `${esc(split)} ${count}`).join(" · ")}; the rest go to the split chosen above)</span></label>` : ""}
+      ${targetSplits.includes("train") ? `<label class="radio-row" title="Uses the rules of the Rebalance dialog (Splits panel), with every image already in the dataset kept where it is"><input type="radio" name="split-mode" value="rules"><span>By the rebalance rules: the new images are placed by class balance and keep-together rules (they start in train; one Ctrl+Z puts them back there)</span></label>` : ""}
     </fieldset>
     <fieldset class="import-fieldset" id="import-folders"><legend>Destination folders</legend><div class="folder-targets"></div></fieldset>
     ${cropFieldset(classification)}
@@ -833,6 +834,8 @@ function trackJob(job, schema) {
       result.dropped && `${result.dropped} skipped`, result.crop_skipped && `${result.crop_skipped} outside the crop region`,
       result.objects_cropped_out && `${plural(result.objects_cropped_out, "object")} cropped out`,
       result.objects_skipped && `${plural(result.objects_skipped, "object")} without a usable shape left out`,
+      result.placed?.moved && `${plural(result.placed.moved, "image")} placed in val/test by the rebalance rules`,
+      result.placed?.error && `not placed by the rules: ${result.placed.error}`,
     ].filter(Boolean);
     deps.toast(`Imported ${plural(result.imported, "image")}${result.labels ? ` and ${plural(result.labels, "label")}` : ""}${extra.length ? ` · ${extra.join(", ")}` : ""}`);
   } else if (job.state === "cancelled") {

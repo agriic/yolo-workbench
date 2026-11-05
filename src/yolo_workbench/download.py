@@ -80,8 +80,9 @@ class _Names:
         return candidate
 
 
-def plan(dataset: Dataset, kind: Kind) -> list[Entry]:
-    """The archive's files, from a snapshot of the dataset's records (read under its lock)."""
+def plan(dataset: Dataset, kind: Kind, placed: dict[str, tuple[str, str | None]] | None = None) -> list[Entry]:
+    """The archive's files, from a snapshot of the dataset's records (read under its lock). `placed`, when given,
+    gets each record's (image name, label name or None) in the archive (snapshots.py lays a snapshot out so)."""
     classification = dataset.category == "classification"
     if kind == "labels" and classification:
         raise DatasetError("A classification dataset's labels are its class folders: download it with the images")
@@ -108,7 +109,7 @@ def plan(dataset: Dataset, kind: Kind) -> list[Entry]:
 
     entries: list[Entry] = []
     exported: dict[str, list[str]] = {split: [] for split in SPLITS}  # image names per split (for .txt lists)
-    labels_seen: set[Path] = set()  # a.jpg and a.png share a.txt
+    labels_seen: dict[Path, str] = {}  # a.jpg and a.png share a.txt: its name in the archive
     for record in records:
         folder = folder_of[record.id]
         label_name = None
@@ -130,8 +131,10 @@ def plan(dataset: Dataset, kind: Kind) -> list[Entry]:
         if kind == "full":
             entries.append(Entry(image_name, record.path, compress=record.path.suffix.lower() in (".bmp", ".tif", ".tiff")))
         if not classification and record.label_path not in labels_seen and record.label_path in labelled:
-            labels_seen.add(record.label_path)
-            entries.append(Entry(names.claim(label_name), record.label_path))
+            labels_seen[record.label_path] = names.claim(label_name)
+            entries.append(Entry(labels_seen[record.label_path], record.label_path))
+        if placed is not None:
+            placed[record.id] = (image_name, labels_seen.get(record.label_path))
 
     if yaml_text is not None:
         entries.insert(0, Entry("data.yaml", text=_data_yaml(yaml_text, root, split_folders, sources, external, exported, names, entries)))
