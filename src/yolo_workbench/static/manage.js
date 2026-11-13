@@ -440,7 +440,10 @@ async function uploadModels(files) {
     $("upload-models").disabled = modelUploads > 0;
     if (!modelUploads) modelStatus("");
   }
-  if (uploaded) deps.toast(`Uploaded ${plural(uploaded, "model")}`);
+  if (uploaded) {
+    deps.toast(`Uploaded ${plural(uploaded, "model")}`);
+    deps.modelsChanged();
+  }
   await loadModels();
 }
 
@@ -457,7 +460,7 @@ async function deleteModel(name) {
   try {
     renderModels(await api(`/models/${encodeURIComponent(name)}`, { method: "DELETE" }));
     deps.toast(`Deleted ${name}`);
-    if (item.loaded) deps.modelDeleted(item.path);
+    deps.modelDeleted(item.path);  // also when not loaded: the Annotation tab's menu still lists it
   } catch (error) { deps.toast(error.message, "error"); }
 }
 

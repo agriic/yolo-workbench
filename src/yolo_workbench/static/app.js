@@ -13,7 +13,7 @@ import {
 } from "./canvas.js";
 import {
   acceptPredictions, applyPredictorState, cancelPredict, configurePredictor, confirmAllPending,
-  drawPredictions, hitPrediction, hoverPrediction, loadEditorPredictions, loadModel, maxPointsChanged, predictImage,
+  drawPredictions, hitPrediction, hoverPrediction, loadEditorPredictions, loadModel, loadModelOptions, maxPointsChanged, predictImage,
   refreshPredictor, rejectAllPending, rejectPredictions, renderModelMenu, renderPredList,
   retryPredict, runPredict, uploadModel,
 } from "./predictor.js";
@@ -1416,9 +1416,11 @@ configureManage({
     $("model-path").value = path;
     return loadModel();
   },
+  // the Annotation tab's model menu lists models/ too
+  modelsChanged: () => loadModelOptions(),
   modelDeleted: path => {
     if ($("model-path").value === path) $("model-path").value = "";
-    refreshPredictor();
+    refreshPredictor();  // reloads the model menu as well
   },
 });
 configureSnapshots({ datasetChanged, toast, showImages: showImageSubset, applySplit: openWithRules });
