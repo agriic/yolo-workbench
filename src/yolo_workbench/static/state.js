@@ -50,7 +50,9 @@ export const state = {
   embed: {
     status: "idle", error: null, items: [], hovered: null, poll: null,
     classes: new Set(), selection: [], band: null, mode: "3d",
-    rotation: { yaw: -0.65, pitch: -0.35 }, zoom: 1, rotate: null, projected: [],
+    // 3D view: rotation is a row-major 3×3 matrix (null = the default view), target the cube point at the
+    // canvas center that the view rotates around (cube coordinates -1..1)
+    rotation: null, target: [0, 0, 0], zoom: 1, rotate: null, projected: [],
     pan2d: { x: 0, y: 0 }, zoom2d: 1, panDrag: null,
   },
 };

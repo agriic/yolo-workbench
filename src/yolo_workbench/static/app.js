@@ -473,6 +473,7 @@ function bind() {
   embedCanvas.onpointerup = embedPointerUp;
   embedCanvas.onpointercancel = embedPointerCancel;
   embedCanvas.onwheel = embedWheel;
+  embedCanvas.oncontextmenu = e => e.preventDefault();  // right-drag pans
   embedCanvas.onpointerleave = () => { state.embed.hovered = null; $("embed-tooltip").hidden = true; renderEmbeddings(); };
   $("embed-clear").onclick = () => { state.embed.selection = []; renderEmbedSelection(); renderEmbeddings(); };
   $("embed-delete").onclick = deleteEmbedSelection;
