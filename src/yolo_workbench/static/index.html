@@ -65,6 +65,7 @@
                     <span aria-hidden="true">–</span>
                     <input id="label-max" type="number" min="0" step="1" inputmode="numeric" placeholder="max" aria-label="Maximum labels">
                   </div></div>
+                  <label class="field" id="iou-filter-field" title="Images where two objects overlap at an IoU above this (0–1), whatever their classes; with a class chosen, one of the two is of that class">Overlap IoU &gt;<input id="image-iou" type="number" min="0" max="1" step="0.05" inputmode="decimal" placeholder="e.g. 0.5" aria-label="Overlap IoU above"></label>
                   <label class="toggle" id="prediction-filter-toggle" title="Only images with pending model predictions"><input type="checkbox" id="filter-predictions"><span>Has predictions</span></label>
                 </div>
               </section>

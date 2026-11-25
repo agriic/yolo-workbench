@@ -426,16 +426,17 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def statistics(session: DatasetSession = current):
         return session.dataset.statistics()
 
-    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, subset: str | None = None, session: DatasetSession = current) -> dict:
+    def image_filters(split: str = "all", class_id: int | None = None, search: str = "", has_predictions: bool = False, min_labels: int | None = Query(None, ge=0), max_labels: int | None = Query(None, ge=0), review: Literal["done", "needs_work", "unreviewed"] | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, subset: str | None = None, iou_above: float | None = Query(None, ge=0, le=1), session: DatasetSession = current) -> dict:
         """The gallery filters, shared by the image list and "next unreviewed". subset: a list of images kept by a
-        snapshot comparison or a rebalance preview (session.remember_subset)."""
+        snapshot comparison or a rebalance preview (session.remember_subset); iou_above: images where two objects
+        overlap at an IoU above it."""
         prediction_ids = session.predictor.pending_image_ids() if has_predictions else None
         if subset:
             chosen = session.subset(subset)
             if chosen is None:
                 raise HTTPException(410, "This list of images is no longer available; compare or preview again")
             prediction_ids = chosen["ids"] if prediction_ids is None else set(prediction_ids) & chosen["ids"]
-        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None, "reviewer": reviewer or None, "folder": folder or None}
+        return {"split": split, "class_id": class_id, "search": search, "prediction_ids": prediction_ids, "min_labels": min_labels, "max_labels": max_labels, "review": review, "issue": issue or None, "reviewer": reviewer or None, "folder": folder or None, "iou_above": iou_above}
 
     @router.get("/images")
     def images(filters: dict = Depends(image_filters), offset: int = 0, limit: int = Query(100, ge=1, le=500), session: DatasetSession = current):

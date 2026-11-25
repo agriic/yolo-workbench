@@ -78,6 +78,21 @@ def test_images_endpoint_filters_by_label_count(tmp_path):
 
     asyncio.run(run())
 
+
+def test_images_endpoint_filters_by_overlap_iou(tmp_path):
+    dataset, label = make_dataset(tmp_path)
+    label.write_text("0 0.5 0.5 0.2 0.2\n1 0.55 0.5 0.2 0.2\n")  # IoU 0.6
+    dataset = Dataset(tmp_path / "dataset.yaml", "detection")
+
+    async def run():
+        app = create_app(dataset, media_cache=MediaCache(tmp_path / "media-cache"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.get("/api/v1/images", params={"iou_above": 0.5})).json()["total"] == 1
+            assert (await client.get("/api/v1/images", params={"iou_above": 0.7})).json()["total"] == 0
+            assert (await client.get("/api/v1/images", params={"iou_above": 1.5})).status_code == 422
+
+    asyncio.run(run())
+
 def test_images_endpoint_filters_by_folder(tmp_path):
     root = tmp_path / "ds"
     for folder, count in (("images/a", 2), ("images/b", 3), ("images/val", 1), ("extra", 1)):

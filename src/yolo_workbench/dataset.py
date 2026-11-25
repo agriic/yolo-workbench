@@ -22,7 +22,7 @@ from .activity import ActivityLog
 from .fsutil import occupied, replace
 from .imaging import upright_size
 from .models import Annotation, Category, ImageRecord
-from .overlap import find_overlaps, same_place
+from .overlap import find_overlaps, max_ious, same_place
 from .review import STATUSES as REVIEW_STATUSES, ReviewStore
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
@@ -281,6 +281,9 @@ class Dataset:
         self._object_index: dict[int, dict[str, dict]] = {}
         self._object_keys_by_image: dict[str, list[tuple[int, str]]] = {}
         self._issues_by_image: dict[str, list[dict]] = {}
+        # per image: its annotations list and overlap.max_ious of it, worked out when the IoU filter first asks
+        # (a re-read replaces the list, so a cached entry is current while it still holds the record's list)
+        self._max_iou_cache: dict[str, tuple[list, dict]] = {}
         self._issue_index: dict[str, tuple[ImageRecord, dict]] = {}
         self._issue_count = 0
         self._orphan_issues: list[dict] = []
@@ -584,6 +587,7 @@ class Dataset:
         self.images.pop(record.id, None)
         self._object_keys_by_image.pop(record.id, None)
         self._issues_by_image.pop(record.id, None)
+        self._max_iou_cache.pop(record.id, None)
         image_ids = self._split_image_ids.get(record.split)
         if image_ids is not None:
             image_ids.discard(record.id)
@@ -997,6 +1001,7 @@ class Dataset:
         self._object_index = {}
         self._object_keys_by_image = {}
         self._issues_by_image = {}
+        self._max_iou_cache = {}
         self._issue_index = {}
         self._issue_count = 0
         for record in self.images.values():
@@ -1405,25 +1410,26 @@ class Dataset:
             item.pop("score", None)
         return outliers[:100]
 
-    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None) -> dict:
+    def list_images(self, split="all", class_id=None, search="", offset=0, limit=100, prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, iou_above: float | None = None) -> dict:
         with self._lock:
-            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer, folder)
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer, folder, iou_above)
             return {"total": len(records), "items": [{**record.summary(), "v": self._revisions.get(record.label_path, 0)} for record in records[offset : offset + limit]]}
 
-    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None) -> dict:
+    def next_unreviewed(self, start: int, split="all", class_id=None, search="", prediction_ids: set[str] | None = None, min_labels: int | None = None, max_labels: int | None = None, review: str | None = None, issue: str | None = None, reviewer: str | None = None, folder: str | None = None, iou_above: float | None = None) -> dict:
         """The first unreviewed image at or after `start` in the filtered list (wrapping around), with its position."""
         with self._lock:
-            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer, folder)
+            records = self._filter_images(split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer, folder, iou_above)
             start = min(max(0, start), len(records))
             for index in [*range(start, len(records)), *range(start)]:
                 if records[index].review is None:
                     return {"index": index, "total": len(records), "item": records[index].summary()}
             return {"index": None, "total": len(records), "item": None}
 
-    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer=None, folder=None) -> list[ImageRecord]:
+    def _filter_images(self, split, class_id, search, prediction_ids, min_labels, max_labels, review, issue, reviewer=None, folder=None, iou_above=None) -> list[ImageRecord]:
         """The gallery's filters, in gallery order. review: done / needs_work / unreviewed; issue: any / none / an
         issue kind; reviewer: a user name (whose review status the image has); folder: a split folder as
-        folder_label shows it (images of .txt lists are in none)."""
+        folder_label shows it (images of .txt lists are in none); iou_above: images where two objects overlap at an
+        IoU above it — with a class filter, an object of that class and any other object (not in classification)."""
         allowed: set[str] | None = None
         if split != "all":
             allowed = set(self._split_image_ids.get(split, set()))
@@ -1448,6 +1454,8 @@ class Dataset:
             low = min_labels if min_labels is not None else 0
             high = max_labels if max_labels is not None else math.inf
             records = [record for record in records if low <= label_count(record) <= high]
+        if iou_above is not None and self.category != "classification":
+            records = [record for record in records if self._max_ious(record).get(class_id, 0.0) > iou_above]
         if review:
             wanted = None if review == "unreviewed" else review
             records = [record for record in records if record.review == wanted]
@@ -1460,6 +1468,15 @@ class Dataset:
         elif issue:
             records = [record for record in records if any(item["kind"] == issue for item in record.issues)]
         return records
+
+    def _max_ious(self, record: ImageRecord) -> dict[int | None, float]:
+        """overlap.max_ious of the record's annotations, cached until they are read again. Callers hold _lock."""
+        cached = self._max_iou_cache.get(record.id)
+        if cached is not None and cached[0] is record.annotations:
+            return cached[1]
+        result = max_ious(self.category, record.annotations)
+        self._max_iou_cache[record.id] = (record.annotations, result)
+        return result
 
     def set_review(self, image_ids: list[str], status: str | None) -> dict:
         """Mark images done / needs work, or clear their status (None). Not on the undo stack."""

@@ -350,9 +350,9 @@ function bind() {
   $("image-review-clear").onclick = () => reviewSelection(null);
   $("show-overlays").onchange = () => loadImages();
   $("image-search").oninput = debounce(() => loadImages({ reset: true }), 250);
-  [$("label-min"), $("label-max")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
+  [$("label-min"), $("label-max"), $("image-iou")].forEach(el => el.oninput = debounce(() => loadImages({ reset: true }), 250));
   $("image-filters-reset").onclick = () => {
-    for (const [id, value] of [["image-split", "all"], ["image-folder", ""], ["image-class", ""], ["image-review", ""], ["image-reviewer", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""]]) $(id).value = value;
+    for (const [id, value] of [["image-split", "all"], ["image-folder", ""], ["image-class", ""], ["image-review", ""], ["image-reviewer", ""], ["image-issues", ""], ["label-min", ""], ["label-max", ""], ["image-iou", ""]]) $(id).value = value;
     renderFolderFilter();
     $("filter-predictions").checked = false;
     showImageSubset(null);
@@ -763,6 +763,8 @@ function imageFilterParams() {
       const value = $(id).value.trim();
       if (/^\d+$/.test(value)) params.set(key, value);
     }
+    const iou = $("image-iou").value.trim();
+    if (iou !== "" && Number.isFinite(+iou) && +iou >= 0 && +iou <= 1) params.set("iou_above", iou);
   }
   return params;
 }
