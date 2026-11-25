@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass, field
 
 from . import identity
+from .boxfit import BoxFitManager
 from .dataset import Dataset
 from .embeddings import EmbeddingsManager
 from .labelqa import LabelQAManager
@@ -25,6 +26,7 @@ class DatasetSession:
     slug: str | None = None  # None in single-dataset mode
     project: dict = field(default_factory=dict)
     labelqa: LabelQAManager | None = None
+    boxfit: BoxFitManager | None = None  # SAM box fit (detection); None for a test's bare session
     last_used: float = field(default_factory=time.monotonic)  # last API request (projects mode closes idle sessions)
     # who has which image open in the editor: browser tab -> {who, image_id, seen}; signed-in users only
     presence: dict = field(default_factory=dict)
@@ -38,12 +40,14 @@ class DatasetSession:
         predictor = predictor or PredictorManager(dataset, project_only=slug is not None)
         # a test may pass a stand-in predictor without the real manager's state; Label QA needs the real one
         labelqa = LabelQAManager(dataset, predictor) if isinstance(predictor, PredictorManager) else None
-        return cls(dataset, predictor, EmbeddingsManager(dataset), slug, project or {}, labelqa)
+        return cls(dataset, predictor, EmbeddingsManager(dataset), slug, project or {}, labelqa, boxfit=BoxFitManager(dataset))
 
     def unload_models(self, run: str) -> bool:
-        """Free the GPU for training run `run`: stop Label QA's analysis and drop the prediction model."""
+        """Free the GPU for training run `run`: stop Label QA's analysis and a SAM box fit, and drop the prediction model."""
         if self.labelqa is not None:
             self.labelqa.stop(UNLOAD_WAIT)
+        if self.boxfit is not None:
+            self.boxfit.stop(UNLOAD_WAIT)
         unload = getattr(self.predictor, "unload", None)  # a test's stand-in predictor may have none
         return bool(unload and unload(run))
 
@@ -88,10 +92,12 @@ class DatasetSession:
         return {image_id: list(people.values()) for image_id, people in found.items()}
 
     def close(self, timeout: float = 5.0) -> None:
-        """Stop this dataset's background work (prediction batch, Label QA, size probing) and drop its model.
+        """Stop this dataset's background work (prediction batch, Label QA, box fit, size probing) and drop its model.
         Embeddings cannot be interrupted; their thread is waited for up to `timeout` seconds."""
         if self.labelqa is not None:
             self.labelqa.stop(timeout)
+        if self.boxfit is not None:
+            self.boxfit.stop(timeout)
         close = getattr(self.predictor, "close", None)
         if close is not None:
             close(timeout)
@@ -109,4 +115,6 @@ class DatasetSession:
             return "embeddings are being computed"
         if self.labelqa is not None and self.labelqa.busy_reason():
             return "Label QA is analyzing images"
+        if self.boxfit is not None and self.boxfit.busy_reason():
+            return self.boxfit.busy_reason()
         return None

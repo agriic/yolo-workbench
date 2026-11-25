@@ -2499,7 +2499,7 @@ class Dataset:
         return [a.as_dict() for a in annotations if a.id not in removed]
 
     def bulk_edit_objects(self, operations: list[dict], schema_generation: int | None = None) -> dict:
-        """Relabel or delete many annotations across images in one transaction."""
+        """Relabel, reshape (new `points`: SAM box fit) or delete many annotations across images in one transaction."""
         with self._lock, identity.action("bulk edit objects"):  # reads records the background probe may be updating
             self.check_schema(schema_generation)
             if self.category == "classification":
@@ -2532,6 +2532,11 @@ class Dataset:
                     continue
                 if operation["action"] == "delete":
                     annotations.remove(annotation)
+                elif operation["action"] == "reshape":
+                    if not operation.get("points"):
+                        skipped.append({"image_id": image_id, "annotation_id": operation["annotation_id"], "reason": "Reshape requires points"})
+                        continue
+                    annotation.points = [float(value) for value in operation["points"]]  # _prepare validates them
                 elif operation.get("class_id") is None:
                     skipped.append({"image_id": image_id, "annotation_id": operation["annotation_id"], "reason": "Relabel requires class_id"})
                     continue
@@ -2557,6 +2562,8 @@ class Dataset:
                 skipped.append({"image_id": operation["image_id"], "annotation_id": None, "reason": "Image not found"})
             elif operation["action"] == "delete":
                 skipped.append({"image_id": record.id, "annotation_id": None, "reason": "Deleting images is not supported for classification datasets"})
+            elif operation["action"] == "reshape":
+                skipped.append({"image_id": record.id, "annotation_id": None, "reason": "Classification images have no geometry"})
             elif operation.get("class_id") is None or int(operation["class_id"]) not in self.names:
                 skipped.append({"image_id": record.id, "annotation_id": None, "reason": "Relabel requires a known class_id"})
             elif record.id not in seen:

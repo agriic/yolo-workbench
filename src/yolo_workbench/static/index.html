@@ -161,6 +161,7 @@
           <strong id="object-selected-count"></strong>
           <select id="bulk-class" title="Target class"></select>
           <button id="bulk-relabel" class="secondary">Relabel</button>
+          <button id="bulk-fit" class="secondary" title="Fit the selected boxes tightly around their objects with SAM; review the result in Label QA before applying">Fit with SAM</button>
           <button id="bulk-delete" class="danger-btn">Delete</button>
           <button id="bulk-clear" class="secondary">Clear</button>
         </div>
@@ -226,9 +227,17 @@
 
     <section id="quality" class="view">
       <div class="section-title">
-        <div><h1>Label QA</h1><p class="section-subtitle">Where a trained model disagrees with the labels: objects nobody labelled, wrong classes, loose boxes, and labels the model cannot find. Most suspicious first.</p></div>
-        <button id="qa-clear" class="secondary" type="button" hidden title="Forget this analysis">Clear results</button>
+        <div><h1>Label QA</h1><p class="section-subtitle" id="qa-subtitle">Where a trained model disagrees with the labels: objects nobody labelled, wrong classes, loose boxes, and labels the model cannot find. Most suspicious first.</p></div>
+        <div class="qa-title-actions">
+          <div class="segmented" id="qa-source" role="radiogroup" aria-label="Compare the labels with">
+            <label title="Run a trained model over the images and list where it disagrees with the labels"><input type="radio" name="qa-source" value="model" checked><span>Trained model</span></label>
+            <label title="Fit every box of a class tightly around its object with SAM and list the boxes it would move"><input type="radio" name="qa-source" value="sam"><span>SAM box fit</span></label>
+          </div>
+          <button id="qa-clear" class="secondary" type="button" hidden title="Forget this analysis">Clear results</button>
+          <button id="fit-clear" class="secondary" type="button" hidden title="Forget every SAM fit and its dismissed boxes">Clear fits</button>
+        </div>
       </div>
+      <div id="qa-model-pane">
       <div class="stats-panel qa-setup">
         <label class="field grow">Model<span class="qa-model-row"><select id="qa-model"></select>
           <button id="qa-load" class="secondary" type="button" title="Load this model (the Annotation tab's prediction model changes too)">Load</button></span></label>
@@ -248,6 +257,27 @@
       </div>
       <div id="qa-grid" class="grid qa-grid"></div>
       <div class="qa-more"><button id="qa-more" class="secondary" type="button" hidden>Show more</button></div>
+      </div>
+      <div id="qa-fit-pane" hidden>
+      <div class="stats-panel qa-setup">
+        <label class="field">Class<select id="fit-class"></select></label>
+        <label class="field">Images<select id="fit-split"><option value="all">All splits</option></select></label>
+        <button id="fit-run" class="primary-btn" type="button" title="Fit every box of the class with SAM (nothing changes until you apply)">Fit boxes</button>
+        <button id="fit-cancel" class="secondary" type="button" hidden>Cancel</button>
+        <div class="qa-status" id="fit-status" role="status" aria-live="polite"></div>
+        <progress id="fit-progress" max="1" value="0" hidden></progress>
+      </div>
+      <div class="filters qa-filters" id="fit-filters" hidden>
+        <div class="field"><span class="field-label">Show</span><div id="fit-kinds" class="chip-row"></div></div>
+        <label class="field" title="List a box only when SAM moves one of its edges by more than this many pixels"><span class="field-label">Moves more than <span id="fit-tolerance-value" class="muted">2 px</span></span><input id="fit-tolerance" type="range" min="0" max="20" step="1" value="2"></label>
+        <label class="field">Class<select id="fit-filter-class"></select></label>
+        <label class="field">Split<select id="fit-filter-split"><option value="all">All splits</option></select></label>
+        <button id="fit-apply-all" class="primary-btn" type="button" hidden>Apply all</button>
+        <div id="fit-total" class="total"></div>
+      </div>
+      <div id="fit-grid" class="grid qa-grid"></div>
+      <div class="qa-more"><button id="fit-more" class="secondary" type="button" hidden>Show more</button></div>
+      </div>
     </section>
 
     <section id="dataset" class="view">
@@ -461,6 +491,7 @@
         </div>
         <button id="predict-image" class="secondary" title="Predict annotations for this image (P)" hidden><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M5.6 5.6l2.2 2.2m8.4 8.4 2.2 2.2m0-12.8-2.2 2.2M7.8 16.2l-2.2 2.2"/></svg>Predict</button>
         <button id="smart-annotate" class="secondary" aria-pressed="false" disabled title="Smart annotation: click objects, SAM outlines them (S)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/></svg>Smart annotation</button>
+        <button id="fit-boxes" class="secondary" title="Fit the selected box tightly around its object with SAM (T) · Shift+T or Shift+click: every box of its class, or of the draw class"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4"/><rect x="8.5" y="8.5" width="7" height="7" rx="1"/></svg>Fit box</button>
         <label class="field inline" id="sam-points-field" hidden title="Polygons from smart annotation get at most this many points, fitted to SAM's outline (empty: SAM's outline, lightly simplified). Kept for the next images.">Max points<input id="sam-max-points" class="points-limit" type="number" min="3" max="10000" step="1" placeholder="all" inputmode="numeric"></label>
         <label class="field inline" id="draw-class-field">Draw class<select id="draw-class"></select></label>
         <button id="delete-image" class="danger-btn" title="Move this image and its label to the dataset trash, then open the next image (Ctrl+Z undoes). ⌫ deletes the selected annotation."><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M10 11v6M14 11v6"/></svg>Delete image</button>

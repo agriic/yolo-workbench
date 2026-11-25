@@ -69,8 +69,10 @@ function applySamState(data) {
   if (s.status === "ready" && !wasReady) {
     encodeCurrent();
     if (s.points.length || s.box) segment();
+    if (s.fitPending != null) { const all = s.fitPending; s.fitPending = null; fitBoxes(all); }
   }
   if (s.status === "error" && s.active) deps.toast(s.error, "error");
+  if (s.status === "error" && s.fitPending != null) { s.fitPending = null; deps.toast(s.error, "error"); }
   deps.updateStatus();
 }
 
@@ -101,12 +103,15 @@ export async function toggleSam(force = null) {
 /** The editor opened an image: forget the old prompts and, once SAM was ever used, encode right away. */
 export function samImageOpened() {
   clearPrompts();
+  clearFit();
   if (!used() || state.meta.category === "classification" || sam().status === "unavailable") return;
   if (sam().status === "ready") encodeCurrent(); else if (!sam().unloaded) startModel();
 }
 
 export function samEditorClosed() {
   clearPrompts();
+  clearFit();
+  sam().fitPending = null;
   sam().press = null;
 }
 
@@ -273,6 +278,7 @@ const lighten = (hex, amount) => `#${[1, 3, 5].map(i =>
 
 export function drawSam(ctx) {
   const s = sam();
+  drawFit(ctx);
   if (!s.active || !state.img || !state.detail) return;
   const color = classColor(+$("draw-class").value);
   if (s.result?.found) {
@@ -346,4 +352,135 @@ export function samHint() {
   if (s.result && !s.result.found) return "SAM found nothing here · add a point on the object or press Esc to start over";
   if (s.result?.found) return "⏎ adds the light outline · click more points to refine the filled mask · right click / Shift+click marks background · ⌫ undoes a point · Esc clears";
   return "Smart annotation: click the object · right click / Shift+click marks background · drag a box around it · S turns it off";
+}
+
+/* ---------- fit boxes (T): SAM tightens boxes that are already there ----------
+   T fits the selected box, Shift+T every box of its class (of the draw class when none is selected). SAM's boxes
+   are drawn dashed over them: green where it is sure, amber where the fit may be wrong (the hint says why).
+   ⏎ applies the green ones, Shift+⏎ all of them, Esc drops them; one save, so one Ctrl+Z undoes it. */
+
+const FIT_REASONS = {
+  low_score: "SAM is unsure of the outline",
+  different: "very different from the box",
+  edge: "the outline reaches the search area's edge",
+  overlap: "overlaps another box",
+};
+const FIT_COLORS = { fitted: "#22c55e", uncertain: "#f59e0b" };
+const MIN_MOVE_PX = 0.5;  // a box SAM would move less than this on every edge is already tight
+
+const corners = points => [points[0] - points[2] / 2, points[1] - points[3] / 2, points[0] + points[2] / 2, points[1] + points[3] / 2];
+const samePoints = (a, b) => a.length === b.length && a.every((value, i) => value === b[i]);
+
+// the largest edge move in image pixels
+function movePx(before, after) {
+  const a = corners(before), b = corners(after);
+  return Math.max(...a.map((value, i) => Math.abs(b[i] - value) * (i % 2 ? state.img.height : state.img.width)));
+}
+
+export function clearFit() {
+  const s = sam();
+  s.fitRequest = (s.fitRequest ?? 0) + 1;
+  if (!s.fit) return;
+  s.fit = null;
+  deps.render();
+}
+
+export async function fitBoxes(all = false) {
+  if (!state.detail || !state.img) return;
+  if (state.meta.category !== "detection") return deps.toast("Fitting boxes works on detection datasets", "error");
+  const s = sam();
+  if (s.status === "unavailable") return deps.toast("Fitting boxes needs SAM: run 'uv sync' to install ultralytics", "error");
+  const annotations = state.detail.annotations;
+  const selected = annotations.find(a => a.id === state.selected);
+  const classId = selected ? selected.class_id : +$("draw-class").value;
+  const targets = all ? annotations.filter(a => a.class_id === classId) : selected ? [selected] : [];
+  if (!targets.length) {
+    const name = state.meta.names[classId] ?? `class ${classId}`;
+    return deps.toast(all ? `No ${name} boxes in this image` : "Select a box to fit · Shift+T fits every box of the draw class", "error");
+  }
+  if (s.status !== "ready") {
+    s.fitPending = all;  // applySamState fits once the model is ready
+    if (s.status !== "loading") deps.toast("Loading SAM — the boxes are fitted once it is ready");
+    return startModel();
+  }
+  const imageId = state.detail.id;
+  const request = s.fitRequest = (s.fitRequest ?? 0) + 1;
+  s.fit = { imageId, busy: true, items: [], failed: 0 };
+  deps.render();
+  try {
+    const result = await api(`/images/${imageId}/sam/fit`, {
+      method: "POST",
+      body: JSON.stringify({ boxes: annotations.map(a => a.points), targets: targets.map(a => annotations.indexOf(a)) }),
+    });
+    if (request !== s.fitRequest || state.detail?.id !== imageId) return;
+    const failed = result.items.filter(item => !item.points).length;
+    const items = result.items
+      .map((item, i) => ({ ...item, id: targets[i].id, before: [...targets[i].points] }))
+      .filter(item => item.points && movePx(item.before, item.points) >= MIN_MOVE_PX);
+    if (!items.length) {
+      s.fit = null;
+      const tight = targets.length - failed;
+      deps.toast([tight ? `${tight === 1 ? "The box is" : `${tight} boxes are`} already tight` : "", failed ? `SAM found no outline for ${failed === 1 ? "the box" : `${failed} boxes`}` : ""].filter(Boolean).join(" · "), failed ? "error" : "info");
+    } else {
+      s.fit = { imageId, busy: false, items, failed };
+    }
+  } catch (error) {
+    if (request !== s.fitRequest) return;
+    s.fit = null;
+    if (!(await modelLost(error))) deps.toast(error.message, "error");
+    else if (sam().status === "loading") s.fitPending = all;
+  } finally {
+    if (request === s.fitRequest) deps.render();
+  }
+}
+
+/** ⏎ applies SAM's sure boxes, Shift+⏎ the uncertain ones too: one save. */
+export async function applyFit(all = false) {
+  const s = sam(), fit = s.fit;
+  if (!fit || fit.busy || !state.detail || fit.imageId !== state.detail.id) return;
+  const chosen = fit.items.filter(item => all || item.status === "fitted");
+  if (!chosen.length) return deps.toast("SAM is unsure of every box here — Shift+⏎ applies them anyway, Esc drops them", "error");
+  let applied = 0;
+  for (const item of chosen) {
+    const annotation = state.detail.annotations.find(a => a.id === item.id && samePoints(a.points, item.before));
+    if (annotation) { annotation.points = [...item.points]; applied++; }
+  }
+  clearFit();
+  if (!applied) return deps.toast("The boxes changed meanwhile; press T again", "error");
+  await deps.save();
+  deps.toast(`Fitted ${applied} box${applied === 1 ? "" : "es"} — Ctrl+Z undoes`);
+}
+
+function drawFit(ctx) {
+  const fit = sam().fit;
+  if (!fit || fit.busy || !state.img || !state.detail || fit.imageId !== state.detail.id) return;
+  ctx.save();
+  for (const item of fit.items) {
+    const [l, t, r, b] = corners(item.points);
+    const [x1, y1] = deps.toScreen(l, t), [x2, y2] = deps.toScreen(r, b);
+    ctx.setLineDash([]);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "rgb(0 0 0 / 65%)";
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = FIT_COLORS[item.status] ?? FIT_COLORS.uncertain;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  }
+  ctx.restore();
+}
+
+export function fitHint() {
+  const fit = sam().fit;
+  if (!fit) return null;
+  if (fit.busy) return "SAM is fitting the boxes…";
+  const sure = fit.items.filter(item => item.status === "fitted").length;
+  const unsure = fit.items.filter(item => item.status !== "fitted");
+  const reasons = [...new Set(unsure.flatMap(item => item.reasons))].map(reason => FIT_REASONS[reason] ?? reason);
+  const parts = [];
+  if (sure) parts.push(`${sure} tighter box${sure === 1 ? "" : "es"} (green)`);
+  if (unsure.length) parts.push(`${unsure.length} uncertain (amber: ${reasons.join(", ")})`);
+  if (fit.failed) parts.push(`no outline for ${fit.failed}`);
+  parts.push(sure ? "⏎ applies the green ones" : "", unsure.length ? "Shift+⏎ applies all" : "", "Esc drops them");
+  return parts.filter(Boolean).join(" · ");
 }

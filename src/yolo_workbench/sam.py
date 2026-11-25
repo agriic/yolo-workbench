@@ -78,6 +78,19 @@ class UltralyticsSamBackend:
         best = int(scores.argmax())
         return masks[best].cpu().numpy(), float(scores[best])
 
+    def candidates(self, features, shape: tuple[int, int], points: list[list[float]], labels: list[int], box: list[float] | None) -> list[tuple[np.ndarray, float]]:
+        """SAM's three masks for the prompt (part, object, group) with their scores, for the caller to choose from."""
+        import torch
+
+        kwargs = {"points": [points], "labels": [labels]} if points else {}
+        if box is not None:
+            kwargs["bboxes"] = [box]
+        with torch.inference_mode():
+            masks, boxes = self.predictor.inference_features(features, shape, multimask_output=True, **kwargs)
+        if masks is None:
+            return []
+        return [(masks[index].cpu().numpy(), float(boxes[index, 4])) for index in range(len(masks))]
+
 
 def _gpu_available() -> bool:
     try:
@@ -234,7 +247,7 @@ class SamManager:
                 }.get(self.status, self.unloaded or "Start smart annotation first"))
             return self.backend
 
-    def _encoded(self, path: Path) -> tuple:
+    def _encoded(self, path: Path, image: np.ndarray | None = None) -> tuple:
         """(features, (h, w)) for the image, encoding it unless cached. Caller holds _run_lock."""
         stat = path.stat()
         key = (str(path), stat.st_mtime_ns, stat.st_size)
@@ -243,7 +256,7 @@ class SamManager:
             self._features.move_to_end(key)
             return cached
         backend = self._require_backend()
-        image = load_upright(path)
+        image = load_upright(path) if image is None else image
         entry = (backend.encode(image), image.shape[:2])
         self._features[key] = entry
         while len(self._features) > FEATURE_CACHE:
@@ -287,3 +300,34 @@ class SamManager:
         if not parts or not points:
             return {"found": False, "score": score, "mask": [], "points": []}
         return {"found": True, "score": round(score, 4), "mask": parts, "points": points}
+
+    def fit_boxes(self, path: Path, boxes: list[list[float]], targets: list[int] | None = None, cache: bool = True) -> list[dict]:
+        """Tighten detection boxes around their objects (see boxfit.py). `boxes` are every label of the image as
+        normalized x1,y1,x2,y2 (the others steer SAM off neighbours), `targets` the indices to fit (None: all).
+        Returns one fit per target. Regions are encoded one at a time, so an editor's click waits for at most one;
+        `cache` keeps a whole-image encoding in the shared feature cache (the editor's), a batch job passes False."""
+        from . import boxfit
+
+        targets = list(range(len(boxes))) if targets is None else list(targets)
+        self._require_backend()
+        self.last_used = time.monotonic()
+        image = load_upright(path)  # outside the lock: reading a file on a network drive takes a while
+        height, width = image.shape[:2]
+        pixels = [[box[0] * width, box[1] * height, box[2] * width, box[3] * height] for box in boxes]
+        results: list[dict | None] = [None] * len(targets)
+        for region, members in boxfit.crop_plan([pixels[index] for index in targets], width, height):
+            left, top, right, bottom = region
+            with self._run_lock:
+                backend = self._require_backend()  # unloaded meanwhile: the caller hears why
+                crop = np.ascontiguousarray(image[top:bottom, left:right])
+                if cache and region == (0, 0, width, height):
+                    features, _ = self._encoded(path, image)
+                else:
+                    features = backend.encode(crop)
+                edges = boxfit.edge_strength(crop)
+                for member in members:
+                    index = targets[member]
+                    others = [box for other, box in enumerate(pixels) if other != index]
+                    results[member] = {**boxfit.fit_one(backend, features, region, pixels[index], others, width, height, edges), "image_size": [width, height]}
+            self.last_used = time.monotonic()
+        return results

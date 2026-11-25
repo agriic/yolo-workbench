@@ -939,6 +939,11 @@ dialog::backdrop { background: rgb(10 16 14 / 78%); }
   vertical-align: 1px;
 }
 
+/* SAM box fit: detection datasets only */
+body:not(.detection) #fit-boxes,
+body:not(.detection) #bulk-fit,
+body:not(.detection) #qa-source { display: none !important; }
+
 /* classification datasets: no geometry, no model-assisted labeling, no embeddings */
 body.classification #assist-bar,
 body.classification .assist-label,
@@ -1466,7 +1471,14 @@ body.classification .tab[data-tab="quality"] { display: none; }
 .qa-card .object-actions .qa-fix { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .qa-card .qa-fix { color: var(--accent-strong); border-color: var(--accent); }
 .qa-more { display: flex; justify-content: center; margin: 14px 0 24px; }
-body.training-locked .qa-fix { opacity: .45; pointer-events: none; }
+body.training-locked .qa-fix,
+body.training-locked #fit-apply-all { opacity: .45; pointer-events: none; }
+.qa-title-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; }
+.qa-kind.fitted { background: #1f8a4c; }
+.qa-kind.uncertain { background: #b37d0b; }
+.qa-kind.failed { background: #5f6b67; }
+.fit-reasons { color: var(--warn); }
+#fit-apply-all { align-self: end; }
 
 /* server-wide warnings (status.js) and the training queue's hold controls */
 .server-banner { padding: 8px 16px; border-bottom: 1px solid var(--warn); background: var(--surface); font-size: 13px; }

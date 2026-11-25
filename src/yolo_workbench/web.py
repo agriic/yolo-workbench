@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import ClientDisconnect
 
-from . import augment_preview, classes, download, identity, imagekeys, importer, rebalance, resize, rfdetr_augment, snapshots, splitstats, storage
+from . import augment_preview, boxfit, classes, download, identity, imagekeys, importer, rebalance, resize, rfdetr_augment, snapshots, splitstats, storage
 from .auth import Auth, AuthError, AuthMiddleware, current_user
 from .dataset import Dataset, DatasetError, SchemaChanged, WriteConflict
 from .fsutil import InsufficientSpace, ensure_free_space, replace
@@ -79,8 +79,9 @@ class BulkFixPayload(BaseModel):
 class BulkObjectOperation(BaseModel):
     image_id: str
     annotation_id: str
-    action: Literal["relabel", "delete"]
+    action: Literal["relabel", "delete", "reshape"]
     class_id: int | None = None
+    points: list[float] | None = Field(default=None, max_length=4)  # reshape: the new box (detection)
     key: str | None = None  # the listed object's `key`: names it even when the id has moved to another line
 
 
@@ -132,6 +133,30 @@ class SamSegmentPayload(StrictPayload):
     points: list[SamPoint] = Field(default_factory=list, max_length=64)
     box: list[float] | None = Field(default=None, min_length=4, max_length=4)  # normalized x1, y1, x2, y2
     max_points: int | None = Field(default=None, ge=3, le=10000)  # segmentation: polygon vertex limit
+
+
+class SamFitPayload(StrictPayload):
+    # every box of the image as YOLO cx, cy, w, h (the others steer SAM off neighbours) and the ones to fit
+    boxes: list[list[float]] = Field(max_length=5000)
+    targets: list[int] = Field(min_length=1, max_length=5000)
+
+
+class BoxFitObject(StrictPayload):
+    image_id: str
+    key: str  # the object gallery's object key
+
+
+class BoxFitRunPayload(StrictPayload):
+    class_ids: list[int] | None = None  # None: every class
+    split: str | None = None  # None / "all": every split
+    objects: list[BoxFitObject] | None = Field(default=None, max_length=200000)  # instead of a class: these objects
+
+
+class BoxFitApplyAllPayload(StrictPayload):
+    kind: Literal["fitted", "uncertain"] = "fitted"
+    class_id: int | None = None
+    split: str = "all"
+    tolerance: float = Field(default=boxfit.DEFAULT_TOLERANCE_PX, ge=0, le=500)
 
 
 class ClassAddPayload(BaseModel):
@@ -1042,6 +1067,72 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def qa_dismiss(image_id: str, key: str, session: DatasetSession = current):
         return found(lambda: labelqa(session).dismiss(image_id, key))
 
+    # ---------- SAM box fit ----------
+
+    def box_fit(session: DatasetSession):
+        if session.boxfit is None or not session.boxfit.available:
+            raise DatasetError("Box fit needs a detection dataset")
+        return session.boxfit
+
+    def start_sam() -> None:
+        """Fitting boxes turns SAM on (loading it in the background) as the Smart annotation button does."""
+        if sam.payload()["status"] in ("idle", "error"):
+            app_lifecycle = lifecycle()
+            refused = app_lifecycle.refuse_gpu_load() if app_lifecycle is not None else None
+            if refused:
+                raise DatasetError(refused)
+            sam.start()
+
+    @router.get("/boxfit")
+    def boxfit_state(session: DatasetSession = current):
+        if session.boxfit is None:
+            return {"available": False, "category": session.dataset.category, "job": {"state": "idle"}, "result": None, "sam": sam.payload()}
+        return {**session.boxfit.payload(), "sam": sam.payload()}
+
+    @router.post("/boxfit/run")
+    def boxfit_run(payload: BoxFitRunPayload, session: DatasetSession = current):
+        manager = box_fit(session)
+        start_sam()
+        objects = None if payload.objects is None else [item.model_dump() for item in payload.objects]
+        return {**manager.start(sam, payload.class_ids, payload.split, objects), "sam": sam.payload()}
+
+    @router.post("/boxfit/cancel")
+    def boxfit_cancel(session: DatasetSession = current):
+        return box_fit(session).cancel()
+
+    @router.delete("/boxfit")
+    def boxfit_clear(session: DatasetSession = current):
+        return box_fit(session).clear()
+
+    @router.get("/boxfit/findings")
+    def boxfit_findings(kind: Literal["fitted", "uncertain", "failed"] | None = None, class_id: int | None = None, split: str = "all", tolerance: float = Query(boxfit.DEFAULT_TOLERANCE_PX, ge=0, le=500), offset: int = Query(0, ge=0), limit: int = Query(60, ge=1, le=500), session: DatasetSession = current):
+        # tolerance: a box SAM would move by at most this many pixels on every edge is already tight
+        return box_fit(session).findings(kind, class_id, split, tolerance, offset, limit)
+
+    @router.post("/boxfit/apply-all")
+    def boxfit_apply_all(payload: BoxFitApplyAllPayload, session: DatasetSession = current):
+        with identity.action("fit boxes with SAM"):
+            return box_fit(session).apply_all(payload.kind, payload.class_id, payload.split, payload.tolerance)
+
+    @router.get("/boxfit/images/{image_id}/findings/{key}/crop")
+    def boxfit_crop(request: Request, image_id: str, key: str, session: DatasetSession = current):
+        record = require_image(session, image_id)
+        # the key names both boxes; the label's time covers its class (the outline's color)
+        cache_key = cache.key("boxfit", record.path, image_mtime(session, record), session.dataset.label_mtime(record), key, PALETTE_VERSION)
+        if request.headers.get("if-none-match") == f'"{cache_key}"':
+            return Response(status_code=304)
+        content = cache.get_or_render(cache_key, lambda: box_fit(session).crop(image_id, key, class_color))
+        return jpeg_response(content, etag=cache_key)
+
+    @router.post("/boxfit/images/{image_id}/findings/{key}/apply")
+    def boxfit_apply(image_id: str, key: str, session: DatasetSession = current):
+        with identity.action("fit box with SAM"):
+            return found(lambda: box_fit(session).apply(image_id, key))
+
+    @router.post("/boxfit/images/{image_id}/findings/{key}/dismiss")
+    def boxfit_dismiss(image_id: str, key: str, session: DatasetSession = current):
+        return found(lambda: box_fit(session).dismiss(image_id, key))
+
     # ---------- smart annotation (SAM) ----------
 
     @router.post("/images/{image_id}/sam/encode")
@@ -1053,6 +1144,18 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
         record = require_image(session, image_id)
         points = [point.model_dump() for point in payload.points]
         return sam.segment(record.path, session.dataset.category, points, payload.box, payload.max_points)
+
+    @router.post("/images/{image_id}/sam/fit")
+    def sam_fit(image_id: str, payload: SamFitPayload, session: DatasetSession = current):
+        """The editor's Fit (T): SAM's tight box for each target, in target order (nothing is written)."""
+        record = require_image(session, image_id)
+        if session.dataset.category != "detection":
+            raise DatasetError("Box fit needs a detection dataset")
+        if any(len(box) != 4 for box in payload.boxes) or any(not 0 <= index < len(payload.boxes) for index in payload.targets):
+            raise DatasetError("Each box needs cx, cy, w, h and each target must name one of them")
+        fits = sam.fit_boxes(record.path, [boxfit.corners(box) for box in payload.boxes], payload.targets)
+        items = [{"points": None if fit["box"] is None else boxfit.yolo_box(fit["box"]), "status": fit["status"], "reasons": fit["reasons"], "score": fit["score"]} for fit in fits]
+        return {"items": items}
 
     @router.get("/embeddings")
     def embeddings_state(session: DatasetSession = current):

@@ -418,7 +418,8 @@ export function updateStatus() {
     ? `${state.detail.width}×${state.detail.height}px · ${state.detail.annotations.length} annotation${state.detail.annotations.length === 1 ? "" : "s"}`
     : "";
   let hint;
-  if (state.sam.active && state.meta.category !== "classification")
+  if (state.sam.fit) hint = deps.fitHint();
+  else if (state.sam.active && state.meta.category !== "classification")
     hint = deps.samHint();
   else if (state.meta.category === "classification")
     hint = "Pick the class in the panel or press 1–9 · drag to pan · scroll to zoom";

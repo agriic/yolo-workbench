@@ -23,12 +23,13 @@ import {
   renderEmbeddings, renderEmbedSelection, resetEmbedView, setEmbedMode,
 } from "./embeddings.js";
 import {
-  acceptSam, configureSam, drawSam, hasPrompts, clearPrompts, refreshSam, removeLastPrompt, samEditorClosed,
+  acceptSam, applyFit, clearFit, configureSam, drawSam, fitBoxes, fitHint, hasPrompts, clearPrompts, refreshSam, removeLastPrompt, samEditorClosed,
   samHint, samImageOpened, samMaxPointsChanged, samPointerDown, samPointerMove, samPointerUp, samRightClick, toggleSam,
 } from "./sam.js";
 import { bindManage, configureManage, loadClasses, loadModels, loadStorage, renderManageMeta } from "./manage.js";
 import { bindRepair, configureRepair, openLabelText, renderUnknownClasses } from "./repair.js";
 import { bindLabelQA, configureLabelQA, labelsChangedForQA, showLabelQA } from "./labelqa.js";
+import { applyQaSource, bindBoxFit, configureBoxFit, fitObjects, labelsChangedForFit, showBoxFit } from "./boxfit.js";
 import { bindTraining, configureTraining, hideTraining, showTraining } from "./training.js";
 import { bindSnapshots, configureSnapshots, loadSnapshots } from "./snapshots.js";
 import { bindRebalance, configureRebalance, loadLeakage, openWithRules } from "./rebalance.js";
@@ -92,6 +93,7 @@ async function init() {
   bindRebalance();
   bindRepair();
   bindLabelQA();
+  bindBoxFit();
   bindTraining();
   updateHistoryButtons();
   watchIndexing();
@@ -107,6 +109,7 @@ async function init() {
 function renderMetaControls() {
   const meta = state.meta;
   document.body.classList.toggle("classification", meta.category === "classification");
+  document.body.classList.toggle("detection", meta.category === "detection");
   document.body.classList.toggle("image-ops", !!meta.capabilities.image_ops);
   if (state.mode !== "projects") {
     const yamlName = meta.yaml.split("/").slice(-2).join("/");
@@ -217,7 +220,7 @@ export async function datasetChanged({ schema = false, keepEditor = false, keepS
   const tasks = [loadImages({ reset: schema }), loadObjects({ reset: schema }), loadIssues(), refreshPredictor()];
   if ($("dataset").classList.contains("active")) tasks.push(loadClasses(), loadStorage(), loadSnapshots(), loadLeakage());
   if ($("embeddings").classList.contains("active")) tasks.push(refreshEmbeddings());
-  labelsChangedForQA();  // findings are recomputed from the labels (undo of a Label QA fix, imports, …)
+  labelsChangedForQA(); labelsChangedForFit();  // findings are recomputed from the labels (undo of a Label QA fix, imports, …)
   await Promise.all(tasks.map(task => Promise.resolve(task).catch(error => toast(error.message, "error"))));
 }
 
@@ -241,7 +244,7 @@ function showTab(tab, runId = null) {
   if (tab === "exploration") objectGallery?.refreshLayout();
   if (tab === "embeddings") refreshEmbeddings();
   if (tab === "statistics") loadStatistics();
-  if (tab === "quality") showLabelQA();
+  if (tab === "quality") { if (applyQaSource() === "sam") showBoxFit(); else showLabelQA(); }
   if (tab === "dataset") { loadClasses(); loadModels(); loadStorage(); loadSnapshots(); loadLeakage(); loadActivity(); }
 }
 
@@ -326,6 +329,10 @@ function renderShortcuts() {
     ["S", "Smart annotation (SAM): click the object"],
     ["Right click", "SAM: mark background (or Shift+Click)"],
     ["⏎", "SAM: add the outlined object"],
+    ...(detection ? [
+      ["T / ⇧+T", "Fit the selected box / every box of its class with SAM"],
+      ["⏎ / ⇧+⏎", "Fit: apply the sure boxes / all of them"],
+    ] : []),
     ["F", "Fit image"],
     ["Esc", "Cancel drawing / close"],
   ];
@@ -377,6 +384,7 @@ function bind() {
   };
   $("bulk-relabel").onclick = () => runObjectBulk("relabel", +$("bulk-class").value);
   $("bulk-delete").onclick = () => runObjectBulk("delete");
+  $("bulk-fit").onclick = fitSelectedObjects;
   $("bulk-clear").onclick = () => { clearObjectSelection(); objectGallery.render(); };
   $("crop-padding").oninput = () => {
     $("padding-value").textContent = `${Math.round($("crop-padding").value * 100)}%`;
@@ -560,6 +568,7 @@ function bind() {
   });
   // blurred so ⏎ (accept) and Space (pan) don't press the button again
   $("smart-annotate").onclick = e => { e.currentTarget.blur(); toggleSam(); };
+  $("fit-boxes").onclick = e => { e.currentTarget.blur(); fitBoxes(e.shiftKey); };
   $("sam-max-points").oninput = samMaxPointsChanged;
   // ⏎ in a point-limit field hands the keyboard back to the editor (the next ⏎ accepts)
   for (const id of ["sam-max-points", "pred-max-points"]) $(id).addEventListener("keydown", e => { if (e.key === "Enter") e.currentTarget.blur(); });
@@ -595,7 +604,7 @@ function bind() {
     state.pred.items = [];
     renderPredList();
     samEditorClosed();
-    labelsChangedForQA();
+    labelsChangedForQA(); labelsChangedForFit();
   });
 
   $("annotation-list").addEventListener("click", e => {
@@ -633,7 +642,8 @@ function bind() {
 // Esc cancels a drawing, in smart annotation clears the prompts, then leaves the mode, before it closes the
 // editor; false when there is nothing left but closing.
 function escapeEditorStep() {
-  if (state.drawing) cancelDrawing();
+  if (state.sam.fit) clearFit();
+  else if (state.drawing) cancelDrawing();
   else if (state.sam.active) {
     if (hasPrompts()) { clearPrompts(); render(); } else toggleSam(false);
   } else return false;
@@ -668,6 +678,7 @@ function keyDown(e) {
     if (key.toLowerCase() === "w") return reviewCurrent("needs_work", true);
     if (key.toLowerCase() === "u") return openNextUnreviewed();
     if (key.toLowerCase() === "c") { if (!e.repeat) propagate(); return; }
+    if (key.toLowerCase() === "t") { if (!e.repeat) fitBoxes(e.shiftKey); return; }
     // the Predictions panel's Accept all ≥ / Reject all (a held key does not repeat them)
     if (key.toLowerCase() === "a" || key.toLowerCase() === "r") {
       const button = $(key.toLowerCase() === "a" ? "accept-all-preds" : "reject-all-preds");
@@ -676,6 +687,7 @@ function keyDown(e) {
     }
   }
   if (key.toLowerCase() === "s" && !e.ctrlKey && !e.metaKey && !e.altKey) return toggleSam();
+  if (key === "Enter" && state.sam.fit) { e.preventDefault(); return applyFit(e.shiftKey); }
   if (key === "Enter" && state.sam.active) { e.preventDefault(); return acceptSam(); }
   if (key === "+" || key === "=") return zoomCentered(1.25);
   if (key === "-") return zoomCentered(0.8);
@@ -1159,6 +1171,21 @@ async function bulkEditObjects(operations, action, edited) {
   }
 }
 
+// Exploration's Fit with SAM: SAM fits the selected boxes; Label QA lists what it would move.
+async function fitSelectedObjects() {
+  const objects = [...state.objectSelection.values()].map(item => ({ image_id: item.image_id, key: item.key }));
+  if (objects.length && await fitObjects(objects)) clearObjectSelection();
+}
+
+// Many images' labels were rewritten in one transaction (Label QA's SAM Apply all): refresh what shows them.
+async function labelsChangedInBulk() {
+  state.canUndo = true;
+  state.canRedo = false;
+  updateHistoryButtons();
+  statisticsChanged();
+  await Promise.all([loadImages(), loadObjects(), loadIssues()].map(task => task.catch(error => toast(error.message, "error"))));
+}
+
 // One image's labels were rewritten outside the editor's own save (raw label editor): refresh what shows them.
 async function labelsChanged(imageId, detail) {
   state.canUndo = true;
@@ -1368,6 +1395,7 @@ configureCanvas({
   editorOpened: id => { clearEditorNotice(); editorShows(id); },
   drawPredictions,
   drawSam,
+  fitHint,
   hitPrediction,
   hoverPrediction,
   imageGallery: () => imageGallery,
@@ -1407,6 +1435,7 @@ configureSam({ render, save, shapePath, toast, toScreen, updateStatus });
 configureRepair({ datasetChanged, labelsChanged, toast });
 configureCollab({ datasetChanged, imagesChanged, presenceChanged: () => imageGallery?.render(), reloadEditor, toast });
 configureLabelQA({ labelsChanged, openEditor, toast });
+configureBoxFit({ labelsChanged, labelsChangedInBulk, openEditor, refreshSam, showLabelQA, showTab, toast });
 configureEmbeddings({ bulkEditObjects, classOptions, editObject, toast });
 configureManage({
   datasetChanged,

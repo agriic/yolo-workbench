@@ -164,7 +164,7 @@ function renderSetup() {
   $("qa-run").disabled = running || !loadedChosen;
   $("qa-run").textContent = result ? "Analyze again" : "Analyze";
   $("qa-cancel").hidden = !running;
-  $("qa-clear").hidden = !result || running;
+  $("qa-clear").hidden = !result || running || $("qa-model-pane").hidden;  // the SAM box fit pane has its own
   $("qa-progress").hidden = !running;
   $("qa-progress").max = Math.max(1, job.total);
   $("qa-progress").value = job.done;

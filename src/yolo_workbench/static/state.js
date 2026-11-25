@@ -46,6 +46,9 @@ export const state = {
     press: null, drag: null,
     result: null,        // {found, score, mask, points} from the server: SAM's mask outline, what ⏎ adds
     busy: false, request: 0, encoding: null, encoded: null,
+    fit: null,           // the editor's Fit (T): {imageId, busy, items: [{id, before, points, status, reasons}], failed}
+    fitPending: null,    // a Fit waiting for SAM to load: true = every box of the class
+    fitRequest: 0,
   },
   embed: {
     status: "idle", error: null, items: [], hovered: null, poll: null,
