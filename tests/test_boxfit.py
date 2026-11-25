@@ -22,9 +22,11 @@ CARD = (400, 300, 600, 450)  # the dark rectangle's pixels: x 400..599, y 300..4
 
 class DarkSam:
     """Stands in for SAM on synthetic images: the mask is the dark part of the prompt box connected to the positive
-    click, without the parts holding a background click. Records what it was asked."""
+    click, without the parts holding a background click; like SAM, it reaches a little past a box that cuts the
+    object off (REACH px). Records what it was asked."""
 
     score = 0.95
+    REACH = 10
 
     def __init__(self, name="fake"):
         self.name = name
@@ -43,6 +45,7 @@ class DarkSam:
         assert image.shape[:2] == tuple(shape)
         dark = image.mean(axis=2) < 128
         x1, y1, x2, y2 = (int(round(value)) for value in box)
+        x1, y1, x2, y2 = x1 - self.REACH, y1 - self.REACH, x2 + self.REACH, y2 + self.REACH
         inside = np.zeros_like(dark)
         inside[max(0, y1):y2, max(0, x1):x2] = True
         _, parts = cv2.connectedComponents((dark & inside).astype(np.uint8))
@@ -169,6 +172,37 @@ def test_prefers_the_mask_whose_outline_follows_the_image_edges():
     assert fit["box"] == pytest.approx([0.35, 0.35, 0.655, 0.655])
 
 
+def test_an_outline_at_the_search_areas_edge_is_uncertain_unless_it_is_the_images():
+    box = [100, 100, 200, 160]
+    prompt = boxfit.grown(box, 400, 300)
+    assert boxfit.judge(box, prompt, [prompt[0], 104, 196, 158], 0.9, [], 400, 300) == ["edge"]
+    assert boxfit.judge(box, prompt, [104, 104, 196, 158], 0.9, [], 400, 300) == []
+    at_border = [0, 100, 60, 160]  # the image's own edge stops the search area there: no reason to doubt
+    assert boxfit.judge(at_border, boxfit.grown(at_border, 400, 300), [0, 102, 58, 158], 0.9, [], 400, 300) == []
+
+
+def test_a_fit_that_changes_with_more_room_is_uncertain():
+    # a card in a dark tray: given the label, SAM outlines the card; given room, the tray around it
+    card, tray = np.zeros((200, 200), bool), np.zeros((200, 200), bool)
+    card[80:120, 60:140] = True
+    tray[66:134, 44:156] = True
+
+    class TraySam:
+        def candidates(self, features, shape, points, labels, box):
+            roomy = box[0] < 50
+            return [(tray if roomy else card, 0.97)]
+
+    fit = boxfit.fit_one(TraySam(), None, (0, 0, 200, 200), [56, 77, 144, 124], [], 200, 200)
+    assert fit["status"] == "uncertain" and fit["reasons"] == ["unstable"]
+    assert fit["box"] == pytest.approx([0.3, 0.4, 0.7, 0.6])  # the label prompt's card is what is proposed
+
+    class SteadySam(TraySam):
+        def candidates(self, features, shape, points, labels, box):
+            return [(card, 0.97)]
+
+    assert boxfit.fit_one(SteadySam(), None, (0, 0, 200, 200), [56, 77, 144, 124], [], 200, 200)["status"] == "fitted"
+
+
 def test_edge_fringe_does_not_widen_the_box():
     mask = np.zeros((300, 300), bool)
     mask[100:200, 80:180] = True               # the card
@@ -188,13 +222,14 @@ def test_edge_fringe_does_not_widen_the_box():
 
 def test_unsure_and_failed_fits(tmp_path):
     labels = [
-        f"0 {yolo((480, 360, 520, 390))}",   # far too small: the outline stops at the search area's edge
+        f"0 {yolo((480, 360, 520, 390))}",   # far too small
         f"0 {yolo((1000, 800, 1100, 900))}",  # nothing there
     ]
     dataset = card_dataset(tmp_path, labels)
     record = next(iter(dataset.images.values()))
     small, empty = ready().fit_boxes(record.path, [norm((480, 360, 520, 390)), norm((1000, 800, 1100, 900))])
-    assert small["status"] == "uncertain" and "edge" in small["reasons"] and "different" in small["reasons"]
+    # given the label, SAM stops short of the card; given room, it goes on: very different from the label, and unstable
+    assert small["status"] == "uncertain" and {"different", "unstable"} <= set(small["reasons"])
     assert empty["status"] == "failed" and empty["box"] is None
     [low] = ready(UnsureSam).fit_boxes(record.path, [norm((395, 296, 604, 455))], [0])
     assert low["status"] == "uncertain" and low["reasons"] == ["low_score"]

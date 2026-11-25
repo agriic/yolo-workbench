@@ -1118,7 +1118,7 @@ def dataset_router(get_session, cache: MediaCache, jobs: JobManager, training: T
     def boxfit_crop(request: Request, image_id: str, key: str, session: DatasetSession = current):
         record = require_image(session, image_id)
         # the key names both boxes; the label's time covers its class (the outline's color)
-        cache_key = cache.key("boxfit", record.path, image_mtime(session, record), session.dataset.label_mtime(record), key, PALETTE_VERSION)
+        cache_key = cache.key("boxfit", 2, record.path, image_mtime(session, record), session.dataset.label_mtime(record), key, PALETTE_VERSION)
         if request.headers.get("if-none-match") == f'"{cache_key}"':
             return Response(status_code=304)
         content = cache.get_or_render(cache_key, lambda: box_fit(session).crop(image_id, key, class_color))

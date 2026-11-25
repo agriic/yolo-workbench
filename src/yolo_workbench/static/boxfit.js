@@ -13,7 +13,7 @@ export function configureBoxFit(dependencies) {
 const PAGE = 60;
 const SOURCE_KEY = "qaSource";
 const KINDS = {
-  fitted: { title: "Tighter box", hint: "SAM's box is tighter and nothing about it looks wrong" },
+  fitted: { title: "Fitted", hint: "SAM's box fits the object and nothing about it looks wrong" },
   uncertain: { title: "Uncertain", hint: "SAM moved the box, but something may be off: look before applying" },
   failed: { title: "No outline", hint: "SAM found no object in the box: the label may be wrong" },
 };
@@ -22,6 +22,7 @@ const REASONS = {
   different: "very different from the label",
   edge: "the outline reaches the search area's edge (the object may be larger)",
   overlap: "overlaps another label (SAM outlines the visible part)",
+  unstable: "SAM outlines something else when given more room (a tray, a hand, a neighbour)",
 };
 const SUBTITLES = {
   model: "Where a trained model disagrees with the labels: objects nobody labelled, wrong classes, loose boxes, and labels the model cannot find. Most suspicious first.",
@@ -197,7 +198,7 @@ function renderSetup() {
   else if (result) {
     const when = result.updated ? new Date(result.updated).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "";
     text = `${plural(result.objects, "box", "boxes")} fitted in ${plural(result.images, "image")}${result.model ? ` with ${result.model}` : ""}${when ? ` · last run ${when}` : ""}${startedBy(result.started_by)}. Fitting again adds to these.`;
-  } else text = "Fit boxes runs SAM around every box of the class and proposes a tighter box where the label is off. Each box is encoded at a resolution that suits its size, so a GPU helps on large images.";
+  } else text = "Fit boxes runs SAM around every box of the class and proposes a better-fitting box where the label is off. Each box is encoded at a resolution that suits its size, so a GPU helps on large images.";
   $("fit-status").textContent = text;
   $("fit-status").title = text;
   $("fit-filters").hidden = !result;
@@ -282,7 +283,7 @@ function renderFindings() {
     return;
   }
   $("fit-grid").innerHTML = fit.items.map(item => `<article class="card qa-card" data-fit-key="${esc(item.key)}" data-fit-image="${esc(item.image_id)}">
-      <div class="thumb" title="Solid: the label · dashed: SAM's box · click to open in the editor">
+      <div class="thumb" title="Solid: the label · dashed: SAM's box · green: what SAM's box adds · red: what it gives up · click to open in the editor">
         <img loading="lazy" src="${apiUrl(`/boxfit/images/${item.image_id}/findings/${item.key}/crop`)}" alt="">
         <span class="qa-kind ${item.kind}">${esc(KINDS[item.kind].title)}</span>
         ${item.deviation_px != null ? `<span class="qa-score" title="The largest edge move">${Math.round(item.deviation_px)} px</span>` : ""}

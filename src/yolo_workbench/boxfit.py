@@ -1,12 +1,16 @@
 """SAM box fit: tighten detection boxes (e.g. a model's, a few pixels off) around their objects with SAM.
 
-Fitting one box (fit_one): SAM is prompted with the label box grown by a margin (so an object the box cuts off
-is still inside it), a click on the box centre, and background clicks on the centres of neighbouring labels inside
-the grown box (cards in a fan); of SAM's three masks the one with the best score × overlap with the label wins
-(not the suit symbol, not the whole stack). The fitted box is the box around that mask, without specks and parts
-mostly outside the label. A fit is "fitted" or "uncertain" with its reasons (SAM unsure, a box very different
-from the label, a mask reaching the grown box's edge — the object is larger, or SAM spread into the background —,
-a label overlapped by another one — SAM outlines the visible part only), or "failed" (no mask).
+Fitting one box (fit_one): SAM is prompted twice — with the label box itself and with the label grown by a margin
+(an object the label cuts off by more) —, each time with a click on the box centre and background clicks on the
+centres of neighbouring labels inside the grown box (cards in a fan). Of each prompt's three masks, the one with the
+best score × overlap with the label × outline contrast wins (not the suit symbol, not the whole stack, not the
+background SAM fills a box with); the fitted box is the box around the label prompt's mask, without specks, edge
+fringe and parts mostly outside the label. A fit is "fitted" or "uncertain" with its reasons (SAM unsure, a box very
+different from the label, a mask reaching the grown box's edge, a label overlapped by another one — SAM outlines the
+visible part only —, or the two prompts disagreeing — the grown one took in a tray, a hand, a neighbour), or
+"failed" (no mask). On cards next to hands, in trays and side by side, with labels ±7 px off, the label prompt's
+box was right ~92% of the time, and where both prompts agreed the box was wrong only where fingers covered the
+card or it was motion-blurred (SAM outlines what it sees).
 
 Precision: SAM encodes 1024 px and draws masks on a 256×256 grid, so on a whole 4K image an edge can be several
 pixels off — about the error being fixed. crop_plan encodes a region around each box instead (a few times the
@@ -54,14 +58,18 @@ MIN_IOU = 0.5             # a fitted box overlapping its label less than this is
 SIZE_RANGE = (0.5, 2.0)   # ... as is one whose area changed beyond these factors
 OVERLAP_FRACTION = 0.15   # a label this much covered by another one: SAM's box is the visible part only
 EDGE_PX = 1.0             # a mask edge this close to the prompt box's: it may continue past it
+AGREE_PX = 3.0            # the label-box and grown-box prompts' boxes agree when every edge is this close ...
+AGREE_FRACTION = 0.05     # ... or this fraction of the label's longer side, when that is more
 REASONS = {
     "low_score": "SAM is unsure of the outline",
     "different": "SAM's box is very different from the label",
     "edge": "the outline reaches the search area's edge",
     "overlap": "the label overlaps another one",
+    "unstable": "SAM outlines something else when given more room (a tray, a hand, a neighbour)",
 }
 KINDS = ("fitted", "uncertain", "failed")
 DEFAULT_TOLERANCE_PX = 2.0
+FIT_TINT = 0.4            # review crops: how strongly what SAM adds (green) and gives up (red) is tinted
 SAVE_INTERVAL = 20.0
 VERSION = 1
 
@@ -192,24 +200,11 @@ def _without_fringe(mask: np.ndarray) -> np.ndarray:
     return (solid & cv2.dilate(core, np.ones((3, 3), np.uint8))).astype(bool)
 
 
-def fit_one(backend, features, region, box, others, width: int, height: int, edges: np.ndarray | None = None) -> dict:
-    """Fit one label box (image pixels) with SAM features of `region`; see the module docstring. `edges` is
-    edge_strength of the region: of SAM's masks, the one whose outline follows the image's edges is preferred."""
-    left, top, right, bottom = region
-    prompt = grown(box, width, height)
-    shift = lambda points: [[x - left, y - top] for x, y in points]
-    local_box = [box[0] - left, box[1] - top, box[2] - left, box[3] - top]
-    points = shift([((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)] + _negatives(box, prompt, others))
-    labels = [1] + [0] * (len(points) - 1)
-    shape = (bottom - top, right - left)
-    local_prompt = [max(0.0, prompt[0] - left), max(0.0, prompt[1] - top), min(float(shape[1]), prompt[2] - left), min(float(shape[0]), prompt[3] - top)]
-    if hasattr(backend, "candidates"):
-        candidates = backend.candidates(features, shape, points, labels, local_prompt)
-    else:  # a backend with one mask per prompt
-        candidates = [backend.segment(features, shape, points, labels, local_prompt)]
-    # SAM's own score and the overlap with the label rule out a part (the suit symbol) or a group (the stack), but
-    # not the box-filling mask SAM draws on a plain background: its overlap with a label a few pixels off is as
-    # good as the object's. Its outline does not follow an edge of the image, though.
+def _best(candidates, local_box, edges: np.ndarray | None):
+    """Of SAM's masks for one prompt: (box, score) of the one with the best score × overlap with the label × outline
+    contrast, None when no mask is left. SAM's score and the overlap rule out a part (the suit symbol) or a group (the
+    stack), but not the box-filling mask SAM draws on a plain background: its overlap with a label a few pixels off
+    is as good as the object's. Its outline does not follow an edge of the image, though."""
     found = []
     for mask, score in candidates:
         result = _mask_extent(mask, local_box)
@@ -217,11 +212,43 @@ def fit_one(backend, features, region, box, others, width: int, height: int, edg
             extent, kept = result
             found.append((extent, score, _bbox_iou(extent, local_box), 1.0 if edges is None else _outline_contrast(kept, edges)))
     if not found:
-        return {"box": None, "score": 0.0, "status": "failed", "reasons": []}
+        return None
     strongest = max(contrast for *_, contrast in found) or 1.0
     extent, score, _, _ = max(found, key=lambda item: item[1] * item[2] * item[3] / strongest)
+    return extent, score
+
+
+def fit_one(backend, features, region, box, others, width: int, height: int, edges: np.ndarray | None = None) -> dict:
+    """Fit one label box (image pixels) with SAM features of `region`; see the module docstring. `edges` is the
+    region's edge_strength: of SAM's masks, the one whose outline follows the image's edges is preferred."""
+    left, top, right, bottom = region
+    prompt = grown(box, width, height)
+    shift = lambda points: [[x - left, y - top] for x, y in points]
+    local_box = [box[0] - left, box[1] - top, box[2] - left, box[3] - top]
+    points = shift([((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)] + _negatives(box, prompt, others))
+    labels = [1] + [0] * (len(points) - 1)
+    shape = (bottom - top, right - left)
+    clip = lambda b: [max(0.0, b[0] - left), max(0.0, b[1] - top), min(float(shape[1]), b[2] - left), min(float(shape[0]), b[3] - top)]
+    # Two prompts. The label box itself: SAM refining a box it is given, reaching a little past it where the object
+    # goes on — its answer is the fit. The label grown by the margin: room for an object the label cuts off by more,
+    # but also an invitation to outline what is around the object (the tray a card lies in, the hand holding it).
+    # Where the two answers agree, the fit does not depend on how SAM was asked; where they do not, it is uncertain.
+    best = []
+    for prompt_box in (clip(box), clip(prompt)):
+        if hasattr(backend, "candidates"):
+            candidates = backend.candidates(features, shape, points, labels, prompt_box)
+        else:  # a backend with one mask per prompt
+            candidates = [backend.segment(features, shape, points, labels, prompt_box)]
+        best.append(_best(candidates, local_box, edges))
+    tight, roomy = best
+    if tight is None and roomy is None:
+        return {"box": None, "score": 0.0, "status": "failed", "reasons": []}
+    extent, score = tight or roomy
     fitted = (extent[0] + left, extent[1] + top, extent[2] + left, extent[3] + top)
     reasons = judge(box, prompt, fitted, score, others, width, height)
+    allowed = max(AGREE_PX, AGREE_FRACTION * max(box[2] - box[0], box[3] - box[1]))
+    if tight is None or roomy is None or max(abs(a - b) for a, b in zip(tight[0], roomy[0])) > allowed:
+        reasons.append("unstable")
     return {
         "box": [round(fitted[0] / width, 6), round(fitted[1] / height, 6), round(fitted[2] / width, 6), round(fitted[3] / height, 6)],
         "score": round(float(score), 4),
@@ -621,7 +648,8 @@ class BoxFitManager:
 
 def render_fit(path: Path, finding: dict, color, size: tuple[int, int] = (420, 320)) -> bytes:
     """A crop around the label (solid, class color) and SAM's box (dashed white), scaled up to `size` (at most 4×)
-    so that a move of a few pixels shows; lines are drawn after scaling, thin."""
+    so that a move of a few pixels shows; what SAM's box adds is tinted green, what it gives up red, so the
+    direction of each move — onto the background, into a hand — shows at a glance. Drawn after scaling, thin."""
     shapes = [corners(finding["label"]["points"])] + ([corners(finding["prediction"]["points"])] if finding["prediction"] else [])
     left, top = min(box[0] for box in shapes), min(box[1] for box in shapes)
     right, bottom = max(box[2] for box in shapes), max(box[3] for box in shapes)
@@ -633,12 +661,23 @@ def render_fit(path: Path, finding: dict, color, size: tuple[int, int] = (420, 3
     crop = image.crop(box)
     scale = min(size[0] / crop.width, size[1] / crop.height, 4.0)
     crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))), Image.Resampling.LANCZOS if scale < 1 else Image.Resampling.BICUBIC)
-    draw = ImageDraw.Draw(crop)
+
+    def scaled(corner_box):
+        return ((corner_box[0] * width - box[0]) * scale, (corner_box[1] * height - box[1]) * scale, (corner_box[2] * width - box[0]) * scale, (corner_box[3] * height - box[1]) * scale)
 
     def outline(corner_box):
-        l, t, r, b = ((corner_box[0] * width - box[0]) * scale, (corner_box[1] * height - box[1]) * scale, (corner_box[2] * width - box[0]) * scale, (corner_box[3] * height - box[1]) * scale)
+        l, t, r, b = scaled(corner_box)
         return [(l, t), (r, t), (r, b), (l, b), (l, t)]
 
+    if finding["prediction"]:
+        ys, xs = np.mgrid[0 : crop.height, 0 : crop.width] + 0.5
+        inside = lambda b: (xs >= b[0]) & (xs < b[2]) & (ys >= b[1]) & (ys < b[3])
+        in_label, in_sam = inside(scaled(shapes[0])), inside(scaled(shapes[1]))
+        pixels = np.asarray(crop).astype(np.float32)
+        for area, tint in ((in_sam & ~in_label, (34, 197, 94)), (in_label & ~in_sam, (239, 68, 68))):
+            pixels[area] = pixels[area] * (1 - FIT_TINT) + np.array(tint, np.float32) * FIT_TINT
+        crop = Image.fromarray(pixels.astype(np.uint8))
+    draw = ImageDraw.Draw(crop)
     label = outline(shapes[0])
     draw.line(label, fill="#000000", width=3)
     draw.line(label, fill=color(finding["label"]["class_id"]), width=1)

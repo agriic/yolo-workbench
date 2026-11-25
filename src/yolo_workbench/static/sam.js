@@ -364,6 +364,7 @@ const FIT_REASONS = {
   different: "very different from the box",
   edge: "the outline reaches the search area's edge",
   overlap: "overlaps another box",
+  unstable: "SAM outlines something else when given more room",
 };
 const FIT_COLORS = { fitted: "#22c55e", uncertain: "#f59e0b" };
 const MIN_MOVE_PX = 0.5;  // a box SAM would move less than this on every edge is already tight
@@ -478,7 +479,7 @@ export function fitHint() {
   const unsure = fit.items.filter(item => item.status !== "fitted");
   const reasons = [...new Set(unsure.flatMap(item => item.reasons))].map(reason => FIT_REASONS[reason] ?? reason);
   const parts = [];
-  if (sure) parts.push(`${sure} tighter box${sure === 1 ? "" : "es"} (green)`);
+  if (sure) parts.push(`${sure} fitted box${sure === 1 ? "" : "es"} (green)`);
   if (unsure.length) parts.push(`${unsure.length} uncertain (amber: ${reasons.join(", ")})`);
   if (fit.failed) parts.push(`no outline for ${fit.failed}`);
   parts.push(sure ? "⏎ applies the green ones" : "", unsure.length ? "Shift+⏎ applies all" : "", "Esc drops them");
